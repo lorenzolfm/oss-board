@@ -1,0 +1,8 @@
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Runtime state: rewritten every run, not source.
+# The directory itself must exist -- oss-board.nix lists it in ReadWritePaths.
+state/*
+!state/.gitkeep
