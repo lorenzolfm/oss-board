@@ -1,30 +1,38 @@
 # Floresta triage
 
-Answers one question about `getfloresta/Floresta`: **what is blocked on you?**
-And then a second, strictly below it: what is worth your evening.
+Answers one question about `getfloresta/Floresta`: **who is actually waiting on
+you?** And then a second, on the board only: what is worth your evening.
 
 It refreshes an obsidian-kanban board at `~/Documents/Vault/Opensource/Tasks.md`
-every hour and sends a Telegram DM twice a day (08:07, 19:23).
+every hour and sends one short Telegram DM each morning (08:07).
 
 This replaced a 91-repo contribution board. That one failed for two reasons:
 every card cost a context load into a codebase you don't carry in your head,
 and it answered "what could I pick up?" when the question that matters is
 "who is waiting on me?".
 
+The next version listed every obligation twice a day and failed differently: of 11
+cards, 3 needed anything from you, and you stopped reading. Your ACKs don't count
+toward merge, so a miss usually means someone pings again, while a false alarm means
+the message goes unread. The board is the complete ledger, and the DM only interrupts.
+
 ## Obligations and opportunities
 
-**Obligations** are found by code alone, are never capped, and are listed
-longest-waiting first. The model may add a one-line gist to one; it can never
-hide, drop or reorder it. Six rules (`src/obligations.rs`):
+**Obligations** are found by code alone, are never capped on the board, and are
+listed longest-waiting first. The model may add a one-line gist to one; it can never
+hide, drop or reorder it there. Six rules (`src/obligations.rs`):
 
 1. **A review was requested from you**, formally or by an informal "@you can
-   you review" comment.
+   you review" comment. A comment of yours with nothing pushed since has answered
+   it, until someone pushes or asks again.
 2. **A conversation is waiting on you**: the newest comment isn't yours, and
    it @-mentions you, quote-replies you, is in a review thread you're part of,
    or is on an item you authored or are assigned. A busy PR you commented on
    once does *not* count -- that is the notifications inbox this replaces.
    Any activity of yours (a comment, a submitted review, an inline reply)
-   answers what came before it; on your own PR, so does a push.
+   answers what came before it, in any thread; on your own PR, so does a push.
+   A comment left unanswered for 14 days stops counting. If it still matters
+   someone will ping again, and that brings the card back.
 3. **Your own PRs when there's something for you to do**: an unresolved
    thread (the ruleset won't merge with one), changes requested since your
    push, a conflict, red CI, or a comment since your last push. ACKs and
@@ -36,8 +44,8 @@ hide, drop or reorder it. Six rules (`src/obligations.rs`):
    the milestone due date.
 6. **A review you started and never submitted.**
 
-**Opportunities** are ranked by the judge, capped at 8 on the board and 3 in
-the DM: new issues (14 days, unassigned, nothing linked), non-draft PRs with
+**Opportunities** are ranked by the judge, capped at 8, and only on the board:
+new issues (14 days, unassigned, nothing linked), non-draft PRs with
 zero approvals you haven't touched, PRs you engaged with that moved since, and
 the org board's Needs review column. Your **footprint** -- the
 crates your commits touched, computed from your local clone -- is ranking
@@ -67,8 +75,8 @@ promoted to an obligation on that issue.
   it didn't have. General activity never re-arms it. Anything else dragged to
   Passed is gone for good.
 - **Dragging a card into Todo/Doing claims it.** A claimed obligation leaves
-  `Needs me` and lives on your card as an annotation (the DM still lists it,
-  marked "in your Doing"). Claiming someone else's PR writes a **review
+  `Needs me` and lives on your card as an annotation (a new ask on it still
+  reaches the DM, marked "in your Doing"). Claiming someone else's PR writes a **review
   brief** -- reading order, review so far, unresolved threads, what moved
   since you last looked; claiming an issue writes the fix-oriented brief.
 - Card identity is the GitHub URL, or a `<!--k:...-->` key for cards with no
@@ -84,23 +92,36 @@ promoted to an obligation on that issue.
 
 ## The DM
 
-Every obligation, longest wait first, each with its computed reasons, the
-model's gist and a tappable URL; then the judge's top 3 opportunities with an
-estimate and a first step; then a count line. 🆕 marks anything new or changed
-since the last DM. A long day is split into several messages, never truncated.
-If the judge is unavailable the opportunities are in mechanical order and the
-message says so.
+One message each morning, and it only carries what is new:
 
-A source that can't be read is not a clear board. `Unshipped` and any card held
-by an unread source stay as they were, a claimed card keeps its note, and the
-DM, the heartbeat and `state/last_run.json` all name the source. The DM won't say
-"nothing is blocked on you" if what it failed to read could have said otherwise.
-That includes a conflict GitHub is still computing, as it does after master moves:
-a card held for a conflict waits for an answer.
+```
+Floresta · 1 new · 2 on the board
 
-The timer is hourly; the DM goes out on the first run at or after each slot, so
-a slot missed while the desktop was off is sent late -- unless it is more than
-8 hours stale, in which case the next slot's message is the better one.
+#1308 ship fork#6 or hand it to Digvijay
+https://github.com/getfloresta/Floresta/issues/1308
+```
+
+An obligation reaches it once, on a **new trigger** since the last DM (the same test
+a mute uses: a newer event, a new kind of reason, or a new head) and only if it is an
+**ask**. A review request, changes requested, a conflict, red CI or an assignment is
+an ask by its nature. Anything else needs the model to read someone waiting on you
+specifically. At most 3 per message; any more stay new for the next one. A quiet
+morning is the header line alone, so a missing message means something is broken.
+
+Opportunities and Unshipped stay on the board.
+
+If the model gives no verdict on a new item, it goes through and the message says it
+wasn't filtered: a false alarm can be seen, a dropped ask can't.
+
+A source that can't be read is not a clear board. `Unshipped` and any card held by an
+unread source stay as they were, a claimed card keeps its note, and the heartbeat and
+`state/last_run.json` name the source. The DM names it too when it could change what
+the DM says. That includes a conflict GitHub is still computing, as it does after
+master moves: a card held for a conflict waits for an answer.
+
+The timer is hourly; the DM goes out on the first run at or after 08:07, so a morning
+missed while the desktop was off is sent late -- unless it is more than 8 hours stale,
+in which case it waits for tomorrow.
 
 ## Layout
 
@@ -108,17 +129,18 @@ a slot missed while the desktop was off is sent late -- unless it is more than
 flake.nix              the package, and the gates `nix flake check` runs
 oss-board.nix          systemd timer (hourly) + service; copy to /etc/nixos
 src/main.rs            orchestrator; board always written, DM when a slot is due
-src/config.rs          the repo, the clone, caps, DM slots, the project column
+src/config.rs          the repo, the clone, caps, the DM slot, the project column
 src/snapshot.rs        one GraphQL read of every open PR and issue; merge state;
                        your upstream PRs; the stale-ACK interdiff
-src/obligations.rs     the six rules and the mute logic -- pure functions
+src/obligations.rs     the six rules, the mute logic and what the DM may carry --
+                       pure functions
 src/opportunities.rs   the four opportunity sources and the fallback ranking
 src/unshipped.rs       fork PRs and local branches, and issue linking
 src/footprint.rs       which crates are yours, from git history
 src/project.rs         the org board's Needs Review column (+ a survey tool)
-src/model.rs           gists and the judge, both cached in state/
+src/model.rs           gists, ask verdicts and the judge, cached in state/
 src/prompts.rs         what the model is told, byte for byte
-src/render.rs          cards and the DM text
+src/render.rs          cards and the DM's words
 src/board.rs           kanban parse/merge/write -- owns the state contract
 src/claims.rs          upstream status of claimed cards
 src/brief.rs           issue and review briefs for claimed cards
@@ -169,8 +191,11 @@ reuse cached gists and rankings unless something they look at moved.
   502'd the old bulk scan.
 - **The board write is deterministic code, not model output.** The model
   writes gists and ranks opportunities; it cannot invent an item, hide an
-  obligation, or touch your lanes. Any model failure degrades to computed
-  reasons and mechanical order, and says so.
+  obligation from the board, or touch your lanes. Any model failure degrades to
+  computed reasons and mechanical order.
+- **The model does filter the DM.** Rules can't tell "@you already pointed this
+  out" from "@you can you check this". A comment can talk the model out of an ask,
+  which costs you that interruption and nothing else: the card stays on the board.
 - **Read-only, enforced by the token.** The scanner sends only GETs and
   GraphQL queries. The gist and judge passes get no tools at all, because their
   prompts carry text from anyone who can open an issue. The one exception is the

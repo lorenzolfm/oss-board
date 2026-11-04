@@ -1,4 +1,5 @@
-//! Floresta triage: what is blocked on you, then what is worth your evening.
+//! Floresta triage: what is waiting on you, and one short DM a morning about what is
+//! new in it.
 //!
 //! Order of operations matters:
 //!   1. Read the board FIRST -- mutes, tombstones and claims are user state and must
@@ -7,8 +8,7 @@
 //!      unshipped work and opportunities as pure functions of it. A source that fails
 //!      leaves what it fed as it was, and the run says so.
 //!   3. Ask the model for gists and an opportunity ranking. Either can fail; the
-//!      board and the DM are still written, from computed reasons and ranking order,
-//!      and say so.
+//!      board and the DM are still written, from computed reasons and ranking order.
 //!   4. Write the board deterministically, on top of the file as it is by then. Only
 //!      then write briefings, which can take minutes and must not hold the board up.
 //!   5. DM if a slot is due.
@@ -118,7 +118,7 @@ fn take_lock(state: &Path) -> Result<Option<File>> {
 
 /// The DM slot this run should answer for, or `None`.
 ///
-/// The timer is hourly; the DM is twice a day. A run sends when the most recent slot
+/// The timer is hourly; the DM is once a day. A run sends when the most recent slot
 /// at or before `now` has not been answered yet. A missed slot (the desktop was off)
 /// is sent by the first run after it -- unless it is so old that the next one is the
 /// better message.
@@ -226,12 +226,11 @@ fn enrich_stale_acks(obs: &mut [Obligation<'_>], me: &Viewer) {
     }
 }
 
-/// What the briefing pass did: the links to add to cards, and which items it wrote a
-/// note for.
+/// What the briefing pass did: the links to add to cards, and how many notes it wrote.
 #[derive(Default)]
 struct Briefings {
     links: Vec<(CardKey, String)>,
-    briefed: Vec<String>,
+    written: usize,
 }
 
 /// Briefing notes for newly claimed cards. A note under its real name is complete, so
@@ -263,7 +262,7 @@ fn write_briefings(
             out.links.push((claim.key.clone(), link));
             continue;
         }
-        if out.briefed.len() >= limit {
+        if out.written >= limit {
             continue;
         }
         let kind = if item.pr().is_some() {
@@ -285,7 +284,7 @@ fn write_briefings(
             Ok(written) => {
                 log(&format!("  written: {}", written.display()));
                 out.links.push((claim.key.clone(), link));
-                out.briefed.push(format!("#{}", item.number));
+                out.written += 1;
             }
         }
     }
@@ -510,7 +509,7 @@ fn run(args: &Refresh) -> Result<()> {
     let mut needs_me: Vec<Card> = visible
         .iter()
         .filter(|ob| !active.contains_key(&ob.item.key))
-        .map(|ob| render::ob_card(ob, gists.get(&ob.item.key).map(String::as_str)))
+        .map(|ob| render::ob_card(ob, gists.get(&ob.item.key).map(|gist| gist.text.as_str())))
         .collect();
     let computed: HashSet<&CardKey> = visible.iter().map(|ob| &ob.item.key).collect();
     needs_me.extend(board.carried(&unread_kinds, &computed));
@@ -571,9 +570,7 @@ fn run(args: &Refresh) -> Result<()> {
     }
 
     let today = local.date_naive().to_string();
-    let briefed = if args.no_briefings || args.dry_run {
-        Vec::new()
-    } else {
+    if !args.no_briefings && !args.dry_run {
         let done = write_briefings(
             &claimed,
             &snap,
@@ -588,8 +585,7 @@ fn run(args: &Refresh) -> Result<()> {
                 ..Changes::default()
             })?;
         }
-        done.briefed
-    };
+    }
 
     // 5. DM
     let last_dm = match model::read_state::<LastDm>(&state_path("last_dm.json")) {
@@ -600,41 +596,20 @@ fn run(args: &Refresh) -> Result<()> {
             LastDm::default()
         }
     };
-    let mut marks: BTreeMap<CardKey, String> = visible
-        .iter()
-        .map(|ob| {
-            let mark = obligations::fingerprint(ob).last_text();
-            (ob.item.key.clone(), mark)
-        })
-        .collect();
-    for (opp, _) in ranked.picks() {
-        let item = opp.item;
-        let mark = item
-            .head()
-            .map_or_else(|| item.created.to_string(), str::to_owned);
-        marks.insert(item.key.clone(), mark);
-    }
-    let new_keys: HashSet<CardKey> = marks
-        .iter()
-        .filter(|(key, mark)| last_dm.seen.get(key) != Some(mark))
-        .map(|(key, _)| key.clone())
-        .collect();
+    let waiting = obligations::new_asks(&visible, &last_dm.seen, |key| {
+        gists.get(key).map(|gist| gist.asks)
+    });
+    let (asks, held) = waiting.split_at(waiting.len().min(config::DM_ASKS));
     let n_gists = gists.len();
     let n_picks = ranked.picks().len();
     let judged = ranked.is_judged();
     let text = Dm {
-        today: &local.format("%a %d %b %H:%M").to_string(),
-        obs: &visible,
-        gists,
-        claimed_lane: active,
-        ranked,
-        unshipped: shelf.len(),
-        new_keys,
-        degraded: degraded.clone(),
+        asks,
+        on_board: visible.len() - asks.len(),
+        gists: &gists,
+        claimed_lane: &active,
+        degraded: &degraded,
         claim_alerts: &claim_alerts,
-        muted: n_muted,
-        briefed: &briefed,
-        cap: config::DM_OPPORTUNITIES,
     }
     .render();
     fs::write(state_path("summary.txt"), &text)?;
@@ -653,7 +628,7 @@ fn run(args: &Refresh) -> Result<()> {
         if results.iter().any(|delivery| delivery.ok) {
             let record = LastDm {
                 at: Some(local),
-                seen: marks,
+                seen: obligations::seen_after(&visible, held, &last_dm.seen),
             };
             model::save(&state_path("last_dm.json"), &record)?;
         }
@@ -722,7 +697,7 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
-    const SLOTS: [(u32, u32); 2] = [(8, 7), (19, 23)];
+    const SLOTS: [(u32, u32); 1] = [(8, 7)];
 
     fn at(day: u32, hour: u32, minute: u32) -> DateTime<FixedOffset> {
         FixedOffset::west_opt(3 * 3600)
@@ -732,13 +707,13 @@ mod tests {
     }
 
     #[test]
-    fn twice_a_day_from_an_hourly_timer() {
+    fn once_a_morning_from_an_hourly_timer() {
         type Clock = (u32, u32, u32);
-        let cases: [(&str, Clock, Option<Clock>, Option<Clock>); 8] = [
+        let cases: [(&str, Clock, Option<Clock>, Option<Clock>); 7] = [
             (
-                "the first run after a slot sends",
+                "the first run after the slot sends",
                 (15, 8, 7),
-                Some((14, 19, 23)),
+                Some((14, 8, 7)),
                 Some((15, 8, 7)),
             ),
             (
@@ -748,33 +723,27 @@ mod tests {
                 None,
             ),
             (
-                "a run before the evening slot does not",
-                (15, 19, 7),
+                "nothing goes out in the evening",
+                (15, 19, 23),
                 Some((15, 8, 7)),
                 None,
             ),
             (
-                "the evening slot sends",
-                (15, 19, 23),
+                "a run before the slot does not",
+                (16, 7, 7),
                 Some((15, 8, 7)),
-                Some((15, 19, 23)),
-            ),
-            (
-                "overnight runs stay quiet",
-                (16, 3, 7),
-                Some((15, 19, 23)),
                 None,
             ),
             (
                 "a slot missed while the desktop was off is sent late",
                 (15, 11, 30),
-                Some((14, 19, 23)),
+                Some((14, 8, 7)),
                 Some((15, 8, 7)),
             ),
             (
-                "one missed by more than the grace waits for the next",
-                (16, 6, 0),
-                Some((15, 8, 7)),
+                "one missed by more than the grace waits for tomorrow",
+                (15, 17, 0),
+                Some((14, 8, 7)),
                 None,
             ),
             ("a first run ever sends", (15, 8, 7), None, Some((15, 8, 7))),

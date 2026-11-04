@@ -124,9 +124,9 @@ pub fn heartbeat(push_url: Option<&str>, status: &str, message: &str) -> Outcome
     }
 }
 
-/// Split at line boundaries so no part exceeds Telegram's limit. The DM lists every
-/// obligation, uncapped, so a long day is several messages rather than a truncated
-/// one.
+/// Split at line boundaries so no part exceeds Telegram's limit. The asks are capped
+/// but the alerts are not, so a message that somehow runs long is several messages
+/// rather than a truncated one.
 pub fn chunks(text: &str, limit: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -223,6 +223,15 @@ pub fn dispatch(text: &str) -> Vec<Delivery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_message_is_split_at_lines_and_nothing_is_lost() {
+        let message = vec!["t".repeat(120); 60].join("\n");
+        let parts = chunks(&message, CHUNK_LIMIT);
+        assert!(parts.len() > 1);
+        assert!(parts.iter().all(|part| part.chars().count() <= CHUNK_LIMIT));
+        assert_eq!(parts.join("\n"), message);
+    }
 
     #[test]
     fn a_single_absurd_line_is_cut_by_characters_not_bytes() {

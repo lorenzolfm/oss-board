@@ -12,6 +12,7 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use chrono::{SecondsFormat, TimeDelta, Utc};
 use tempfile::TempDir;
 
 const FAKE_GH: &str = r#"#!/bin/sh
@@ -52,10 +53,12 @@ case "$prompt" in
   "Each item below"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     echo 'Sure, here you go:'
-    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no"}]}';;
+    asks=true
+    [ -f "$FIXTURE_DIR/nobody_asks" ] && asks=false
+    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no","asks":'"$asks"'}]}';;
   "You are picking"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
-    echo '{"picks":[{"number":8,"why":"small and yours","pitch":"read it first","est":"1h"}]}';;
+    echo '{"picks":[{"number":8,"why":"small and yours"}]}';;
   "Write an Obsidian"*)
     echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     cp "$FIXTURE_DIR/vault/Tasks.md" "$FIXTURE_DIR/board_at_brief.md"
@@ -73,11 +76,13 @@ printf 'TODO' > "$note"
 exit 1
 "#;
 
-/// An open PR, as the bulk query returns one.
+/// An open PR, as the bulk query returns one, opened recently enough that a mention in
+/// its description is still asking.
 fn pr_node(number: u64, title: &str, body: &str, head: &str, author: &str) -> String {
+    let opened = (Utc::now() - TimeDelta::days(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
     format!(
         r#"{{"number":{number},"title":"{title}","url":"https://github.com/getfloresta/Floresta/pull/{number}",
-        "body":"{body}","isDraft":false,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z",
+        "body":"{body}","isDraft":false,"createdAt":"{opened}","updatedAt":"{opened}",
         "additions":1,"deletions":0,"changedFiles":1,"headRefOid":"{head}",
         "author":{{"__typename":"User","login":"{author}"}},"milestone":null,"labels":{{"nodes":[]}},
         "assignees":{{"nodes":[]}},"reviewDecision":null,"reviewRequests":{{"nodes":[]}},
@@ -488,7 +493,6 @@ fn a_failed_merge_read_keeps_the_card_and_is_not_an_all_clear() {
     let beat = beats.recv().unwrap();
     assert!(beat.contains("degraded"), "{beat}");
     let dm = fixture.read_state("summary.txt");
-    assert!(!dm.contains('✅'), "{dm}");
     assert!(dm.contains("merge state unread"), "{dm}");
 }
 
@@ -516,14 +520,13 @@ fn a_conflict_still_being_computed_keeps_the_card_and_is_not_an_all_clear() {
     assert_eq!(lane(&board, "Needs me"), [card.as_str()]);
     assert_eq!(fixture.degraded(), serde_json::json!(["merge_computing"]));
     let dm = fixture.read_state("summary.txt");
-    assert!(!dm.contains('✅'), "{dm}");
     assert!(dm.contains("still computing conflicts"), "{dm}");
 
     answer_with("MERGEABLE");
     let board = fixture.read_board();
     assert!(lane(&board, "Needs me").is_empty(), "answered: {board}");
     assert_eq!(fixture.degraded(), serde_json::json!([]));
-    assert!(fixture.read_state("summary.txt").contains('✅'));
+    assert!(!fixture.read_state("summary.txt").contains('⚠'));
 }
 
 /// You muted it red. A push is a new trigger, and it comes back only then.
@@ -673,7 +676,7 @@ fn a_corrupt_last_dm_means_never_sent_and_says_so() {
             "{record}"
         );
         let dm = fixture.read_state("summary.txt");
-        assert!(dm.contains("🆕"), "{record}: {dm}");
+        assert!(dm.contains("1 new"), "{record}: {dm}");
     }
 }
 
@@ -821,20 +824,22 @@ fn without_a_read_only_token_a_briefing_is_refused_not_run_on_your_own_auth() {
     assert_eq!(fixture.claude_log(), "");
 }
 
+/// One DM through the transport the tests can read, handing back what it sent.
+fn deliver(fixture: &Fixture, url: &str, messages: &Receiver<String>, flags: &[&str]) -> String {
+    run(fixture
+        .command(&[&["--notify", "--dm-now", "--no-briefings"], flags].concat())
+        .env("OPENCLAW_ENABLED", "1")
+        .env("OPENCLAW_URL", url)
+        .env("OPENCLAW_GATEWAY_TOKEN", "gateway-token"));
+    messages.recv().unwrap()
+}
+
 #[test]
-fn a_delivered_dm_is_remembered_so_the_next_one_marks_only_what_changed() {
+fn a_delivered_dm_is_remembered_so_the_next_one_says_nothing_new() {
     let fixture = Fixture::new();
     let (url, messages) = listener();
-    let notify = |fixture: &Fixture| {
-        run(fixture
-            .command(&["--notify", "--dm-now", "--no-model", "--no-briefings"])
-            .env("OPENCLAW_ENABLED", "1")
-            .env("OPENCLAW_URL", &url)
-            .env("OPENCLAW_GATEWAY_TOKEN", "gateway-token"));
-    };
 
-    notify(&fixture);
-    let first = messages.recv().unwrap();
+    let first = deliver(&fixture, &url, &messages, &["--no-model"]);
     assert!(
         first.contains("POST /api/channels/telegram/send"),
         "{first}"
@@ -845,15 +850,41 @@ fn a_delivered_dm_is_remembered_so_the_next_one_marks_only_what_changed() {
             .contains("authorization: bearer gateway-token"),
         "{first}"
     );
-    assert!(
-        first.contains("🆕"),
-        "everything is new the first time: {first}"
-    );
-    let record: serde_json::Value =
-        serde_json::from_str(&fixture.read_state("last_dm.json")).unwrap();
-    assert_eq!(record["seen"]["getfloresta/floresta#8"], "bbbbbbb");
+    assert!(first.contains("1 new"), "{first}");
+    assert!(first.contains("pull/7"), "{first}");
 
-    notify(&fixture);
-    let second = messages.recv().unwrap();
-    assert!(!second.contains("🆕"), "nothing moved: {second}");
+    let second = deliver(&fixture, &url, &messages, &["--no-model"]);
+    assert!(second.contains("nothing new"), "{second}");
+    assert!(!second.contains("pull/7"), "{second}");
+    assert!(second.contains("1 on the board"), "{second}");
+}
+
+/// The verdict decides what interrupts you. It never decides what is on the board, so a
+/// comment that talks the model out of an ask cannot make it disappear.
+#[test]
+fn what_the_model_says_asks_nothing_stays_on_the_board_and_out_of_the_dm() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("nobody_asks"), "").unwrap();
+    let (url, messages) = listener();
+    let dm = deliver(&fixture, &url, &messages, &[]);
+    assert!(dm.contains("nothing new"), "{dm}");
+    assert!(!dm.contains("pull/7"), "{dm}");
+    assert!(!dm.contains("not filtered"), "{dm}");
+
+    let board = fixture.read_board();
+    assert!(lane(&board, "Needs me")[0].contains("[#7]("), "{board}");
+}
+
+/// Opportunities stay on the board.
+#[test]
+fn the_dm_carries_no_opportunities() {
+    let fixture = Fixture::new();
+    let (url, messages) = listener();
+    let dm = deliver(&fixture, &url, &messages, &[]);
+    assert!(!dm.contains("pull/8"), "{dm}");
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Opportunities")[0].contains("[#8]("),
+        "{board}"
+    );
 }

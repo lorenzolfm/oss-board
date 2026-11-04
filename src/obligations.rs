@@ -15,6 +15,8 @@ use std::sync::LazyLock;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 
+use crate::board::CardKey;
+use crate::config;
 use crate::snapshot::{
     CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review, ReviewState,
     Snapshot,
@@ -87,6 +89,19 @@ impl ReasonKind {
             Self::UnresolvedThread => "unresolved_thread",
             Self::Unshipped => "unshipped",
         }
+    }
+
+    /// Whether this reason is an ask by its nature. For the rest, someone has to have
+    /// actually asked, which only the gist pass can read.
+    fn is_an_ask(self) -> bool {
+        matches!(
+            self,
+            Self::Assigned
+                | Self::ChangesRequested
+                | Self::CiFailed
+                | Self::Conflict
+                | Self::ReviewRequested
+        )
     }
 }
 
@@ -296,6 +311,11 @@ fn quotes(body: &str, mine: &[Said<'_>]) -> bool {
     mine.iter().any(|said| norm(said.body).contains(probe))
 }
 
+/// Whether a comment is recent enough to still be asking anything.
+fn is_live(at: Timestamp, now: DateTime<Utc>) -> bool {
+    at.days_ago(now) <= config::CONVERSATION_TTL_DAYS
+}
+
 // ---------------------------------------------------------------- the rules
 
 /// Rule 2: the newest comment isn't yours, and it mentions you, or the item is
@@ -323,7 +343,7 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     }
     let after = said
         .iter()
-        .filter(|s| !me.is(s.author) && !s.bot && Some(s.at) > mine_at);
+        .filter(|s| !me.is(s.author) && !s.bot && Some(s.at) > mine_at && is_live(s.at, now));
     let (pinged, others): (Vec<&Said<'_>>, Vec<&Said<'_>>) =
         after.partition(|s| me.is_mentioned_in(s.body) || quotes(s.body, &mine));
 
@@ -380,6 +400,9 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
     if me.is(&item.author) {
         return Vec::new(); // your own PR's threads are rule 3's business
     }
+    // Any activity of yours answers what came before it, in this thread or not. Without
+    // write access you cannot resolve a thread, so an ACK is all you can say to one.
+    let engaged = engaged_at(item, me);
     let mut waiting = Vec::new();
     for thread in &pr.threads {
         let comments: Vec<_> = thread.comments.iter().filter(|c| !c.bot).collect();
@@ -389,14 +412,9 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
         let Some(newest) = comments.last().filter(|c| !me.is(&c.author)) else {
             continue;
         };
-        let mine_at = comments
-            .iter()
-            .filter(|c| me.is(&c.author))
-            .map(|c| c.at)
-            .max();
         let Some(first) = comments
             .iter()
-            .find(|c| Some(c.at) > mine_at && !me.is(&c.author))
+            .find(|c| Some(c.at) > engaged && !me.is(&c.author) && is_live(c.at, now))
         else {
             continue;
         };
@@ -435,6 +453,13 @@ fn review_request(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -
         .get(&me.login)
         .copied()
         .unwrap_or(item.created);
+    // GitHub holds the request open until a review is submitted. A comment of yours with
+    // nothing pushed since has said your piece, and the next move is the author's.
+    let answered = engaged_at(item, me)
+        .is_some_and(|mine| mine > at && pr.head_at.is_some_and(|head| head <= mine));
+    if answered {
+        return Vec::new();
+    }
     let text = format!("review requested {} ago", at.ago(now));
     vec![Reason::at(ReasonKind::ReviewRequested, at, text)]
 }
@@ -726,6 +751,85 @@ pub fn is_muted(ob: &Obligation<'_>, mute: Option<&Mute>) -> bool {
     mute.is_some_and(|mute| ob.reasons.iter().all(|reason| mute.covers(reason)))
 }
 
+// ---------------------------------------------------------------- the DM
+
+/// What the last DM saw of an item, as `last_dm.json` keeps it.
+fn seen_text(ob: &Obligation<'_>) -> String {
+    let fp = fingerprint(ob);
+    format!(
+        "{}|{}|{}",
+        fp.last_text(),
+        fp.kinds_text(),
+        fp.head.unwrap_or_default()
+    )
+}
+
+/// The reasons that are a new trigger since the last DM, by the same test a mute uses.
+fn new_reasons<'o>(ob: &'o Obligation<'_>, seen: Option<&str>) -> Vec<&'o Reason> {
+    let Some(seen) = seen else {
+        return ob.reasons.iter().collect();
+    };
+    let mut parts = seen.split('|');
+    let last = parts.next().and_then(Timestamp::parse);
+    let Some(kinds) = parts.next() else {
+        // Written before the record named kinds, so all it says is how far you had read.
+        return if fingerprint(ob).last <= last {
+            Vec::new()
+        } else {
+            ob.reasons.iter().collect()
+        };
+    };
+    let head = parts.next().filter(|head| !head.is_empty());
+    let mut mute = Mute::default();
+    for kind in kinds.split(',').filter_map(ReasonKind::parse) {
+        mute.remember(kind, last, head);
+    }
+    ob.reasons
+        .iter()
+        .filter(|reason| !mute.covers(reason))
+        .collect()
+}
+
+/// Everything the DM may interrupt you with, in the order of `obs`: a new trigger since
+/// the last DM that is an ask, either by its nature or on the model's reading. An item
+/// the model has no verdict on is kept, because a dropped ask cannot be seen to be
+/// missing and a capped message can afford a false alarm.
+pub fn new_asks<'o, 'a>(
+    obs: &'o [Obligation<'a>],
+    seen: &BTreeMap<CardKey, String>,
+    asks: impl Fn(&CardKey) -> Option<bool>,
+) -> Vec<&'o Obligation<'a>> {
+    obs.iter()
+        .filter(|ob| {
+            let new = new_reasons(ob, seen.get(&ob.item.key).map(String::as_str));
+            !new.is_empty()
+                && (new.iter().any(|reason| reason.kind.is_an_ask())
+                    || asks(&ob.item.key).unwrap_or(true))
+        })
+        .collect()
+}
+
+/// What to remember once a DM is delivered. An ask `held` back by the cap keeps what was
+/// remembered of it, so it stays new for the next DM; what cleared is forgotten.
+pub fn seen_after(
+    obs: &[Obligation<'_>],
+    held: &[&Obligation<'_>],
+    seen: &BTreeMap<CardKey, String>,
+) -> BTreeMap<CardKey, String> {
+    let is_held = |key: &CardKey| held.iter().any(|ob| ob.item.key == *key);
+    obs.iter()
+        .filter_map(|ob| {
+            let key = &ob.item.key;
+            let text = if is_held(key) {
+                seen.get(key)?.clone()
+            } else {
+                seen_text(ob)
+            };
+            Some((key.clone(), text))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! The obligation rules, through `collect` -- the one entry point the run uses.
@@ -850,7 +954,9 @@ mod tests {
             ),
             (
                 "PR description cc's you",
-                pr(9).body(&at_me("Fixes a stall. cc @me for review")),
+                pr(9)
+                    .created(day(3))
+                    .body(&at_me("Fixes a stall. cc @me for review")),
                 vec!["mention"],
             ),
         ]);
@@ -859,7 +965,10 @@ mod tests {
     #[test]
     fn an_informal_ask_reads_as_one() {
         let viewer = me();
-        let snapshot = snap(vec![pr(9).body(&at_me("cc @me for review"))], vec![]);
+        let snapshot = snap(
+            vec![pr(9).created(day(3)).body(&at_me("cc @me for review"))],
+            vec![],
+        );
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let text = &obs[0].reasons[0].text;
         assert!(text.contains("asked you to review"), "{text}");
@@ -872,7 +981,7 @@ mod tests {
                 "an answer to you stays one after a later assignment (#167)",
                 issue(167).assigned(ME, day(8)).comments(vec![
                     c(ME, 40, "What's the scope?"),
-                    c("csgui", 29, "Run a node and re-level logs"),
+                    c("csgui", 9, "Run a node and re-level logs"),
                 ]),
                 vec!["assigned", "reply"],
             ),
@@ -1032,6 +1141,120 @@ mod tests {
         ]);
     }
 
+    /// Without write access you cannot resolve a thread, so these would never clear.
+    #[test]
+    fn a_later_word_of_yours_answers_a_thread_you_cannot_resolve() {
+        let replied = |n| pr(n).threads(vec![thread(vec![c(ME, 9, "nit"), c("bob", 5, "done")])]);
+        check(vec![
+            (
+                "an ACK of the head since the reply (#1417)",
+                replied(70).reviews(vec![review(ME, 3, ReviewState::Approved, "ACK fffffff")]),
+                vec![],
+            ),
+            (
+                "a comment elsewhere on the PR since the reply (#1412)",
+                replied(71).comments(vec![c(ME, 3, "one more thing")]),
+                vec![],
+            ),
+            (
+                "a word of yours from before the reply answers nothing",
+                replied(72).reviews(vec![review(ME, 7, ReviewState::Commented, "some notes")]),
+                vec!["thread"],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_review_request_you_have_answered_short_of_a_review() {
+        let requested = |n| pr(n).requested(ME, &day(10).to_string());
+        let said = || vec![c(ME, 5, "what about the pokes?")];
+        check(vec![
+            (
+                "a comment with nothing pushed since (#1336)",
+                requested(73).comments(said()),
+                vec![],
+            ),
+            (
+                "a push since your comment",
+                requested(74).head_at(day(2)).comments(said()),
+                vec!["review_requested"],
+            ),
+            (
+                "asked again since your comment",
+                pr(75).requested(ME, &day(2).to_string()).comments(said()),
+                vec!["review_requested"],
+            ),
+            (
+                "a comment from before the request",
+                requested(76).comments(vec![c(ME, 15, "a comment")]),
+                vec!["review_requested"],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_conversation_left_quiet_stops_asking_and_a_state_does_not() {
+        check(vec![
+            (
+                "a mention nobody followed up",
+                issue(80).comments(vec![c("bob", 15, &at_me("@me thoughts?"))]),
+                vec![],
+            ),
+            (
+                "a mention still inside the window",
+                issue(81).comments(vec![c("bob", 13, &at_me("@me thoughts?"))]),
+                vec!["mention"],
+            ),
+            (
+                "a reply in your review thread",
+                pr(82).threads(vec![thread(vec![
+                    c(ME, 30, "why?"),
+                    c("bob", 15, "because"),
+                ])]),
+                vec![],
+            ),
+            (
+                "a reply on your own issue",
+                issue(83)
+                    .author(ME)
+                    .comments(vec![c("bob", 15, "a comment")]),
+                vec![],
+            ),
+            (
+                "a formal review request",
+                pr(84).requested(ME, &day(60).to_string()),
+                vec!["review_requested"],
+            ),
+            (
+                "an assignment",
+                issue(85).assigned(ME, day(60)),
+                vec!["assigned"],
+            ),
+            (
+                "an unresolved thread on your own PR",
+                pr(86)
+                    .author(ME)
+                    .head_at(day(40))
+                    .threads(vec![thread(vec![c("bob", 30, "a nit")])]),
+                vec!["unresolved_thread"],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_new_ping_brings_it_back_dated_from_itself() {
+        let viewer = me();
+        let snapshot = snap(
+            vec![],
+            vec![issue(87).comments(vec![
+                c("bob", 40, &at_me("@me thoughts?")),
+                c("carol", 2, &at_me("@me still?")),
+            ])],
+        );
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert_eq!(obs[0].reasons[0].text, "carol mentioned you 2d ago");
+    }
+
     #[test]
     fn stale_acks_and_unsubmitted_reviews() {
         let head = "abcdef0123456789abcdef0123456789abcdef01";
@@ -1087,9 +1310,9 @@ mod tests {
             vec![
                 pr(50).requested(ME, &day(2).to_string()),
                 pr(51).requested(ME, &day(40).to_string()),
-                pr(52).author(ME).updated(day(10)),
+                pr(52).author(ME).updated(day(5)),
             ],
-            vec![issue(53).comments(vec![c("bob", 20, &at_me("@me"))])],
+            vec![issue(53).comments(vec![c("bob", 12, &at_me("@me"))])],
         );
         let merge = merge_of(52, Mergeability::Conflicting, None);
         let order: Vec<u64> = collect(&snapshot, &viewer, now(), &merge)
@@ -1229,5 +1452,158 @@ mod tests {
             None,
         );
         assert!(!is_muted(&obs[0], Some(&mute)));
+    }
+
+    // ------------------------------------------------------------ the DM
+
+    /// What a delivered DM leaves behind when nothing was held back.
+    fn seen_of(obs: &[Obligation<'_>]) -> BTreeMap<CardKey, String> {
+        seen_after(obs, &[], &BTreeMap::new())
+    }
+
+    /// The numbers the DM would carry, given a model that always says the same thing.
+    fn asking(
+        item: Item,
+        merge: &HashMap<u64, MergeState>,
+        seen: &BTreeMap<CardKey, String>,
+        verdict: Option<bool>,
+    ) -> Vec<u64> {
+        let viewer = me();
+        let snapshot = snap(vec![item], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), merge);
+        new_asks(&obs, seen, |_| verdict)
+            .iter()
+            .map(|ob| ob.item.number)
+            .collect()
+    }
+
+    fn seen_on(item: Item, merge: &HashMap<u64, MergeState>) -> BTreeMap<CardKey, String> {
+        let viewer = me();
+        let snapshot = snap(vec![item], vec![]);
+        seen_of(&collect(&snapshot, &viewer, now(), merge))
+    }
+
+    #[test]
+    fn what_the_last_dm_saw_stays_quiet_until_a_new_trigger() {
+        let empty = HashMap::new();
+        let base = pr(90).comments(vec![c("bob", 5, &at_me("@me ping"))]);
+        let seen = seen_on(base.clone(), &empty);
+        assert!(asking(base.clone(), &empty, &seen, Some(true)).is_empty());
+        assert!(
+            asking(
+                base.clone().comments(vec![c("carol", 4, "+1 from me")]),
+                &empty,
+                &seen,
+                Some(true)
+            )
+            .is_empty(),
+            "general activity"
+        );
+        assert_eq!(
+            asking(
+                base.comments(vec![c("carol", 2, &at_me("@me also this"))]),
+                &empty,
+                &seen,
+                Some(true)
+            ),
+            [90],
+            "a newer mention"
+        );
+    }
+
+    /// The newest time alone cannot tell these apart: neither of them moves it.
+    #[test]
+    fn a_new_kind_or_a_new_head_is_new_though_the_time_has_not_moved() {
+        let clean = HashMap::new();
+        let conflict = merge_of(91, Mergeability::Conflicting, None);
+        let mine = pr(91)
+            .author(ME)
+            .head_at(day(5))
+            .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
+        let seen = seen_on(mine.clone(), &clean);
+        assert_eq!(asking(mine.clone(), &conflict, &seen, Some(false)), [91]);
+
+        let seen = seen_on(mine.clone(), &conflict);
+        assert!(asking(mine.clone(), &conflict, &seen, Some(false)).is_empty());
+        let pushed = mine.with_head(&"b".repeat(40));
+        assert_eq!(asking(pushed, &conflict, &seen, Some(false)), [91]);
+    }
+
+    /// #167 loses its mention to the expiry and stays assigned. Nothing happened.
+    #[test]
+    fn a_reason_going_away_is_not_new() {
+        let viewer = me();
+        let mentioned =
+            issue(92)
+                .assigned(ME, day(8))
+                .comments(vec![c("bob", 5, &at_me("@me scope?"))]);
+        let snapshot = snap(vec![], vec![mentioned]);
+        let seen = seen_of(&collect(&snapshot, &viewer, now(), &HashMap::new()));
+
+        let quiet = issue(92).assigned(ME, day(8));
+        let snapshot = snap(vec![], vec![quiet]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert!(new_asks(&obs, &seen, |_| Some(true)).is_empty());
+    }
+
+    #[test]
+    fn the_model_decides_only_what_is_not_an_ask_by_its_nature() {
+        let empty = HashMap::new();
+        let none = BTreeMap::new();
+        let mention = || pr(93).comments(vec![c("bob", 5, &at_me("@me thanks!"))]);
+        assert_eq!(asking(mention(), &empty, &none, Some(true)), [93]);
+        assert!(asking(mention(), &empty, &none, Some(false)).is_empty());
+        assert_eq!(
+            asking(mention(), &empty, &none, None),
+            [93],
+            "no verdict keeps it"
+        );
+
+        let requested = pr(94).requested(ME, &day(5).to_string());
+        assert_eq!(asking(requested.clone(), &empty, &none, Some(false)), [94]);
+
+        let seen = seen_on(requested.clone(), &empty);
+        let then_thanked = requested.comments(vec![c("bob", 2, &at_me("@me thanks!"))]);
+        assert!(
+            asking(then_thanked, &empty, &seen, Some(false)).is_empty(),
+            "only what is new counts: the request was already seen"
+        );
+    }
+
+    #[test]
+    fn an_ask_held_back_by_the_cap_stays_new_for_the_next_dm() {
+        let viewer = me();
+        let snapshot = snap(
+            vec![
+                pr(95).requested(ME, &day(5).to_string()),
+                pr(96).requested(ME, &day(3).to_string()),
+            ],
+            vec![],
+        );
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let waiting = new_asks(&obs, &BTreeMap::new(), |_| None);
+        let (shown, held) = waiting.split_at(1);
+        assert_eq!(shown[0].item.number, 95);
+
+        let seen = seen_after(&obs, held, &BTreeMap::new());
+        let next = new_asks(&obs, &seen, |_| None);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].item.number, 96);
+    }
+
+    /// The record from before this one named kinds, and opportunities by their head.
+    #[test]
+    fn a_record_from_before_kinds_covers_everything_up_to_its_time() {
+        let empty = HashMap::new();
+        let item = pr(97).comments(vec![c("bob", 5, &at_me("@me ping"))]);
+        let key = item.key.clone();
+        let seen_as = |text: String| BTreeMap::from([(key.clone(), text)]);
+
+        let current = seen_as(day(5).to_string());
+        assert!(asking(item.clone(), &empty, &current, Some(true)).is_empty());
+        let older = seen_as(day(6).to_string());
+        assert_eq!(asking(item.clone(), &empty, &older, Some(true)), [97]);
+        let a_head = seen_as("d6c385e521c36cc9c24bc534db3f4b1693194a20".to_owned());
+        assert_eq!(asking(item, &empty, &a_head, Some(true)), [97]);
     }
 }

@@ -172,6 +172,11 @@ impl Item {
         self
     }
 
+    pub fn created(mut self, at: Timestamp) -> Self {
+        self.created = at;
+        self
+    }
+
     pub fn updated(mut self, at: Timestamp) -> Self {
         self.updated = at;
         self
