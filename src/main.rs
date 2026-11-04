@@ -151,7 +151,8 @@ struct LastDm {
     at: Option<DateTime<FixedOffset>>,
     #[serde(default, deserialize_with = "seen_records")]
     seen: BTreeMap<CardKey, Seen>,
-    /// What each claimed card's alert last said.
+    /// What each claimed card's alert last said, not how the line was worded, so a change
+    /// of wording is not news.
     #[serde(default)]
     alerted: BTreeMap<CardKey, String>,
 }
@@ -162,7 +163,7 @@ impl LastDm {
         alerts
             .iter()
             .filter(|(key, said)| self.alerted.get(*key) != Some(*said))
-            .map(|(_, said)| said.clone())
+            .map(|(key, said)| format!("{} — {said}", key.short()))
             .collect()
     }
 
@@ -722,8 +723,7 @@ fn run(args: &Refresh) -> Result<()> {
         // Done is finished with, so what happens upstream of it is no alarm. The card says it.
         let urgent = held.filter(|s| s.urgent && claim.lane.is_active());
         if let Some(held) = urgent {
-            let said = format!("{} — {}", claim.key.short(), held.notes.join(" · "));
-            claim_alerts.insert(claim.key.clone(), said);
+            claim_alerts.insert(claim.key.clone(), held.notes.join(" · "));
         }
     }
 
@@ -865,7 +865,7 @@ mod tests {
     use super::*;
     use crate::obligations::{collect, new_asks};
     use crate::snapshot::MergeState;
-    use crate::testkit::{ME, c, day, me, now, pr, snap};
+    use crate::testkit::{ME, c, day, key, me, now, pr, snap};
     use chrono::TimeZone;
 
     const SLOTS: [(u32, u32); 1] = [(8, 7)];
@@ -940,6 +940,21 @@ mod tests {
                 .seen
                 .contains_key(&"getfloresta/floresta#7".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn an_alert_is_news_for_what_it_says_and_the_dm_names_the_item() {
+        let record: LastDm = serde_json::from_str(
+            r#"{"at": null, "seen": {},
+                "alerted": {"getfloresta/floresta#98": "closed upstream"}}"#,
+        )
+        .unwrap();
+        let alert = |said: &str| {
+            let alerts = BTreeMap::from([(key("getfloresta/floresta#98"), said.to_owned())]);
+            record.new_alerts(&alerts)
+        };
+        assert!(alert("closed upstream").is_empty());
+        assert_eq!(alert("assigned to bob"), ["floresta#98 — assigned to bob"]);
     }
 
     /// Whether item 97 is new to a `last_dm.json` holding this entry for it.
