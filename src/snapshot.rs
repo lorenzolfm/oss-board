@@ -51,7 +51,7 @@ const PR_FIELDS: &str = r#"
   comments(last: 60) { totalCount nodes { author { __typename login } body createdAt } }
   reviewThreads(first: 100) { totalCount nodes {
     isResolved isOutdated path
-    comments(first: 30) { totalCount nodes { author { __typename login } body createdAt } } } }
+    comments(last: 30) { totalCount nodes { author { __typename login } body createdAt } } } }
   timelineItems(last: 20, itemTypes: [REVIEW_REQUESTED_EVENT]) { nodes {
     ... on ReviewRequestedEvent { createdAt requestedReviewer { ... on User { login } } } } }
   forcePushes: timelineItems(last: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { nodes {
@@ -127,6 +127,7 @@ pub struct Review {
 pub struct Thread {
     pub resolved: bool,
     pub path: String,
+    /// Its newest 30 at most, oldest first. A run logs any thread that has more.
     pub comments: Vec<Comment>,
 }
 
@@ -505,7 +506,16 @@ struct ReviewNode {
 struct ThreadNode {
     is_resolved: bool,
     path: String,
-    comments: Conn<CommentNode>,
+    comments: ThreadComments,
+}
+
+/// What was read of a thread, and how long it really is. Without the count a thread that was cut
+/// looks like a whole one.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadComments {
+    total_count: usize,
+    nodes: Vec<Option<CommentNode>>,
 }
 
 #[derive(Deserialize)]
@@ -600,14 +610,25 @@ impl TryFrom<PrNode> for Item {
         let threads = n
             .review_threads
             .into_nodes()
-            .map(|t| Thread {
-                resolved: t.is_resolved,
-                path: t.path,
-                comments: t
-                    .comments
-                    .into_nodes()
-                    .map(|c| c.into_comment(CommentKind::Thread))
-                    .collect(),
+            .map(|t| {
+                let ThreadComments { total_count, nodes } = t.comments;
+                if total_count > nodes.len() {
+                    eprintln!(
+                        "[snapshot] {}: a thread in {} has {total_count} comments, and only the newest {} were read",
+                        n.url,
+                        t.path,
+                        nodes.len()
+                    );
+                }
+                Thread {
+                    resolved: t.is_resolved,
+                    path: t.path,
+                    comments: nodes
+                        .into_iter()
+                        .flatten()
+                        .map(|c| c.into_comment(CommentKind::Thread))
+                        .collect(),
+                }
             })
             .collect();
         let requested: BTreeSet<String> = n
