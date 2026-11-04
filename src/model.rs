@@ -447,7 +447,7 @@ pub struct Verdict {
 #[derive(Debug)]
 pub enum Ranked<'o, 'a> {
     Judged(Vec<(&'o Opportunity<'a>, Verdict)>),
-    /// Ranking order with nothing from the judge, and shown as such.
+    /// Ranking order with nothing from the judge. The run reports it as `Degraded::Model`.
     Mechanical(Vec<&'o Opportunity<'a>>),
 }
 
@@ -468,7 +468,7 @@ impl<'o, 'a> Ranked<'o, 'a> {
     }
 }
 
-/// Falls back to the order given, untouched, and says so.
+/// Falls back to the order given, untouched, and `is_judged` says so.
 pub fn rank<'o, 'a>(
     opps: &'o [Opportunity<'a>],
     fp: &Footprint,

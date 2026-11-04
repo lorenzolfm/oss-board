@@ -58,6 +58,7 @@ case "$prompt" in
     echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no","asks":'"$asks"'}]}';;
   "You are picking"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
+    [ -f "$FIXTURE_DIR/no_judge" ] && exit 1
     echo '{"picks":[{"number":8,"why":"small and yours"}]}';;
   "Write an Obsidian"*)
     echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
@@ -1084,4 +1085,78 @@ fn a_card_in_done_raises_no_alert() {
         lane(&board, "Done")[0].contains("closed upstream"),
         "the card still says so: {board}"
     );
+}
+
+/// With the opportunities gone from the DM, nothing else would say so on a morning with
+/// no ask for the "not filtered" line to go on.
+#[test]
+fn a_model_that_does_not_answer_is_said_on_a_quiet_morning_too() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("bin/claude"), "#!/bin/sh\nexit 1\n").unwrap();
+    let (url, messages) = listener();
+    let first = deliver(&fixture, &url, &messages, &[]);
+    assert!(first.contains("did not answer"), "{first}");
+    let quiet = deliver(&fixture, &url, &messages, &[]);
+    assert!(quiet.contains("nothing new"), "{quiet}");
+    assert!(quiet.contains("did not answer"), "{quiet}");
+    assert_eq!(fixture.degraded(), serde_json::json!(["model"]));
+}
+
+#[test]
+fn what_counts_as_the_model_not_answering() {
+    let waiting = pr_node(7, "waiting on you", "cc @me please", "aaaaaaa", "bob");
+    let also = pr_node(50, "also waiting", "cc @me too", "ddddddd", "bob");
+    let answered = serde_json::json!([]);
+    let unanswered = serde_json::json!(["model"]);
+    let asks_the_model: &[&str] = &["--no-briefings"];
+    for (name, prs, flags, judge_fails, want) in [
+        (
+            "told not to ask",
+            prs(),
+            &["--no-briefings", "--no-model"][..],
+            false,
+            &answered,
+        ),
+        (
+            "nothing to rank is not a failed judge",
+            prs_page(std::slice::from_ref(&waiting)),
+            asks_the_model,
+            false,
+            &answered,
+        ),
+        (
+            "the judge alone failed",
+            prs(),
+            asks_the_model,
+            true,
+            &unanswered,
+        ),
+        (
+            "one item got no gist",
+            prs_page(&[waiting.clone(), also.clone()]),
+            asks_the_model,
+            false,
+            &unanswered,
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("prs.json"), prs).unwrap();
+        if judge_fails {
+            fs::write(fixture.path("no_judge"), "").unwrap();
+        }
+        run(&mut fixture.command(flags));
+        assert_eq!(&fixture.degraded(), want, "{name}");
+    }
+}
+
+/// The shortlist only feeds the ranking, so losing it says nothing about your own PRs.
+#[test]
+fn a_failed_read_of_the_shortlist_does_not_warn_about_your_prs() {
+    let fixture = Fixture::new();
+    run(fixture
+        .command(&["--no-model", "--no-briefings"])
+        .env("GH_FAIL_ON", "mergeable"));
+    assert_eq!(fixture.degraded(), serde_json::json!(["opportunity_merge"]));
+    let dm = fixture.read_state("summary.txt");
+    assert!(!dm.contains("merge state unread"), "{dm}");
 }

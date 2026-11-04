@@ -8,7 +8,8 @@
 //!      unshipped work and opportunities as pure functions of it. A source that fails
 //!      leaves what it fed as it was, and the run says so.
 //!   3. Ask the model for gists and an opportunity ranking. Either can fail; the
-//!      board and the DM are still written, from computed reasons and ranking order.
+//!      board and the DM are still written, from computed reasons and ranking order,
+//!      and the run says so.
 //!   4. Write the board deterministically, on top of the file as it is by then. Only
 //!      then write briefings, which can take minutes and must not hold the board up.
 //!   5. DM if a slot is due.
@@ -510,7 +511,7 @@ fn run(args: &Refresh) -> Result<()> {
     let opp_merge = snapshot::merge_state(config::REPO, &pr_numbers);
     if !opp_merge.unread.is_empty() {
         log(&format!("  merge state unread for {:?}", opp_merge.unread));
-        degraded.insert(Degraded::Merge);
+        degraded.insert(Degraded::OpportunityMerge);
     }
     for o in &mut opps {
         o.merge = opp_merge.states.get(&o.item.number).copied();
@@ -534,6 +535,14 @@ fn run(args: &Refresh) -> Result<()> {
             config::JUDGE_TTL_HOURS,
             model::claude,
         )?;
+        // Both fall back without a mark on the board, so the run has to say so. A cached
+        // answer is an answer: nothing was asked, so nothing failed.
+        let no_gist = visible.iter().any(|ob| !gists.contains_key(&ob.item.key));
+        let no_ranking = !ranked.is_judged() && !opps.is_empty();
+        if no_gist || no_ranking {
+            log("  the model did not answer");
+            degraded.insert(Degraded::Model);
+        }
         (gists, ranked)
     };
     log(&format!(

@@ -127,7 +127,8 @@ A source that can't be read is not a clear board. `Unshipped` and any card held 
 unread source stay as they were, a claimed card keeps its note, and the heartbeat and
 `state/last_run.json` name the source. The DM names it too when it could change what
 the DM says. That includes a conflict GitHub is still computing, as it does after
-master moves: a card held for a conflict waits for an answer.
+master moves: a card held for a conflict waits for an answer. A model that didn't answer
+is named the same way, even on a morning with nothing new.
 
 The timer is hourly; the DM goes out on the first run at or after 08:07, so a morning
 missed while the desktop was off is sent late -- unless it is more than 8 hours stale,
@@ -202,7 +203,7 @@ reuse cached gists and rankings unless something they look at moved.
 - **The board write is deterministic code, not model output.** The model
   writes gists and ranks opportunities; it cannot invent an item, hide an
   obligation from the board, or touch your lanes. Any model failure degrades to
-  computed reasons and mechanical order.
+  computed reasons and mechanical order, and the run says so.
 - **The model does filter the DM.** Rules can't tell "@you already pointed this
   out" from "@you can you check this". A comment can talk the model out of an ask,
   which costs you that interruption and nothing else: the card stays on the board.

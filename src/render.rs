@@ -42,9 +42,11 @@ pub enum Degraded {
     Project,
     Merge,
     MergeComputing,
+    OpportunityMerge,
     Claims,
     Footprint,
     LastDm,
+    Model,
 }
 
 impl Degraded {
@@ -54,9 +56,11 @@ impl Degraded {
             Self::Project => "project",
             Self::Merge => "merge",
             Self::MergeComputing => "merge_computing",
+            Self::OpportunityMerge => "opportunity_merge",
             Self::Claims => "claims",
             Self::Footprint => "footprint",
             Self::LastDm => "last_dm",
+            Self::Model => "model",
         }
     }
 
@@ -70,7 +74,10 @@ impl Degraded {
                 Some("claimed cards not checked upstream: their notes are as they were")
             }
             Self::LastDm => Some("last_dm.json unreadable: everything reads as new"),
-            Self::Project | Self::Footprint => None,
+            Self::Model => Some(
+                "the model did not answer: the board falls back to computed reasons and ranking order",
+            ),
+            Self::Project | Self::Footprint | Self::OpportunityMerge => None,
         }
     }
 }
@@ -315,7 +322,7 @@ mod tests {
         assert!(text.contains("not filtered"), "{text}");
     }
 
-    /// The two left out only feed the opportunity ranking, which the DM does not carry.
+    /// Those not warned about only feed the opportunity ranking, which the DM does not carry.
     #[test]
     fn only_a_source_that_touches_what_the_dm_says_is_warned_about() {
         for (source, warned) in [
