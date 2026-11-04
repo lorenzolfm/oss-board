@@ -108,6 +108,11 @@ an ask by its nature. Anything else needs the model to read someone waiting on y
 specifically. At most 3 per message; any more stay new for the next one. A quiet
 morning is the header line alone, so a missing message means something is broken.
 
+Only clearing forgets what you were told. Dragging a card to Passed doesn't, so what
+re-arms the mute is new and what you already knew is not. A source that can't be read
+doesn't either, so a conflict isn't news twice because GitHub was computing it one
+morning.
+
 Opportunities and Unshipped stay on the board.
 
 If the model gives no verdict on a new item, it goes through and the message says it

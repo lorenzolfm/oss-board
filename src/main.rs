@@ -647,7 +647,7 @@ fn run(args: &Refresh) -> Result<()> {
         if results.iter().any(|delivery| delivery.ok) {
             let record = LastDm {
                 at: Some(local),
-                seen: obligations::seen_after(&visible, held, &last_dm.seen),
+                seen: obligations::seen_after(&obs, held, &last_dm.seen, &unread_kinds),
             };
             model::save(&state_path("last_dm.json"), &record)?;
         }

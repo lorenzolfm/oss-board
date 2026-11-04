@@ -529,6 +529,17 @@ fn a_conflict_still_being_computed_keeps_the_card_and_is_not_an_all_clear() {
     assert!(!fixture.read_state("summary.txt").contains('⚠'));
 }
 
+/// What you do with the first card in `Needs me` to mute it. Hands back the card.
+fn drag_to_passed(fixture: &Fixture) -> String {
+    let board = fixture.read_board();
+    let card = lane(&board, "Needs me")[0].to_owned();
+    let dragged = board
+        .replace(&format!("{card}\n"), "")
+        .replace("## Passed\n", &format!("## Passed\n\n{card}\n"));
+    fs::write(fixture.board(), dragged).unwrap();
+    card
+}
+
 /// You muted it red. A push is a new trigger, and it comes back only then.
 #[test]
 fn a_push_rearms_a_muted_red_pr() {
@@ -538,12 +549,7 @@ fn a_push_rearms_a_muted_red_pr() {
     fs::write(fixture.path("merge.json"), merge).unwrap();
     run(&mut fixture.command(&["--no-model", "--no-briefings"]));
 
-    let board = fixture.read_board();
-    let card = lane(&board, "Needs me")[0].to_owned();
-    let dragged = board
-        .replace(&format!("{card}\n"), "")
-        .replace("## Passed\n", &format!("## Passed\n\n{card}\n"));
-    fs::write(fixture.board(), dragged).unwrap();
+    let card = drag_to_passed(&fixture);
 
     run(&mut fixture.command(&["--no-model", "--no-briefings"]));
     let board = fixture.read_board();
@@ -873,6 +879,74 @@ fn what_the_model_says_asks_nothing_stays_on_the_board_and_out_of_the_dm() {
 
     let board = fixture.read_board();
     assert!(lane(&board, "Needs me")[0].contains("[#7]("), "{board}");
+}
+
+/// GitHub answers UNKNOWN at 08:07 because master just moved. That says nothing about the
+/// conflict, so it must not forget that you were told.
+#[test]
+fn a_conflict_you_were_told_about_is_not_news_after_a_morning_it_went_unread() {
+    let fixture = Fixture::new();
+    let (prs, _) = my_broken_pr();
+    fs::write(fixture.path("prs.json"), prs).unwrap();
+    let (url, messages) = listener();
+    let morning = |mergeable: &str| {
+        let node = merge_node(mergeable, "null");
+        let merge = format!(r#"{{"data":{{"repository":{{"p9":{node}}}}}}}"#);
+        fs::write(fixture.path("merge.json"), merge).unwrap();
+        deliver(&fixture, &url, &messages, &["--no-model"])
+    };
+
+    let told = morning("CONFLICTING");
+    assert!(told.contains("1 new"), "{told}");
+    let computing = morning("UNKNOWN");
+    assert!(computing.contains("nothing new"), "{computing}");
+    let answered = morning("CONFLICTING");
+    assert!(answered.contains("nothing new"), "{answered}");
+}
+
+/// Dragging a card to Passed does not clear it. A thank-you re-arms the mute, and only the
+/// thank-you is new, so the request you were already told about does not come back with it.
+#[test]
+fn what_re_arms_a_mute_does_not_resend_what_you_were_told() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("nobody_asks"), "").unwrap();
+    let requested = pr_node(7, "waiting on you", "", "aaaaaaa", "bob")
+        .replace(
+            r#""reviewRequests":{"nodes":[]}"#,
+            r#""reviewRequests":{"nodes":[{"requestedReviewer":{"login":"me"}}]}"#,
+        )
+        .replace(
+            r#""timelineItems":{"nodes":[]}"#,
+            r#""timelineItems":{"nodes":[{"createdAt":"2026-01-01T00:00:00Z","requestedReviewer":{"login":"me"}}]}"#,
+        );
+    fs::write(
+        fixture.path("prs.json"),
+        prs_page(std::slice::from_ref(&requested)),
+    )
+    .unwrap();
+    let (url, messages) = listener();
+
+    let told = deliver(&fixture, &url, &messages, &[]);
+    assert!(told.contains("1 new"), "{told}");
+    drag_to_passed(&fixture);
+    let muted = deliver(&fixture, &url, &messages, &[]);
+    assert!(muted.contains("nothing new"), "{muted}");
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let thanked = requested.replace(
+        r#""comments":{"nodes":[]}"#,
+        &format!(
+            r#""comments":{{"nodes":[{{"author":{{"__typename":"User","login":"bob"}},
+            "body":"thanks @me","createdAt":"{now}"}}]}}"#
+        ),
+    );
+    fs::write(fixture.path("prs.json"), prs_page(&[thanked])).unwrap();
+    let rearmed = deliver(&fixture, &url, &messages, &[]);
+    assert!(
+        lane(&fixture.read_board(), "Needs me")[0].contains("[#7]("),
+        "the mute re-armed"
+    );
+    assert!(rearmed.contains("nothing new"), "{rearmed}");
 }
 
 /// Opportunities stay on the board.

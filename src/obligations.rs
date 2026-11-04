@@ -768,6 +768,13 @@ impl Seen {
         seen.heads.extend(head.map(str::to_owned));
     }
 
+    /// Only what this says about these kinds, if anything.
+    fn about(&self, kinds: &[ReasonKind]) -> Option<Self> {
+        let kept = self.0.iter().filter(|(kind, _)| kinds.contains(kind));
+        let kept: BTreeMap<_, _> = kept.map(|(kind, seen)| (*kind, seen.clone())).collect();
+        (!kept.is_empty()).then_some(Self(kept))
+    }
+
     /// Remember a reason as `covers` will test it.
     fn saw(&mut self, reason: &Reason) {
         match &reason.when {
@@ -822,27 +829,31 @@ pub fn new_asks<'o, 'a>(
         .collect()
 }
 
-/// What to remember once a DM is delivered. An ask `held` back by the cap keeps what was
-/// remembered of it, so it stays new for the next DM; what cleared is forgotten.
+/// What to remember once a DM is delivered. `obs` is every obligation, muted ones too:
+/// an item leaves this record only by clearing. A mute is not a clearing, and neither is
+/// a kind this run could not read, so what was remembered of those stays. An ask `held`
+/// back by the cap keeps what was remembered of it, so it stays new for the next DM.
 pub fn seen_after(
     obs: &[Obligation<'_>],
     held: &[&Obligation<'_>],
     seen: &BTreeMap<CardKey, Seen>,
+    unread: &[ReasonKind],
 ) -> BTreeMap<CardKey, Seen> {
-    let is_held = |key: &CardKey| held.iter().any(|ob| ob.item.key == *key);
-    obs.iter()
-        .filter_map(|ob| {
-            let key = &ob.item.key;
-            let told = if is_held(key) {
-                seen.get(key)?.clone()
-            } else {
-                let mut told = Seen::default();
-                ob.reasons.iter().for_each(|reason| told.saw(reason));
-                told
-            };
-            Some((key.clone(), told))
-        })
-        .collect()
+    let mut after: BTreeMap<CardKey, Seen> = seen
+        .iter()
+        .filter_map(|(key, told)| Some((key.clone(), told.about(unread)?)))
+        .collect();
+    for ob in obs {
+        let key = &ob.item.key;
+        if held.iter().any(|held| held.item.key == *key) {
+            after.remove(key);
+            after.extend(seen.get(key).map(|told| (key.clone(), told.clone())));
+            continue;
+        }
+        let told = after.entry(key.clone()).or_default();
+        ob.reasons.iter().for_each(|reason| told.saw(reason));
+    }
+    after
 }
 
 #[cfg(test)]
@@ -1473,7 +1484,7 @@ mod tests {
 
     /// What a delivered DM leaves behind when nothing was held back.
     fn seen_of(obs: &[Obligation<'_>]) -> BTreeMap<CardKey, Seen> {
-        seen_after(obs, &[], &BTreeMap::new())
+        seen_after(obs, &[], &BTreeMap::new(), &[])
     }
 
     /// The numbers the DM would carry, given a model that always says the same thing.
@@ -1588,22 +1599,86 @@ mod tests {
     #[test]
     fn an_ask_held_back_by_the_cap_stays_new_for_the_next_dm() {
         let viewer = me();
+        let pinged = |comments| pr(99).comments(comments);
+        let first = c("bob", 8, &at_me("@me first"));
+        let told = seen_on(pinged(vec![first.clone()]), &HashMap::new());
         let snapshot = snap(
             vec![
-                pr(95).requested(ME, &day(5).to_string()),
-                pr(96).requested(ME, &day(3).to_string()),
+                pr(95).requested(ME, &day(9).to_string()),
+                pr(96).requested(ME, &day(7).to_string()),
+                pinged(vec![first, c("bob", 2, &at_me("@me second"))]),
             ],
             vec![],
         );
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let waiting = new_asks(&obs, &BTreeMap::new(), |_| None);
+        let waiting = new_asks(&obs, &told, |_| None);
         let (shown, held) = waiting.split_at(1);
         assert_eq!(shown[0].item.number, 95);
 
-        let seen = seen_after(&obs, held, &BTreeMap::new());
-        let next = new_asks(&obs, &seen, |_| None);
-        assert_eq!(next.len(), 1);
-        assert_eq!(next[0].item.number, 96);
+        let seen = seen_after(&obs, held, &told, &[]);
+        let next: Vec<u64> = new_asks(&obs, &seen, |_| None)
+            .iter()
+            .map(|ob| ob.item.number)
+            .collect();
+        assert_eq!(next, [99, 96], "new when held, with a record or without");
+    }
+
+    /// What the next DM says about a conflict you were told about on this PR, after a morning
+    /// that read `between` with these kinds unread.
+    fn conflict_after(
+        between: Item,
+        between_merge: &HashMap<u64, MergeState>,
+        unread: &[ReasonKind],
+        next: Item,
+    ) -> Vec<u64> {
+        let viewer = me();
+        let conflict = merge_of(91, Mergeability::Conflicting, None);
+        let told = seen_on(next.clone(), &conflict);
+        let snapshot = snap(vec![between], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), between_merge);
+        let seen = seen_after(&obs, &[], &told, unread);
+        asking(next, &conflict, &seen, Some(false))
+    }
+
+    /// The whole run proves the plain case. These are what the record must tell apart.
+    #[test]
+    fn only_clearing_forgets_what_you_were_told() {
+        let head = "a".repeat(40);
+        let mine = pr(91).author(ME).with_head(&head).head_at(day(5));
+        let listed = mine
+            .clone()
+            .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
+        let computing = merge_of(91, Mergeability::Unknown, None);
+        let clean = merge_of(91, Mergeability::Mergeable, None);
+        let unread = [ReasonKind::Conflict];
+
+        assert!(
+            conflict_after(listed.clone(), &computing, &unread, listed.clone()).is_empty(),
+            "unread, with another reason keeping the item listed"
+        );
+        assert_eq!(
+            conflict_after(mine.clone(), &clean, &[], mine.clone()),
+            [91],
+            "read and clean, so it cleared and coming back is news"
+        );
+    }
+
+    /// What is kept for an unread kind is what you were told, so it stops at that head.
+    #[test]
+    fn a_conflict_on_a_head_pushed_while_it_went_unread_is_new() {
+        let viewer = me();
+        let conflict = merge_of(91, Mergeability::Conflicting, None);
+        let mine = |head: &str| {
+            pr(91)
+                .author(ME)
+                .with_head(&head.repeat(40))
+                .head_at(day(5))
+        };
+        let told = seen_on(mine("a"), &conflict);
+        let snapshot = snap(vec![mine("b")], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let seen = seen_after(&obs, &[], &told, &[ReasonKind::Conflict]);
+        assert_eq!(asking(mine("b"), &conflict, &seen, Some(false)), [91]);
     }
 
     /// A mention the record has seen, on an item whose head was committed ahead of the next
