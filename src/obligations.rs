@@ -486,13 +486,13 @@ fn own_pr(
     me: &Viewer,
     now: DateTime<Utc>,
     merge: Option<&MergeState>,
+    threads_block_merge: bool,
 ) -> Vec<Reason> {
     if !me.is(&item.author) {
         return Vec::new();
     }
     let mut out = Vec::new();
-    // Dated by what someone else said. Your own reply and a bot's are no new trigger, and a
-    // thread with nothing else in it is dated from when it opened.
+    // Dated by what someone else said. Your own reply and a bot's are no new trigger.
     let lasts: Vec<Timestamp> = pr
         .threads
         .iter()
@@ -500,17 +500,24 @@ fn own_pr(
         .filter_map(|t| {
             let others = t.comments.iter().filter(|c| !me.is(&c.author) && !c.bot);
             let said = others.map(|c| c.at).max();
-            said.or_else(|| t.comments.iter().map(|c| c.at).min())
+            if threads_block_merge {
+                // It has to be resolved all the same, so with nothing else in it, it is
+                // dated from when it opened.
+                said.or_else(|| t.comments.iter().map(|c| c.at).min())
+            } else {
+                said.filter(|at| is_live(*at, now))
+            }
         })
         .collect();
     if let (Some(oldest), Some(newest)) = (lasts.iter().min(), lasts.iter().max()) {
         let n = lasts.len();
-        // The ruleset refuses to merge with an open thread, even a typo nit.
-        let text = format!(
-            "{n} unresolved thread{} block{} merge",
-            plural(n),
-            if n == 1 { "s" } else { "" }
-        );
+        let text = if threads_block_merge {
+            // The ruleset refuses to merge with an open thread, even a typo nit.
+            let verb = if n == 1 { "blocks" } else { "block" };
+            format!("{n} unresolved thread{} {verb} merge", plural(n))
+        } else {
+            format!("{n} unresolved thread{}", plural(n))
+        };
         out.push(Reason::between(
             ReasonKind::UnresolvedThread,
             *oldest,
@@ -674,7 +681,8 @@ pub fn collect<'a>(
                 let mut reasons = review_request(item, pr, me, now);
                 reasons.extend(conversation(item, me, now));
                 reasons.extend(threads(item, pr, me, now));
-                reasons.extend(own_pr(item, pr, me, now, merge.get(&item.key)));
+                let blocks = snap.project.threads_block_merge;
+                reasons.extend(own_pr(item, pr, me, now, merge.get(&item.key), blocks));
                 reasons.extend(stale_ack(item, pr, me, now));
                 reasons.extend(pending_review(pr, me, now));
                 reasons
@@ -904,7 +912,7 @@ mod tests {
     //! conversation).
 
     use super::*;
-    use crate::snapshot::{Ci, Comment, Mergeability};
+    use crate::snapshot::{Ci, Comment, Mergeability, Thread};
     use crate::testkit::{
         ME, bot, c, day, floresta, issue, key, me, now, pr, review, snap, thread,
     };
@@ -1151,6 +1159,85 @@ mod tests {
                 vec!["unresolved_thread"],
             ),
         ]);
+    }
+
+    /// What your own PR with these threads says on a project's board.
+    fn thread_reasons(project: &'static config::Project, threads: Vec<Thread>) -> Vec<String> {
+        let viewer = me();
+        let repo = project.repo.to_string();
+        let item = pr(1).author(ME).in_repo(&repo).threads(threads);
+        let snapshot = Snapshot {
+            project,
+            items: vec![item],
+        };
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let reasons = obs.iter().flat_map(|ob| &ob.reasons);
+        reasons.map(|reason| reason.text.clone()).collect()
+    }
+
+    #[test]
+    fn floresta_says_a_thread_blocks_merge_because_its_ruleset_refuses() {
+        let floresta = &config::PROJECTS[0];
+        let nit = || thread(vec![c("bob", 3, "a nit")]);
+        assert_eq!(
+            thread_reasons(floresta, vec![nit()]),
+            ["1 unresolved thread blocks merge"]
+        );
+        assert_eq!(
+            thread_reasons(floresta, vec![nit(), nit()]),
+            ["2 unresolved threads block merge"]
+        );
+    }
+
+    /// cdk merges with a thread open, so one is only a conversation there: someone else has
+    /// to have said something in it, and lately.
+    #[test]
+    fn where_a_thread_cannot_block_merge_it_is_only_a_conversation() {
+        let cases: Vec<(&str, Vec<Thread>, Vec<&str>)> = vec![
+            (
+                "someone said something lately",
+                vec![thread(vec![c("bob", 3, "a nit")])],
+                vec!["1 unresolved thread"],
+            ),
+            (
+                "only the threads still live are counted",
+                vec![
+                    thread(vec![c("bob", 3, "a nit")]),
+                    thread(vec![c("carol", 5, "a nit")]),
+                    thread(vec![c("dave", 30, "a nit")]),
+                ],
+                vec!["2 unresolved threads"],
+            ),
+            (
+                "it went quiet",
+                vec![thread(vec![c("bob", 30, "a nit")])],
+                vec![],
+            ),
+            (
+                "your own reply does not keep it going",
+                vec![thread(vec![c("bob", 30, "a nit"), c(ME, 1, "done")])],
+                vec![],
+            ),
+            (
+                "someone else speaking again brings it back",
+                vec![thread(vec![c("bob", 30, "a nit"), c("carol", 2, "still?")])],
+                vec!["1 unresolved thread"],
+            ),
+            (
+                "only your own words",
+                vec![thread(vec![c(ME, 3, "a note for reviewers")])],
+                vec![],
+            ),
+            (
+                "only a review bot's",
+                vec![thread(vec![bot("chatgpt-codex-connector", 3, "a nit")])],
+                vec![],
+            ),
+        ];
+        let cdk = &config::PROJECTS[1];
+        for (name, threads, want) in cases {
+            assert_eq!(thread_reasons(cdk, threads), want, "{name}");
+        }
     }
 
     #[test]

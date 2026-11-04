@@ -37,9 +37,11 @@ hide, drop or reorder it there. Six rules (`src/obligations.rs`):
    A comment left unanswered for 14 days stops counting. If it still matters
    someone will ping again, and that brings the card back.
 3. **Your own PRs when there's something for you to do**: an unresolved
-   thread (the ruleset won't merge with one), changes requested since your
-   push, a conflict, red CI, or a comment since your last push. ACKs and
-   approvals are good news, not requests.
+   thread, changes requested since your push, a conflict, red CI, or a comment
+   since your last push. ACKs and approvals are good news, not requests.
+   Floresta's ruleset won't merge with an open thread, so there one counts until
+   it's resolved, whoever spoke last. cdk has no such rule, so there it counts
+   only for what someone else said in it, and stops counting after 14 days.
 4. **A stale ACK**: you posted `ACK <hash>` and the head moved. The card says
    whether it was a rebase (computed: the PR's diff at your ACK against its
    diff now) or new code, and in which files.

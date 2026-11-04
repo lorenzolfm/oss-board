@@ -35,6 +35,9 @@ pub struct Project {
     remote: &'static str,
     /// The review column on its org board.
     pub column: ReviewColumn,
+    /// Whether its rules refuse to merge with a review thread open. Where they don't, a
+    /// thread on your PR is only a conversation, and goes quiet like one.
+    pub threads_block_merge: bool,
 }
 
 impl Project {
@@ -81,6 +84,8 @@ pub static PROJECTS: [Project; 2] = [
             number: 2,
             column: "Needs review",
         }),
+        // Its ruleset has `required_review_thread_resolution`.
+        threads_block_merge: true,
     },
     Project {
         repo: Repo {
@@ -99,6 +104,9 @@ pub static PROJECTS: [Project; 2] = [
             number: 2,
             column: "Needs Review",
         }),
+        // Checked 2026-11-04: `main` has no pull request rule, and 12 of the 28 open PRs
+        // with an unresolved thread were ready to merge.
+        threads_block_merge: false,
     },
 ];
 
