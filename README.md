@@ -105,7 +105,8 @@ An obligation reaches it once, on a **new trigger** since the last DM (the same 
 a mute uses: a newer event, a new kind of reason, or a new head) and only if it is an
 **ask**. A review request, changes requested, a conflict, red CI or an assignment is
 an ask by its nature. Anything else needs the model to read someone waiting on you
-specifically. At most 3 per message; any more stay new for the next one. A quiet
+specifically. Your own reply, a bot's, and more work on your own unshipped fix aren't
+new triggers. At most 3 per message; any more stay new for the next one. A quiet
 morning is the header line alone, so a missing message means something is broken.
 
 Only clearing forgets what you were told. Dragging a card to Passed doesn't, so what

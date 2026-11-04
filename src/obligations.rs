@@ -6,7 +6,8 @@
 //!
 //!   kind  also what a mute remembers
 //!   when  how long it has been waiting (ordering), and what re-arms a mute on it:
-//!         a newer event, or for a state of the PR like a merge conflict, a new head
+//!         a newer event, for a state of the PR like a merge conflict a new head, and
+//!         for your own unshipped work only going away and coming back
 //!   text  the phone-sized explanation
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -119,6 +120,9 @@ pub enum When {
         oid: String,
         since: Option<Timestamp>,
     },
+    /// True since `since`, which only orders it. That date is your own work on it, which
+    /// is no new trigger, so only its first appearance is one.
+    Standing { since: Timestamp },
 }
 
 #[derive(Clone, Debug)]
@@ -129,8 +133,16 @@ pub struct Reason {
 }
 
 impl Reason {
-    pub fn at(kind: ReasonKind, at: Timestamp, text: String) -> Self {
+    fn at(kind: ReasonKind, at: Timestamp, text: String) -> Self {
         Self::between(kind, at, at, text)
+    }
+
+    pub fn standing(kind: ReasonKind, since: Timestamp, text: String) -> Self {
+        Self {
+            kind,
+            when: When::Standing { since },
+            text,
+        }
     }
 
     fn between(kind: ReasonKind, first: Timestamp, last: Timestamp, text: String) -> Self {
@@ -156,6 +168,7 @@ impl Reason {
         match &self.when {
             When::Events { first, .. } => Some(*first),
             When::Head { since, .. } => *since,
+            When::Standing { since } => Some(*since),
         }
     }
 
@@ -163,12 +176,13 @@ impl Reason {
         match &self.when {
             When::Events { last, .. } => Some(*last),
             When::Head { since, .. } => *since,
+            When::Standing { .. } => None,
         }
     }
 
     fn head(&self) -> Option<&str> {
         match &self.when {
-            When::Events { .. } => None,
+            When::Events { .. } | When::Standing { .. } => None,
             When::Head { oid, .. } => Some(oid),
         }
     }
@@ -477,11 +491,17 @@ fn own_pr(
         return Vec::new();
     }
     let mut out = Vec::new();
+    // Dated by what someone else said. Your own reply and a bot's are no new trigger, and a
+    // thread with nothing else in it is dated from when it opened.
     let lasts: Vec<Timestamp> = pr
         .threads
         .iter()
         .filter(|t| !t.resolved)
-        .filter_map(|t| t.comments.iter().map(|c| c.at).max())
+        .filter_map(|t| {
+            let others = t.comments.iter().filter(|c| !me.is(&c.author) && !c.bot);
+            let said = others.map(|c| c.at).max();
+            said.or_else(|| t.comments.iter().map(|c| c.at).min())
+        })
         .collect();
     if let (Some(oldest), Some(newest)) = (lasts.iter().min(), lasts.iter().max()) {
         let n = lasts.len();
@@ -780,6 +800,7 @@ impl Seen {
         match &reason.when {
             When::Events { last, .. } => self.remember(reason.kind, Some(*last), None),
             When::Head { oid, .. } => self.remember(reason.kind, None, Some(oid)),
+            When::Standing { .. } => self.remember(reason.kind, None, None),
         }
     }
 
@@ -790,6 +811,7 @@ impl Seen {
         match &reason.when {
             When::Events { last, .. } => Some(*last) <= seen.last,
             When::Head { oid, .. } => seen.heads.contains(oid),
+            When::Standing { .. } => true,
         }
     }
 }
@@ -1101,6 +1123,11 @@ mod tests {
                 "a resolved thread does not",
                 own(27).threads(vec![thread(vec![c("bob", 3, "a comment")]).resolved()]),
                 vec![],
+            ),
+            (
+                "a thread with only your own words in it blocks merge too",
+                own(35).threads(vec![thread(vec![c(ME, 3, "a comment")])]),
+                vec!["unresolved_thread"],
             ),
         ]);
     }
@@ -1679,6 +1706,51 @@ mod tests {
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let seen = seen_after(&obs, &[], &told, &[ReasonKind::Conflict]);
         assert_eq!(asking(mine("b"), &conflict, &seen, Some(false)), [91]);
+    }
+
+    /// What you said yourself is not news to you, and a request you answered with "this
+    /// weekend" would otherwise come back the next morning.
+    #[test]
+    fn only_someone_elses_word_on_your_own_thread_is_new() {
+        let empty = HashMap::new();
+        let asked = || c("bob", 5, "can you rename this?");
+        let own = |comments: Vec<Comment>| pr(88).author(ME).threads(vec![thread(comments)]);
+        let seen = seen_on(own(vec![asked()]), &empty);
+        for (name, word, new) in [
+            ("your reply", c(ME, 1, "this weekend"), false),
+            ("a bot's", bot("cov[bot]", 1, "coverage report"), false),
+            ("bob's", c("bob", 1, "any news?"), true),
+        ] {
+            let got = asking(own(vec![asked(), word]), &empty, &seen, Some(true));
+            assert_eq!(!got.is_empty(), new, "{name}");
+        }
+    }
+
+    /// Its date is your own work on it, which nobody has to tell you about. The record goes
+    /// through the file, because what it keeps of this kind has no time and no head.
+    #[test]
+    fn unshipped_work_is_new_once_whatever_you_do_to_it() {
+        let viewer = me();
+        let snapshot = snap(vec![], vec![issue(89).assigned(ME, day(20))]);
+        let plain = || collect(&snapshot, &viewer, now(), &HashMap::new());
+        let with_fork = |worked_on| {
+            let mut obs = plain();
+            let text = "your fork#6 would fix this".to_owned();
+            let reason = Reason::standing(ReasonKind::Unshipped, worked_on, text);
+            add_reason(&mut obs, &snapshot.items[0], reason);
+            obs
+        };
+        let carried = |obs: &[Obligation<'_>], seen: &BTreeMap<CardKey, Seen>| {
+            !new_asks(obs, seen, |_| Some(true)).is_empty()
+        };
+        let before = seen_of(&plain());
+        assert!(carried(&with_fork(day(5)), &before), "a new kind of reason");
+
+        let told = seen_of(&with_fork(day(5)));
+        let file = serde_json::to_string(&told).unwrap();
+        let told = serde_json::from_str(&file).unwrap();
+        assert!(!carried(&with_fork(day(5)), &told), "nothing moved");
+        assert!(!carried(&with_fork(day(1)), &told), "you worked on it");
     }
 
     /// A mention the record has seen, on an item whose head was committed ahead of the next

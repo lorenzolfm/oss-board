@@ -205,7 +205,8 @@ fn promote_unshipped<'a>(
         };
         let at = Timestamp::at_midnight(u.last);
         let text = format!("your {what} would fix this and never went upstream");
-        obligations::add_reason(obs, issue, Reason::at(ReasonKind::Unshipped, at, text));
+        let reason = Reason::standing(ReasonKind::Unshipped, at, text);
+        obligations::add_reason(obs, issue, reason);
         promoted.insert(u.key.clone());
     }
     promoted
