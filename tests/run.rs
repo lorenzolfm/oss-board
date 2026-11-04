@@ -492,6 +492,40 @@ fn a_failed_merge_read_keeps_the_card_and_is_not_an_all_clear() {
     assert!(dm.contains("merge state unread"), "{dm}");
 }
 
+/// GitHub answers UNKNOWN while it recomputes, as it does after master moves. Your PR
+/// may still conflict, so its card waits for an answer.
+#[test]
+fn a_conflict_still_being_computed_keeps_the_card_and_is_not_an_all_clear() {
+    let fixture = Fixture::new();
+    let (prs, merge) = my_broken_pr();
+    fs::write(fixture.path("prs.json"), prs).unwrap();
+    fs::write(fixture.path("merge.json"), merge).unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    let board = fixture.read_board();
+    let card = lane(&board, "Needs me")[0].to_owned();
+
+    let answer_with = |mergeable: &str| {
+        let node = merge_node(mergeable, "null");
+        let merge = format!(r#"{{"data":{{"repository":{{"p9":{node}}}}}}}"#);
+        fs::write(fixture.path("merge.json"), merge).unwrap();
+        run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    };
+
+    answer_with("UNKNOWN");
+    let board = fixture.read_board();
+    assert_eq!(lane(&board, "Needs me"), [card.as_str()]);
+    assert_eq!(fixture.degraded(), serde_json::json!(["merge_computing"]));
+    let dm = fixture.read_state("summary.txt");
+    assert!(!dm.contains('✅'), "{dm}");
+    assert!(dm.contains("still computing conflicts"), "{dm}");
+
+    answer_with("MERGEABLE");
+    let board = fixture.read_board();
+    assert!(lane(&board, "Needs me").is_empty(), "answered: {board}");
+    assert_eq!(fixture.degraded(), serde_json::json!([]));
+    assert!(fixture.read_state("summary.txt").contains('✅'));
+}
+
 /// You muted it red. A push is a new trigger, and it comes back only then.
 #[test]
 fn a_push_rearms_a_muted_red_pr() {

@@ -95,6 +95,8 @@ A source that can't be read is not a clear board. `Unshipped` and any card held
 by an unread source stay as they were, a claimed card keeps its note, and the
 DM, the heartbeat and `state/last_run.json` all name the source. The DM won't say
 "nothing is blocked on you" if what it failed to read could have said otherwise.
+That includes a conflict GitHub is still computing, as it does after master moves:
+a card held for a conflict waits for an answer.
 
 The timer is hourly; the DM goes out on the first run at or after each slot, so
 a slot missed while the desktop was off is sent late -- unless it is more than

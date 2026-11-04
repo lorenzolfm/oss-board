@@ -360,6 +360,14 @@ fn run(args: &Refresh) -> Result<()> {
         degraded.insert(Degraded::Merge);
         unread_kinds.extend([ReasonKind::Conflict, ReasonKind::CiFailed]);
     }
+    let computing = merge.computing();
+    if !computing.is_empty() {
+        log(&format!(
+            "  GitHub is still computing conflicts for {computing:?}"
+        ));
+        degraded.insert(Degraded::MergeComputing);
+        unread_kinds.push(ReasonKind::Conflict);
+    }
     let mut obs = obligations::collect(&snap, &me, now, &merge.states);
     enrich_stale_acks(&mut obs, &me);
 

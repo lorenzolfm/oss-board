@@ -40,6 +40,7 @@ pub enum Degraded {
     Unshipped,
     Project,
     Merge,
+    MergeComputing,
     Claims,
     Footprint,
     LastDm,
@@ -51,6 +52,7 @@ impl Degraded {
             Self::Unshipped => "unshipped",
             Self::Project => "project",
             Self::Merge => "merge",
+            Self::MergeComputing => "merge_computing",
             Self::Claims => "claims",
             Self::Footprint => "footprint",
             Self::LastDm => "last_dm",
@@ -62,6 +64,7 @@ impl Degraded {
             Self::Unshipped => "Unshipped not refreshed: its source failed",
             Self::Project => "project board unreadable — does the token have read:project?",
             Self::Merge => "merge state unread: a conflict or red CI may be missing",
+            Self::MergeComputing => "GitHub is still computing conflicts: one may be missing",
             Self::Claims => "claimed cards not checked upstream: their notes are as they were",
             Self::Footprint => "footprint unread: ranked without knowing your areas",
             Self::LastDm => "last_dm.json unreadable: everything reads as new",
@@ -69,7 +72,7 @@ impl Degraded {
     }
 
     fn can_hide_an_obligation(self) -> bool {
-        matches!(self, Self::Unshipped | Self::Merge)
+        matches!(self, Self::Unshipped | Self::Merge | Self::MergeComputing)
     }
 }
 
@@ -410,7 +413,11 @@ mod tests {
             message(&[Degraded::Project]).contains("✅ Nothing is blocked on you"),
             "the project column cannot hide an obligation"
         );
-        for source in [Degraded::Merge, Degraded::Unshipped] {
+        for source in [
+            Degraded::Merge,
+            Degraded::MergeComputing,
+            Degraded::Unshipped,
+        ] {
             let said = message(&[source]);
             assert!(!said.contains('✅'), "{said}");
             assert!(said.contains(source.warning()), "{said}");

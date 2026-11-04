@@ -305,6 +305,22 @@ pub struct MergeRead {
     pub unread: Vec<u64>,
 }
 
+impl MergeRead {
+    /// PRs GitHub has not finished testing for conflicts. It answers `UNKNOWN` while it
+    /// recomputes, as it does after master moves, so these say nothing about a conflict
+    /// either way. Their CI was read.
+    pub fn computing(&self) -> Vec<u64> {
+        let mut numbers: Vec<u64> = self
+            .states
+            .iter()
+            .filter(|(_, state)| state.mergeable == Mergeability::Unknown)
+            .map(|(number, _)| *number)
+            .collect();
+        numbers.sort_unstable();
+        numbers
+    }
+}
+
 /// One of your upstream PRs, in any state: what unshipped work is checked against.
 pub struct UpstreamPr {
     pub title: String,
