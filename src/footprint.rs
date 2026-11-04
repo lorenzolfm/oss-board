@@ -5,11 +5,11 @@
 //! gets this as context for ranking; nothing is ever excluded on it.
 
 use std::collections::{BTreeSet, HashMap};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Result;
 
+use crate::config::LocalClone;
 use crate::proc;
 
 const GIT_LOG_TIMEOUT: Duration = Duration::from_secs(60);
@@ -61,46 +61,35 @@ fn area(path: &str) -> String {
 
 /// `extra` adds refs to the upstream branch, e.g. your unshipped branches. A history
 /// that cannot be read is an error, so the run can say the judge ranked without it.
-pub fn compute(
-    emails: &BTreeSet<String>,
-    clones: &[PathBuf],
-    upstream_ref: &str,
-    extra: &[String],
-) -> Result<Footprint> {
+pub fn compute(email: &str, local: &LocalClone, extra: &[String]) -> Result<Footprint> {
     let mut counts: HashMap<String, u64> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let refs: Vec<&str> = std::iter::once(upstream_ref)
-        .chain(extra.iter().map(String::as_str))
-        .collect();
-    for clone in clones {
-        for reference in &refs {
-            for email in emails {
-                let log = proc::git(
-                    clone,
-                    &[
-                        "log",
-                        reference,
-                        &format!("--author={email}"),
-                        "--no-merges",
-                        "--name-only",
-                        "--format=%x00",
-                    ],
-                    GIT_LOG_TIMEOUT,
-                )?;
-                for commit in log.split('\0') {
-                    let areas: BTreeSet<String> = commit
-                        .split('\n')
-                        .filter(|line| !line.trim().is_empty())
-                        .map(area)
-                        .collect();
-                    for name in areas {
-                        let count = counts.entry(name.clone()).or_insert(0);
-                        if *count == 0 {
-                            order.push(name);
-                        }
-                        *count += 1;
-                    }
+    let refs = std::iter::once(local.upstream_ref.as_str()).chain(extra.iter().map(String::as_str));
+    for reference in refs {
+        let log = proc::git(
+            &local.path,
+            &[
+                "log",
+                reference,
+                &format!("--author={email}"),
+                "--no-merges",
+                "--name-only",
+                "--format=%x00",
+            ],
+            GIT_LOG_TIMEOUT,
+        )?;
+        for commit in log.split('\0') {
+            let areas: BTreeSet<String> = commit
+                .split('\n')
+                .filter(|line| !line.trim().is_empty())
+                .map(area)
+                .collect();
+            for name in areas {
+                let count = counts.entry(name.clone()).or_insert(0);
+                if *count == 0 {
+                    order.push(name);
                 }
+                *count += 1;
             }
         }
     }

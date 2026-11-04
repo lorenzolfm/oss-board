@@ -442,16 +442,15 @@ fn gather<'s>(
         }
     }
 
-    let upstream_ref = project.upstream_ref();
+    let local = project.local();
     let branch_refs: Vec<String> = items
         .iter()
         .filter(|u| matches!(u.origin, Origin::Branch))
-        .map(|u| format!("{upstream_ref}..{}", u.branch))
+        .map(|u| format!("{}..{}", local.upstream_ref, u.branch))
         .collect();
-    let clones = project.clones();
     // Ranking context, never a filter, so it is not worth the board either.
-    let footprint_result = unshipped::my_emails(&clones)
-        .and_then(|emails| footprint::compute(&emails, &clones, &upstream_ref, &branch_refs));
+    let footprint_result = unshipped::my_email(&local.path)
+        .and_then(|email| footprint::compute(&email, &local, &branch_refs));
     let footprint = footprint_result.unwrap_or_else(|err| {
         log(&format!("  {repo}: footprint unread ({err:#})"));
         lost.degraded.insert(Degraded::Footprint);

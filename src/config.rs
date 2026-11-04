@@ -38,15 +38,27 @@ pub struct Project {
 }
 
 impl Project {
-    /// As fresh as your last fetch: the unit can only read the clones.
-    pub fn upstream_ref(&self) -> String {
-        format!("{}/{}", self.remote, self.base)
+    pub fn local(&self) -> LocalClone {
+        LocalClone {
+            repo: self.repo,
+            path: home().join(self.clone),
+            upstream_ref: format!("{}/{}", self.remote, self.base),
+            base: self.base,
+        }
     }
+}
 
-    /// Local clones scanned for unshipped branches and for the footprint.
-    pub fn clones(&self) -> Vec<PathBuf> {
-        vec![home().join(self.clone)]
-    }
+/// A project's clone and what it calls things, scanned for unshipped branches and for the
+/// footprint. These go together: a ref means something only in the clone that has it.
+pub struct LocalClone {
+    /// What it is a clone of.
+    pub repo: Repo,
+    pub path: PathBuf,
+    /// `repo`'s base as the clone knows it, as fresh as your last fetch: the unit can only
+    /// read the clones.
+    pub upstream_ref: String,
+    /// The branch PRs land on, which is never work in its own right.
+    pub base: &'static str,
 }
 
 pub static PROJECTS: [Project; 2] = [
