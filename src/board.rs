@@ -965,7 +965,7 @@ mod tests {
     fn muting_an_item_twice_counts_both_cards_in_either_order() {
         let viewer = me();
         let merge = HashMap::from([(61, crate::snapshot::MergeState::conflicting())]);
-        let snapshot = snap(vec![pr(61).author(ME).head_at(day(2))], vec![]);
+        let snapshot = snap(vec![pr(61).author(ME).pushed_at(day(2))], vec![]);
         let obs = obligations::collect(&snapshot, &viewer, now(), &merge);
         let dragged = render::ob_card(&obs[0], None).as_str().to_owned();
         let older = format!("- [ ] old [#61]({F}/pull/61) <!--t:2026-01-01T00:00:00Z|mention-->");

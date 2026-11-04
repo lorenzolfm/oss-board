@@ -88,7 +88,7 @@ fn pr_node(number: u64, title: &str, body: &str, head: &str, author: &str) -> St
         "assignees":{{"nodes":[]}},"reviewDecision":null,"reviewRequests":{{"nodes":[]}},
         "commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-01T00:00:00Z"}}}}]}},
         "reviews":{{"nodes":[]}},"comments":{{"nodes":[]}},"reviewThreads":{{"nodes":[]}},
-        "timelineItems":{{"nodes":[]}},"files":{{"nodes":[]}}}}"#
+        "timelineItems":{{"nodes":[]}},"forcePushes":{{"nodes":[]}},"files":{{"nodes":[]}}}}"#
     )
 }
 
@@ -560,6 +560,70 @@ fn a_push_rearms_a_muted_red_pr() {
     let board = fixture.read_board();
     assert_eq!(lane(&board, "Needs me").len(), 1, "re-armed: {board}");
     assert_eq!(lane(&board, "Passed"), [card.as_str()], "your card stays");
+}
+
+/// GitHub keeps no push time, so the head's date is the later of its commit and the last
+/// force-push. A request stays open past your comment only if that is later than it.
+#[test]
+fn a_push_is_dated_by_its_force_push_or_failing_that_its_commit() {
+    let spoke = "2026-02-01T00:00:00Z";
+    let before = "2026-01-15T00:00:00Z";
+    let after = "2026-03-01T00:00:00Z";
+    let cases = [
+        (
+            "a commit from before you spoke, and no force-push",
+            before,
+            None,
+            false,
+        ),
+        (
+            "the same commit, force-pushed since",
+            before,
+            Some(after),
+            true,
+        ),
+        ("force-pushed before you spoke", before, Some(before), false),
+        (
+            "a commit since a force-push from before you spoke",
+            after,
+            Some(before),
+            true,
+        ),
+    ];
+    for (name, committed, forced, open) in cases {
+        let forced = forced.map_or(String::new(), |at| format!(r#"{{"createdAt":"{at}"}}"#));
+        let node = pr_node(50, "x", "", "ccccccc", "alice")
+            .replace("2026-01-01T00:00:00Z", committed)
+            .replace(
+                r#""reviewRequests":{"nodes":[]}"#,
+                r#""reviewRequests":{"nodes":[{"requestedReviewer":{"login":"me"}}]}"#,
+            )
+            .replace(
+                r#""timelineItems":{"nodes":[]}"#,
+                r#""timelineItems":{"nodes":[{"createdAt":"2025-12-01T00:00:00Z","requestedReviewer":{"login":"me"}}]}"#,
+            )
+            .replace(
+                r#""comments":{"nodes":[]}"#,
+                &format!(
+                    r#""comments":{{"nodes":[{{"author":{{"__typename":"User","login":"me"}},
+                    "body":"what about the pokes?","createdAt":"{spoke}"}}]}}"#
+                ),
+            )
+            .replace(
+                r#""forcePushes":{"nodes":[]}"#,
+                &format!(r#""forcePushes":{{"nodes":[{forced}]}}"#),
+            );
+        let fixture = Fixture::new();
+        fs::write(fixture.path("prs.json"), prs_page(&[node])).unwrap();
+        run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+        let board = fixture.read_board();
+        let needs_me = lane(&board, "Needs me");
+        assert_eq!(
+            needs_me.iter().any(|card| card.contains("[#50](")),
+            open,
+            "{name}: {board}"
+        );
+    }
 }
 
 /// A failed read says nothing about the card, so it must not erase what it says.

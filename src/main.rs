@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn a_conflict_on_a_bare_time_reads_as_new() {
         let merge = HashMap::from([(97, MergeState::conflicting())]);
-        let item = pr(97).author(ME).head_at(day(5));
+        let item = pr(97).author(ME).pushed_at(day(5));
         assert!(is_new_to(item, &merge, &format!(r#""{}""#, day(0))));
     }
 }

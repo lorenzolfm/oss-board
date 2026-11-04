@@ -201,6 +201,12 @@ reuse cached gists and rankings unless something they look at moved.
 - **The model does filter the DM.** Rules can't tell "@you already pointed this
   out" from "@you can you check this". A comment can talk the model out of an ask,
   which costs you that interruption and nothing else: the card stays on the board.
+- **A push is dated as well as GitHub allows, which isn't exactly.** GitHub keeps no
+  push time, and `Commit.pushedDate` is gone. A force-push has its event, and a
+  fast-forward has only the date of the commit it adds. So a commit made before your
+  comment and fast-forwarded after it reads as nothing pushed, and that review request
+  stays answered until someone pushes again or re-requests. The head moving at all is
+  still a new trigger, because state tied to a head compares the head, not its date.
 - **Read-only, enforced by the token.** The scanner sends only GETs and
   GraphQL queries. The gist and judge passes get no tools at all, because their
   prompts carry text from anyone who can open an issue. The one exception is the

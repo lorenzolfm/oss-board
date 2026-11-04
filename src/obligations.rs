@@ -330,7 +330,7 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     if let Detail::Pr(pr) = &item.detail
         && me.is(&item.author)
     {
-        mine_at = mine_at.max(pr.head_at); // a push answers too
+        mine_at = mine_at.max(pr.pushed_at); // a push answers too
     }
     let assigned_to_me = item.assignees.iter().any(|login| me.is(login));
     if mine_at.is_none()
@@ -457,7 +457,7 @@ fn review_request(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -
     // GitHub holds the request open until a review is submitted. A comment of yours with
     // nothing pushed since has said your piece, and the next move is the author's.
     let answered = engaged_at(item, me)
-        .is_some_and(|mine| mine > at && pr.head_at.is_some_and(|head| head <= mine));
+        .is_some_and(|mine| mine > at && pr.pushed_at.is_some_and(|head| head <= mine));
     if answered {
         return Vec::new();
     }
@@ -516,7 +516,7 @@ fn own_pr(
     }
     let blocking: Vec<&Review> = latest
         .into_iter()
-        .filter(|r| r.state == ReviewState::ChangesRequested && Some(r.at) > pr.head_at)
+        .filter(|r| r.state == ReviewState::ChangesRequested && Some(r.at) > pr.pushed_at)
         .collect();
     let oldest = blocking.iter().min_by_key(|r| r.at);
     let newest = blocking.iter().map(|r| r.at).max();
@@ -576,7 +576,7 @@ fn stale_ack(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec
         return Vec::new();
     }
     let short = prefix(&acked, 7);
-    if let Some(pushed) = pr.head_at.filter(|pushed| *pushed > at) {
+    if let Some(pushed) = pr.pushed_at.filter(|pushed| *pushed > at) {
         let text = format!("pushed {} ago, past your ACK {short}", pushed.ago(now));
         return vec![Reason::on_head(
             ReasonKind::StaleAck,
@@ -974,7 +974,7 @@ mod tests {
                 "bots never wait on you",
                 pr(8)
                     .author(ME)
-                    .head_at(day(10))
+                    .pushed_at(day(10))
                     .comments(vec![bot("ci[bot]", 2, "coverage report")]),
                 vec![],
             ),
@@ -1038,20 +1038,20 @@ mod tests {
             (
                 "a comment since your push",
                 own(20)
-                    .head_at(day(10))
+                    .pushed_at(day(10))
                     .comments(vec![c("bob", 3, "a comment")]),
                 vec!["reply"],
             ),
             (
                 "a push answers the comment before it",
                 own(21)
-                    .head_at(day(2))
+                    .pushed_at(day(2))
                     .comments(vec![c("bob", 3, "a comment")]),
                 vec![],
             ),
             (
                 "an ACK is good news, not a request",
-                own(22).head_at(day(10)).comments(vec![c(
+                own(22).pushed_at(day(10)).comments(vec![c(
                     "bob",
                     3,
                     "ACK 1a2b3c4d\n\nran the tests",
@@ -1060,7 +1060,7 @@ mod tests {
             ),
             (
                 "an APPROVED review asks nothing",
-                own(23).head_at(day(10)).reviews(vec![review(
+                own(23).pushed_at(day(10)).reviews(vec![review(
                     "bob",
                     3,
                     ReviewState::Approved,
@@ -1070,7 +1070,7 @@ mod tests {
             ),
             (
                 "changes requested since your push",
-                own(24).head_at(day(10)).reviews(vec![review(
+                own(24).pushed_at(day(10)).reviews(vec![review(
                     "bob",
                     3,
                     ReviewState::ChangesRequested,
@@ -1080,7 +1080,7 @@ mod tests {
             ),
             (
                 "changes requested before your latest push is answered",
-                own(25).head_at(day(2)).reviews(vec![review(
+                own(25).pushed_at(day(2)).reviews(vec![review(
                     "bob",
                     3,
                     ReviewState::ChangesRequested,
@@ -1090,7 +1090,7 @@ mod tests {
             ),
             (
                 "an unresolved thread blocks merge, whoever spoke last",
-                own(26).head_at(day(2)).threads(vec![thread(vec![c(
+                own(26).pushed_at(day(2)).threads(vec![thread(vec![c(
                     "jaoleal",
                     30,
                     "typo: is_backfiling",
@@ -1202,7 +1202,7 @@ mod tests {
             ),
             (
                 "a push since your comment",
-                requested(74).head_at(day(2)).comments(said()),
+                requested(74).pushed_at(day(2)).comments(said()),
                 vec!["review_requested"],
             ),
             (
@@ -1260,7 +1260,7 @@ mod tests {
                 "an unresolved thread on your own PR",
                 pr(86)
                     .author(ME)
-                    .head_at(day(40))
+                    .pushed_at(day(40))
                     .threads(vec![thread(vec![c("bob", 30, "a nit")])]),
                 vec!["unresolved_thread"],
             ),
@@ -1289,7 +1289,7 @@ mod tests {
                 "an ACK the PR moved past",
                 pr(40)
                     .with_head(head)
-                    .head_at(day(2))
+                    .pushed_at(day(2))
                     .comments(vec![c(ME, 5, "ACK 1234567")]),
                 vec!["stale_ack"],
             ),
@@ -1406,14 +1406,14 @@ mod tests {
             let before = pr(61)
                 .author(ME)
                 .with_head(&"a".repeat(40))
-                .head_at(day(5))
+                .pushed_at(day(5))
                 .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
             let snapshot = snap(vec![before.clone()], vec![]);
             let obs = collect(&snapshot, &viewer, now(), &merge);
             let mute = mute_of(&obs[0]);
             assert!(is_muted(&obs[0], Some(&mute)), "same head: {merge:?}");
 
-            let pushed = before.with_head(&"b".repeat(40)).head_at(day(4));
+            let pushed = before.with_head(&"b".repeat(40)).pushed_at(day(4));
             let snapshot = snap(vec![pushed], vec![]);
             let obs = collect(&snapshot, &viewer, now(), &merge);
             assert!(!is_muted(&obs[0], Some(&mute)), "new head: {merge:?}");
@@ -1426,7 +1426,7 @@ mod tests {
         let acked = |head: &str, pushed| {
             pr(63)
                 .with_head(&head.repeat(40))
-                .head_at(pushed)
+                .pushed_at(pushed)
                 .comments(vec![c(ME, 9, "ACK 1234567")])
         };
         let snapshot = snap(vec![acked("a", day(3))], vec![]);
@@ -1451,7 +1451,7 @@ mod tests {
         let acked = |head: &str, pushed| {
             pr(64)
                 .with_head(&head.repeat(40))
-                .head_at(pushed)
+                .pushed_at(pushed)
                 .comments(vec![c(ME, 9, "ACK 1234567")])
         };
         for (first, next) in [(day(12), day(11)), (day(3), day(12))] {
@@ -1544,7 +1544,7 @@ mod tests {
         let conflict = merge_of(91, Mergeability::Conflicting, None);
         let mine = pr(91)
             .author(ME)
-            .head_at(day(5))
+            .pushed_at(day(5))
             .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
         let seen = seen_on(mine.clone(), &clean);
         assert_eq!(asking(mine.clone(), &conflict, &seen, Some(false)), [91]);
@@ -1644,7 +1644,7 @@ mod tests {
     #[test]
     fn only_clearing_forgets_what_you_were_told() {
         let head = "a".repeat(40);
-        let mine = pr(91).author(ME).with_head(&head).head_at(day(5));
+        let mine = pr(91).author(ME).with_head(&head).pushed_at(day(5));
         let listed = mine
             .clone()
             .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
@@ -1672,7 +1672,7 @@ mod tests {
             pr(91)
                 .author(ME)
                 .with_head(&head.repeat(40))
-                .head_at(day(5))
+                .pushed_at(day(5))
         };
         let told = seen_on(mine("a"), &conflict);
         let snapshot = snap(vec![mine("b")], vec![]);
@@ -1691,7 +1691,7 @@ mod tests {
             said.extend(comments);
             pr(98)
                 .with_head(&"a".repeat(40))
-                .head_at(day(-30))
+                .pushed_at(day(-30))
                 .comments(said)
         };
         let seen = seen_on(acked(vec![]), &empty);
