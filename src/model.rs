@@ -6,8 +6,10 @@
 //!          only point at candidates it was given; anything else is dropped.
 //!
 //! Both are cached in state/ so the hourly refresh pays for the model only when
-//! something it would look at has changed. Neither subprocess gets a GitHub token:
-//! the data goes in inline, and nothing here needs to fetch.
+//! something it would look at has changed. Neither subprocess gets any tools: the
+//! data goes in inline and nothing here needs to fetch, and the prompts carry text
+//! from anyone who can open an issue. Removing the GitHub token alone would not be
+//! enough, because `gh` falls back to your own login.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -55,7 +57,8 @@ fn json_object_in(stdout: &str) -> Option<Value> {
 /// Parsed JSON object from `claude -p`, or `None` on any failure.
 pub fn claude(prompt: &str) -> Option<Value> {
     let mut cmd = Command::new("claude");
-    cmd.args(["-p", prompt])
+    // The prompt goes first: `--tools` takes a list and would swallow it.
+    cmd.args(["-p", prompt, "--tools", "", "--strict-mcp-config"])
         .env_remove("GH_TOKEN")
         .env_remove("GITHUB_TOKEN");
     match proc::run(&mut cmd, TIMEOUT) {

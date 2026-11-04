@@ -119,7 +119,8 @@ pub fn write_briefing(vault_dir: &Path, target: &Target<'_>) -> Result<PathBuf, 
     // NOT post anything" is guidance, not a boundary -- the token is the boundary.
     // Pin it to the unit's read-only GH_TOKEN explicitly: with the var merely
     // inherited, a manual run leaves it unset and `gh` falls back to the user's own
-    // keyring auth, which carries `repo` (write). Refuse instead.
+    // keyring auth, which carries `repo` (write). Refuse instead. The agent could unset
+    // it too, which is why the unit hides that login from it.
     let token = std::env::var("GH_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())

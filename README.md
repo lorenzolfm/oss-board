@@ -170,11 +170,14 @@ reuse cached gists and rankings unless something they look at moved.
   obligation, or touch your lanes. Any model failure degrades to computed
   reasons and mechanical order, and says so.
 - **Read-only, enforced by the token.** The scanner sends only GETs and
-  GraphQL queries. The one exception is the briefing note, authored by a
-  `claude -p` subprocess holding the `gh` CLI -- there the prompt's "do NOT
-  post anything" is guidance, and the token is what enforces it. `brief.rs`
-  refuses to run without `GH_TOKEN` rather than fall back to your own keyring
-  auth, which carries `repo`.
+  GraphQL queries. The gist and judge passes get no tools at all, because their
+  prompts carry text from anyone who can open an issue. The one exception is the
+  briefing note, authored by a `claude -p` subprocess holding the `gh` CLI --
+  there the prompt's "do NOT post anything" is guidance, and the token is what
+  enforces it. `brief.rs` refuses to run without `GH_TOKEN` rather than fall back
+  to your own login, which carries `repo`, and the unit hides that login
+  (`~/.config/gh`) so the agent can't reach it either. The rest of `$HOME` stays
+  readable to that agent, so this covers `gh`, not every credential you have.
 - **Responses are parsed once, against GitHub's schema.** A field the schema
   promises is required, so a response of another shape is a failed read rather
   than an empty list. `labels` and `files` are the only lists allowed to be

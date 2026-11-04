@@ -123,6 +123,10 @@ in
         "${home}/Documents/Vault/Opensource"
         "${projectDir}/state"
       ];
+      # `gh` falls back to the login kept here when GH_TOKEN is unset, and that login
+      # can write. The briefing agent reads text from anyone who can open an issue and
+      # could unset the variable, so the read-only token must be all it can reach.
+      TemporaryFileSystem = "${home}/.config/gh:ro";
       NoNewPrivileges = true;
       ProtectKernelTunables = true;
       ProtectKernelModules = true;

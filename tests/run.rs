@@ -45,18 +45,21 @@ esac
 /// does, and writes the note a briefing asks for. Keeps the board it saw at that
 /// moment, for what a slow briefing can cost.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
-case "$2" in
+prompt=$2
+shift 2
+args=$(printf '[%s]' "$@")
+case "$prompt" in
   "Each item below"*)
-    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset}" >> "$FIXTURE_DIR/claude.log"
+    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     echo 'Sure, here you go:'
     echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no"}]}';;
   "You are picking"*)
-    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset}" >> "$FIXTURE_DIR/claude.log"
+    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     echo '{"picks":[{"number":8,"why":"small and yours","pitch":"read it first","est":"1h"}]}';;
   "Write an Obsidian"*)
-    echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset}" >> "$FIXTURE_DIR/claude.log"
+    echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     cp "$FIXTURE_DIR/vault/Tasks.md" "$FIXTURE_DIR/board_at_brief.md"
-    note=$(printf '%s\n' "$2" | sed -n '/exactly this path/{n;s/^ *//;p;}')
+    note=$(printf '%s\n' "$prompt" | sed -n '/exactly this path/{n;s/^ *//;p;}')
     printf '%0400d' 0 > "$note"
     echo DONE;;
 esac
@@ -314,9 +317,12 @@ fn a_run_rewrites_the_agent_lanes_and_leaves_yours() {
     );
 }
 
-/// The data goes in inline, so the model passes have no use for GitHub credentials.
+/// The data goes in inline, and the prompts carry text from anyone who can open an
+/// issue, so the model passes get no tools. An unset token alone would leave them your
+/// own login through `gh`. The fake only answers a prompt in `$2`, so this also fails
+/// if the prompt ever follows `--tools`, which would swallow it.
 #[test]
-fn the_model_passes_never_hold_a_github_token() {
+fn the_model_passes_get_no_tools_and_no_github_token() {
     let fixture = Fixture::new();
     run(fixture
         .command(&["--no-briefings"])
@@ -325,8 +331,8 @@ fn the_model_passes_never_hold_a_github_token() {
     let log = fixture.claude_log();
     assert_eq!(log.lines().count(), 2, "{log}");
     assert!(
-        log.lines()
-            .all(|l| l == "model GH_TOKEN=unset GITHUB_TOKEN=unset"),
+        log.lines().all(|l| l
+            == "model GH_TOKEN=unset GITHUB_TOKEN=unset args=[--tools][][--strict-mcp-config]"),
         "{log}"
     );
 }
@@ -644,7 +650,7 @@ fn claimed_pr_board() -> String {
     )
 }
 
-/// The briefing agent holds Bash and `gh`, so the token is what keeps it read-only.
+/// The briefing agent needs Bash and `gh`, so the token is what keeps it read-only.
 #[test]
 fn claiming_a_pr_writes_a_review_brief_with_the_read_only_token() {
     let fixture = Fixture::new();
@@ -657,7 +663,7 @@ fn claiming_a_pr_writes_a_review_brief_with_the_read_only_token() {
     assert!(note.exists());
     assert_eq!(
         fixture.claude_log().trim(),
-        "brief GH_TOKEN=read-only-token GITHUB_TOKEN=read-only-token"
+        "brief GH_TOKEN=read-only-token GITHUB_TOKEN=read-only-token args=[]"
     );
     let board = fixture.read_board();
     assert!(
