@@ -148,6 +148,33 @@ struct LastDm {
     at: Option<DateTime<FixedOffset>>,
     #[serde(default, deserialize_with = "seen_records")]
     seen: BTreeMap<CardKey, Seen>,
+    /// What each claimed card's alert last said.
+    #[serde(default)]
+    alerted: BTreeMap<CardKey, String>,
+}
+
+impl LastDm {
+    /// An alert is news when it says something the last DM did not.
+    fn new_alerts(&self, alerts: &BTreeMap<CardKey, String>) -> Vec<String> {
+        alerts
+            .iter()
+            .filter(|(key, said)| self.alerted.get(*key) != Some(*said))
+            .map(|(_, said)| said.clone())
+            .collect()
+    }
+
+    /// What to remember once a DM is delivered. As in `obligations::seen_after`, only
+    /// clearing forgets, so a claim this run could not read keeps what was said about it.
+    fn alerted_after(
+        &self,
+        alerts: BTreeMap<CardKey, String>,
+        unread: &[&CardKey],
+    ) -> BTreeMap<CardKey, String> {
+        let kept = unread
+            .iter()
+            .filter_map(|key| Some(((*key).clone(), self.alerted.get(*key)?.clone())));
+        alerts.into_iter().chain(kept).collect()
+    }
 }
 
 /// Parsed once, here. Earlier versions wrote a bare time for how far you had read, and a
@@ -561,11 +588,15 @@ fn run(args: &Refresh) -> Result<()> {
         log("  some claimed cards could not be read");
         degraded.insert(Degraded::Claims);
     }
-    let mut claim_alerts: Vec<String> = Vec::new();
+    let mut claim_alerts: BTreeMap<CardKey, String> = BTreeMap::new();
+    let mut unread_claims: Vec<&CardKey> = Vec::new();
     for claim in &claimed {
         let held = match claim.key.github() {
             // Not read, which says nothing, so the card keeps what it says.
-            Some(item) if !status.contains_key(item) => continue,
+            Some(item) if !status.contains_key(item) => {
+                unread_claims.push(&claim.key);
+                continue;
+            }
             Some(item) => status.get(item),
             None => None,
         };
@@ -575,8 +606,11 @@ fn run(args: &Refresh) -> Result<()> {
         }
         notes.extend(held.iter().flat_map(|s| s.notes.iter().cloned()));
         changes.notes.push((claim.key.clone(), notes.join(" · ")));
-        if let (Some(held), Some(item)) = (held.filter(|s| s.urgent), claim.key.github()) {
-            claim_alerts.push(format!("#{} — {}", item.number(), held.notes.join(" · ")));
+        // Done is finished with, so what happens upstream of it is no alarm. The card says it.
+        let urgent = held.filter(|s| s.urgent && claim.lane.is_active());
+        if let (Some(held), Some(item)) = (urgent, claim.key.github()) {
+            let said = format!("#{} — {}", item.number(), held.notes.join(" · "));
+            claim_alerts.insert(claim.key.clone(), said);
         }
     }
 
@@ -629,7 +663,7 @@ fn run(args: &Refresh) -> Result<()> {
         gists: &gists,
         claimed_lane: &active,
         degraded: &degraded,
-        claim_alerts: &claim_alerts,
+        claim_alerts: &last_dm.new_alerts(&claim_alerts),
     }
     .render();
     fs::write(state_path("summary.txt"), &text)?;
@@ -649,6 +683,7 @@ fn run(args: &Refresh) -> Result<()> {
             let record = LastDm {
                 at: Some(local),
                 seen: obligations::seen_after(&obs, held, &last_dm.seen, &unread_kinds),
+                alerted: last_dm.alerted_after(claim_alerts, &unread_claims),
             };
             model::save(&state_path("last_dm.json"), &record)?;
         }

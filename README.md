@@ -114,6 +114,10 @@ re-arms the mute is new and what you already knew is not. A source that can't be
 doesn't either, so a conflict isn't news twice because GitHub was computing it one
 morning.
 
+A card in Todo or Doing can add a ⚠ line: closed upstream, assigned to someone else,
+or a PR opened for it. That also goes out once and then stays on the card. It goes out
+again only if it says something else, or clears and comes back.
+
 Opportunities and Unshipped stay on the board.
 
 If the model gives no verdict on a new item, it goes through and the message says it

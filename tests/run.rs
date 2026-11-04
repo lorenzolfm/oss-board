@@ -1026,3 +1026,62 @@ fn the_dm_carries_no_opportunities() {
         "{board}"
     );
 }
+
+const CLAIMED_ISSUE: &str = "- [ ] mine [#98](https://github.com/getfloresta/Floresta/issues/98)";
+
+/// Issue #98, as the claims read finds it.
+fn claimed_issue(state: &str, assignee: &str) -> String {
+    format!(
+        r#"{{"data":{{"n0":{{"issueOrPullRequest":{{"__typename":"Issue","state":"{state}",
+        "closedAt":"2026-01-01T00:00:00Z","assignees":{{"nodes":[{{"login":"{assignee}"}}]}},
+        "timelineItems":{{"nodes":[]}}}}}}}}}}"#
+    )
+}
+
+/// An alert is news once, and the card goes on saying it. Only saying something else, or
+/// clearing and coming back, sends it again.
+#[test]
+fn a_claim_alert_goes_out_once_and_stays_on_the_card() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), board_text("", CLAIMED_ISSUE)).unwrap();
+    let (url, messages) = listener();
+    let closed = claimed_issue("CLOSED", "me");
+    let taken = claimed_issue("CLOSED", "bob");
+    let open = claimed_issue("OPEN", "me");
+    for (name, claims, sent) in [
+        ("the first morning", closed.as_str(), true),
+        ("the next one", &closed, false),
+        ("it says something else", &taken, true),
+        ("a read that failed says nothing", "not json", false),
+        ("and is no reason to say it again", &taken, false),
+        ("it cleared", &open, false),
+        ("it came back", &taken, true),
+    ] {
+        fs::write(fixture.path("claims.json"), claims).unwrap();
+        let dm = deliver(&fixture, &url, &messages, &["--no-model"]);
+        assert_eq!(dm.contains("#98 —"), sent, "{name}: {dm}");
+    }
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Doing")[0].contains("assigned to bob"),
+        "{board}"
+    );
+}
+
+/// Finished with, so a closed issue there is how it should be.
+#[test]
+fn a_card_in_done_raises_no_alert() {
+    let fixture = Fixture::new();
+    let board =
+        board_text("", "").replace("## Done\n\n", &format!("## Done\n\n{CLAIMED_ISSUE}\n\n"));
+    fs::write(fixture.board(), board).unwrap();
+    fs::write(fixture.path("claims.json"), claimed_issue("CLOSED", "me")).unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    let dm = fixture.read_state("summary.txt");
+    assert!(!dm.contains("#98 —"), "{dm}");
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Done")[0].contains("closed upstream"),
+        "the card still says so: {board}"
+    );
+}
