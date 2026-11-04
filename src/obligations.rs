@@ -559,9 +559,10 @@ fn stale_ack(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec
             text,
         )];
     }
-    // A head older than the ACK means the ACK named some other commit.
+    // A head older than the ACK means the ACK named some other commit. That is still
+    // a fact about this head, and the next push is a new trigger whatever its date.
     let text = format!("your ACK {short} is not the PR head");
-    vec![Reason::at(ReasonKind::StaleAck, at, text)]
+    vec![Reason::on_head(ReasonKind::StaleAck, pr, Some(at), text)]
 }
 
 /// Rule 5: assigned to you and nothing links a fix yet.
@@ -1190,6 +1191,30 @@ mod tests {
             !is_muted(&obs[0], Some(&mute)),
             "an older commit, pushed later"
         );
+    }
+
+    /// These commits are dated before the ACK and pushed after it, so their dates say
+    /// nothing about the push. The first head is either side of the ACK, because which
+    /// side decides how the reason is dated.
+    #[test]
+    fn a_push_dated_before_your_ack_still_rearms_a_muted_stale_ack() {
+        let viewer = me();
+        let acked = |head: &str, pushed| {
+            pr(64)
+                .with_head(&head.repeat(40))
+                .head_at(pushed)
+                .comments(vec![c(ME, 9, "ACK 1234567")])
+        };
+        for (first, next) in [(day(12), day(11)), (day(3), day(12))] {
+            let snapshot = snap(vec![acked("a", first)], vec![]);
+            let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+            let mute = mute_of(&obs[0]);
+            assert!(is_muted(&obs[0], Some(&mute)), "the head you muted");
+
+            let snapshot = snap(vec![acked("b", next)], vec![]);
+            let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+            assert!(!is_muted(&obs[0], Some(&mute)), "a new head");
+        }
     }
 
     #[test]
