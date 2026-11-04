@@ -1,9 +1,11 @@
 //! The two model passes, and the only places a model touches the output.
 //!
-//!   gists  one line per obligation. Decorative by contract: an obligation with no
-//!          gist is still listed, in the same place, with its computed reasons.
-//!   rank   the opportunity judge -- filters, orders, estimates, pitches. It may
-//!          only point at candidates it was given; anything else is dropped.
+//!   gists  one line per obligation, and whether anyone is actually asking. Never
+//!          touches the board's list: an obligation with no gist stays there, in the
+//!          same place, with its computed reasons. The verdict only decides what the
+//!          DM may interrupt you with, and no verdict means it may.
+//!   rank   the opportunity judge -- filters and orders. It may only point at
+//!          candidates it was given; anything else is dropped.
 //!
 //! Both are cached in state/ so the hourly refresh pays for the model only when
 //! something it would look at has changed. Neither subprocess gets any tools: the
@@ -27,7 +29,7 @@ use sha2::{Digest, Sha256};
 
 use crate::board::CardKey;
 use crate::footprint::Footprint;
-use crate::obligations::{Obligation, Viewer, fingerprint};
+use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind};
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
@@ -109,11 +111,10 @@ pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
 // ---------------------------------------------------------------- gists
 
 fn gist_fingerprint(ob: &Obligation<'_>) -> String {
-    let fp = fingerprint(ob);
     format!(
         "{}|{}|{}",
-        fp.last_text(),
-        fp.kinds_text(),
+        last_per_kind(ob),
+        fingerprint(ob).kinds_text(),
         ob.item.head().unwrap_or("")
     )
 }
@@ -142,6 +143,9 @@ struct Excerpt<'a> {
     key: &'a CardKey,
     kind: &'static str,
     title: &'a str,
+    author: &'a str,
+    /// He opened it or is assigned it, so a request on it is for him.
+    his: bool,
     reasons: Vec<&'a str>,
     description: String,
     waiting_comments: Vec<Said<'a>>,
@@ -209,6 +213,8 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
         key: &item.key,
         kind: item.kind(),
         title: &item.title,
+        author: &item.author,
+        his: item.author == me.login || item.assignees.contains(&me.login),
         reasons: ob.reasons.iter().map(|r| r.text.as_str()).collect(),
         description: clip(&item.body, 500),
         waiting_comments: recent
@@ -226,10 +232,20 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
     }
 }
 
+/// What the gist pass said about an obligation.
+#[derive(Debug, PartialEq)]
+pub struct Gist {
+    pub text: String,
+    /// Whether someone is waiting on you specifically.
+    pub asks: bool,
+}
+
+/// A cache from before `asks` will not read, which costs one model pass.
 #[derive(Serialize, Deserialize)]
 struct CachedGist {
     fp: String,
     gist: String,
+    asks: bool,
 }
 
 #[derive(Deserialize)]
@@ -241,16 +257,17 @@ struct GistAnswer {
 struct WireGist {
     key: CardKey,
     gist: String,
+    asks: bool,
 }
 
 /// `key -> gist`. Cached per fingerprint; only changed items reach the model. An entry
-/// of another shape costs that one gist, which is decoration anyway.
+/// of another shape costs that one gist.
 pub fn gists(
     obs: &[Obligation<'_>],
     me: &Viewer,
     cache_path: &Path,
     mut ask: impl FnMut(&str) -> Option<Value>,
-) -> Result<BTreeMap<CardKey, String>> {
+) -> Result<BTreeMap<CardKey, Gist>> {
     let mut cache: BTreeMap<CardKey, CachedGist> = load_cache(cache_path);
     let want: HashMap<&CardKey, String> = obs
         .iter()
@@ -266,13 +283,13 @@ pub fn gists(
         let answer = ask(&prompt).and_then(|answer| serde_json::from_value(answer).ok());
         let entries = answer.map_or(Vec::new(), |answer: GistAnswer| answer.gists);
         for entry in entries {
-            let Ok(WireGist { key, gist }) = serde_json::from_value(entry) else {
+            let Ok(WireGist { key, gist, asks }) = serde_json::from_value(entry) else {
                 continue;
             };
-            let gist = clip(&gist, 200);
+            let gist = clip(&gist, 120);
             if let Some(fp) = want.get(&key).filter(|_| !gist.is_empty()) {
                 let fp = fp.clone();
-                cache.insert(key, CachedGist { fp, gist });
+                cache.insert(key, CachedGist { fp, gist, asks });
             }
         }
     }
@@ -281,7 +298,13 @@ pub fn gists(
     Ok(cache
         .into_iter()
         .filter(|(key, cached)| want.get(key) == Some(&cached.fp))
-        .map(|(key, cached)| (key, cached.gist))
+        .map(|(key, cached)| {
+            let gist = Gist {
+                text: cached.gist,
+                asks: cached.asks,
+            };
+            (key, gist)
+        })
         .collect())
 }
 
@@ -383,10 +406,6 @@ struct WirePick {
     number: u64,
     #[serde(default, deserialize_with = "text_or_nothing")]
     why: Option<String>,
-    #[serde(default, deserialize_with = "text_or_nothing")]
-    pitch: Option<String>,
-    #[serde(default, deserialize_with = "text_or_nothing")]
-    est: Option<String>,
 }
 
 /// The judge writes `"number": "1"` as readily as `"number": 1`. Anything else points
@@ -421,22 +440,14 @@ fn clipped(field: Option<String>, n: usize) -> Option<String> {
 #[derive(Debug)]
 pub struct Verdict {
     pub why: Option<String>,
-    pub pitch: Option<String>,
-    pub est: Option<String>,
 }
 
 /// The opportunities to show, best first.
 #[derive(Debug)]
 pub enum Ranked<'o, 'a> {
     Judged(Vec<(&'o Opportunity<'a>, Verdict)>),
-    /// Ranking order with nothing from the judge, and shown as such.
+    /// Ranking order with nothing from the judge. The run reports it as `Degraded::Model`.
     Mechanical(Vec<&'o Opportunity<'a>>),
-}
-
-impl Default for Ranked<'_, '_> {
-    fn default() -> Self {
-        Self::Mechanical(Vec::new())
-    }
 }
 
 impl<'o, 'a> Ranked<'o, 'a> {
@@ -456,7 +467,7 @@ impl<'o, 'a> Ranked<'o, 'a> {
     }
 }
 
-/// Falls back to the order given, untouched, and says so.
+/// Falls back to the order given, untouched, and `is_judged` says so.
 pub fn rank<'o, 'a>(
     opps: &'o [Opportunity<'a>],
     fp: &Footprint,
@@ -515,8 +526,6 @@ pub fn rank<'o, 'a>(
         }
         let verdict = Verdict {
             why: clipped(pick.why, 80),
-            pitch: clipped(pick.pitch, 240),
-            est: clipped(pick.est, 8),
         };
         out.push((opp, verdict));
         if out.len() >= cap {
@@ -538,11 +547,10 @@ mod tests {
 
     use super::*;
     use crate::obligations::collect;
-    use crate::render::Dm;
     use crate::snapshot::Item;
     use crate::testkit::{ME, c, day, key, me, now, opportunity, pr, snap};
     use serde_json::json;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -583,7 +591,7 @@ mod tests {
         let items = items();
         let opps = opportunities(&items);
         let answer = json!({"picks": [
-            {"number": 3, "why": "w", "pitch": "p", "est": "1h"},
+            {"number": 3, "why": "w"},
             {"number": 99, "why": "invented"},
             {"number": 3},
             {"bogus": 1},
@@ -606,16 +614,12 @@ mod tests {
             {"number": [1]},
             {"number": null},
             "not an object",
-            {"number": 2, "why": true, "pitch": 7, "est": ""},
+            {"number": 2, "why": true},
         ]});
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(answer));
         assert_eq!(numbers(&ranked), [2]);
         let picks = ranked.picks();
-        let verdict = picks[0].1.unwrap();
-        assert_eq!(
-            (&verdict.why, &verdict.pitch, &verdict.est),
-            (&None, &None, &None)
-        );
+        assert_eq!(picks[0].1.unwrap().why, None);
     }
 
     #[test]
@@ -629,19 +633,13 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_judge_is_said_out_loud() {
+    fn a_failed_judge_falls_back_to_ranking_order_flagged() {
         let dir = TempDir::new().unwrap();
         let items = items();
         let opps = opportunities(&items);
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), None);
-        let message = Dm {
-            today: "d",
-            ranked,
-            cap: 3,
-            ..Dm::default()
-        }
-        .render();
-        assert!(message.contains("judge unavailable"), "{message}");
+        assert!(!ranked.is_judged());
+        assert_eq!(numbers(&ranked), [1, 2, 3]);
     }
 
     #[test]
@@ -679,13 +677,21 @@ mod tests {
         let calls = Cell::new(0);
         let ask = |_: &str| {
             calls.set(calls.get() + 1);
-            Some(json!({"gists": [{"key": item_key.to_string(), "gist": "asks for a yes/no"}]}))
+            Some(json!({"gists": [
+                {"key": item_key.to_string(), "gist": "asks for a yes/no", "asks": true}
+            ]}))
         };
         let first = gists(&obs, &viewer, &path, ask).unwrap();
         let second = gists(&obs, &viewer, &path, ask).unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(first, second);
-        assert_eq!(first[&item_key], "asks for a yes/no");
+        assert_eq!(
+            first[&item_key],
+            Gist {
+                text: "asks for a yes/no".to_owned(),
+                asks: true
+            }
+        );
 
         let newer = snap(
             vec![
@@ -707,6 +713,86 @@ mod tests {
         );
     }
 
+    /// One time across every kind would let this head hide the ping, and a verdict on the
+    /// thank-you would decide a question the model never read.
+    #[test]
+    fn a_newer_ping_on_a_head_dated_ahead_is_read_again() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let empty = HashMap::new();
+        let acked = |comments| {
+            pr(98)
+                .with_head(&"a".repeat(40))
+                .pushed_at(day(-30))
+                .comments(comments)
+        };
+        let ack = c(ME, 9, "ACK 1234567");
+        let thanks = c("bob", 5, &format!("@{ME} thanks"));
+        let question = c("bob", 1, &format!("@{ME} can you decide?"));
+        let first = snap(vec![acked(vec![ack.clone(), thanks.clone()])], vec![]);
+        let obs = collect(&first, &viewer, now(), &empty);
+        let item_key = obs[0].item.key.clone();
+        let answer = |asks: bool| {
+            Some(json!({"gists": [{"key": item_key.to_string(), "gist": "g", "asks": asks}]}))
+        };
+        gists(&obs, &viewer, &path, |_| answer(false)).unwrap();
+
+        let next = snap(vec![acked(vec![ack, thanks, question])], vec![]);
+        let obs = collect(&next, &viewer, now(), &empty);
+        let got = gists(&obs, &viewer, &path, |_| answer(true)).unwrap();
+        assert!(got[&item_key].asks, "the cached verdict decided it");
+    }
+
+    /// Asked to judge a "can you rebase?" with no owner on it, the model could not tell
+    /// who was being asked.
+    #[test]
+    fn the_verdict_can_see_whose_item_it_is() {
+        let dir = TempDir::new().unwrap();
+        let viewer = me();
+        let snapshot = snap(
+            vec![
+                pr(1).author(ME).requested(ME, &day(1).to_string()),
+                pr(2).requested(ME, &day(1).to_string()),
+            ],
+            vec![],
+        );
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let prompt = RefCell::new(String::new());
+        gists(&obs, &viewer, &cache(&dir, "g.json"), |sent| {
+            prompt.replace(sent.to_owned());
+            None
+        })
+        .unwrap();
+        let sent = prompt.into_inner();
+        let payload: Value =
+            serde_json::from_str(&sent[sent.find("ITEMS:").unwrap() + 6..]).unwrap();
+        assert_eq!(payload[0]["author"], ME);
+        assert_eq!(payload[0]["his"], true);
+        assert_eq!(payload[1]["author"], "alice");
+        assert_eq!(payload[1]["his"], false);
+    }
+
+    /// No verdict means the DM may interrupt you, so a verdict must be a real one.
+    #[test]
+    fn a_gist_without_a_verdict_counts_as_no_answer() {
+        let dir = TempDir::new().unwrap();
+        let viewer = me();
+        let snapshot = snap(vec![pr(100).requested(ME, &day(1).to_string())], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let key = obs[0].item.key.to_string();
+        for entry in [
+            json!({"key": key, "gist": "text"}),
+            json!({"key": key, "gist": "text", "asks": "false"}),
+        ] {
+            let got = gists(&obs, &viewer, &cache(&dir, "g.json"), |_| {
+                Some(json!({"gists": [entry.clone()]}))
+            })
+            .unwrap();
+            assert!(got.is_empty(), "{entry}");
+        }
+    }
+
     #[test]
     fn prose_around_the_answer_is_tolerated_and_garbage_is_not_an_answer() {
         assert_eq!(
@@ -726,7 +812,7 @@ mod tests {
         let snapshot = snap(vec![pr(100).requested(ME, "2026-10-08T17:14:49Z")], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let cached = format!(
-            "{{\n \"getfloresta/Floresta#100\": {{\n  \"fp\": \"2026-10-08T17:14:49Z|review_requested|{}\",\n  \"gist\": \"caf\\u00e9\"\n }}\n}}",
+            "{{\n \"getfloresta/Floresta#100\": {{\n  \"fp\": \"2026-10-08T17:14:49Z|review_requested|{}\",\n  \"gist\": \"caf\\u00e9\",\n  \"asks\": false\n }}\n}}",
             "f".repeat(40),
         );
         fs::write(&path, cached).unwrap();
@@ -734,7 +820,7 @@ mod tests {
             panic!("a cached gist must not ask")
         })
         .unwrap();
-        assert_eq!(got[&key("getfloresta/floresta#100")], "café");
+        assert_eq!(got[&key("getfloresta/floresta#100")].text, "café");
 
         let dir = TempDir::new().unwrap();
         let path = cache(&dir, "r.json");
@@ -747,7 +833,7 @@ mod tests {
         let cached = json!({
             "sig": rank_fingerprint(&opps),
             "at": now,
-            "picks": [{"est": "1h", "number": 2, "pitch": "p", "why": "w"}],
+            "picks": [{"number": 2, "why": "w"}],
         });
         fs::write(&path, cached.to_string()).unwrap();
         let ranked = rank(&opps, &Footprint::default(), 8, &path, 12.0, |_| {
@@ -755,6 +841,28 @@ mod tests {
         })
         .unwrap();
         assert_eq!(numbers(&ranked), [2]);
+    }
+
+    /// A gist cached before `asks` has no verdict in it, so it is asked for again.
+    #[test]
+    fn a_gist_cache_from_before_verdicts_costs_one_model_pass() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let snapshot = snap(vec![pr(100).requested(ME, "2026-10-08T17:14:49Z")], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let item_key = obs[0].item.key.clone();
+        let cached =
+            json!({ item_key.to_string(): {"fp": gist_fingerprint(&obs[0]), "gist": "old"} });
+        fs::write(&path, cached.to_string()).unwrap();
+        let calls = Cell::new(0);
+        let got = gists(&obs, &viewer, &path, |_| {
+            calls.set(calls.get() + 1);
+            Some(json!({"gists": [{"key": item_key.to_string(), "gist": "new", "asks": false}]}))
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(got[&item_key].text, "new");
     }
 
     #[test]

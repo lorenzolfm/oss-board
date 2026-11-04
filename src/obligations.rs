@@ -6,7 +6,8 @@
 //!
 //!   kind  also what a mute remembers
 //!   when  how long it has been waiting (ordering), and what re-arms a mute on it:
-//!         a newer event, or for a state of the PR like a merge conflict, a new head
+//!         a newer event, for a state of the PR like a merge conflict a new head, and
+//!         for your own unshipped work only going away and coming back
 //!   text  the phone-sized explanation
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -14,7 +15,10 @@ use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
+use crate::board::CardKey;
+use crate::config;
 use crate::snapshot::{
     CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review, ReviewState,
     Snapshot,
@@ -88,6 +92,19 @@ impl ReasonKind {
             Self::Unshipped => "unshipped",
         }
     }
+
+    /// Whether this reason is an ask by its nature. For the rest, someone has to have
+    /// actually asked, which only the gist pass can read.
+    fn is_an_ask(self) -> bool {
+        matches!(
+            self,
+            Self::Assigned
+                | Self::ChangesRequested
+                | Self::CiFailed
+                | Self::Conflict
+                | Self::ReviewRequested
+        )
+    }
 }
 
 /// How a reason is dated, which is also what re-arms a mute on it.
@@ -103,6 +120,9 @@ pub enum When {
         oid: String,
         since: Option<Timestamp>,
     },
+    /// True since `since`, which only orders it. That date is your own work on it, which
+    /// is no new trigger, so only its first appearance is one.
+    Standing { since: Timestamp },
 }
 
 #[derive(Clone, Debug)]
@@ -113,8 +133,16 @@ pub struct Reason {
 }
 
 impl Reason {
-    pub fn at(kind: ReasonKind, at: Timestamp, text: String) -> Self {
+    fn at(kind: ReasonKind, at: Timestamp, text: String) -> Self {
         Self::between(kind, at, at, text)
+    }
+
+    pub fn standing(kind: ReasonKind, since: Timestamp, text: String) -> Self {
+        Self {
+            kind,
+            when: When::Standing { since },
+            text,
+        }
     }
 
     fn between(kind: ReasonKind, first: Timestamp, last: Timestamp, text: String) -> Self {
@@ -140,6 +168,7 @@ impl Reason {
         match &self.when {
             When::Events { first, .. } => Some(*first),
             When::Head { since, .. } => *since,
+            When::Standing { since } => Some(*since),
         }
     }
 
@@ -147,12 +176,13 @@ impl Reason {
         match &self.when {
             When::Events { last, .. } => Some(*last),
             When::Head { since, .. } => *since,
+            When::Standing { .. } => None,
         }
     }
 
     fn head(&self) -> Option<&str> {
         match &self.when {
-            When::Events { .. } => None,
+            When::Events { .. } | When::Standing { .. } => None,
             When::Head { oid, .. } => Some(oid),
         }
     }
@@ -296,6 +326,11 @@ fn quotes(body: &str, mine: &[Said<'_>]) -> bool {
     mine.iter().any(|said| norm(said.body).contains(probe))
 }
 
+/// Whether a comment is recent enough to still be asking anything.
+fn is_live(at: Timestamp, now: DateTime<Utc>) -> bool {
+    at.days_ago(now) <= config::CONVERSATION_TTL_DAYS
+}
+
 // ---------------------------------------------------------------- the rules
 
 /// Rule 2: the newest comment isn't yours, and it mentions you, or the item is
@@ -309,7 +344,7 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     if let Detail::Pr(pr) = &item.detail
         && me.is(&item.author)
     {
-        mine_at = mine_at.max(pr.head_at); // a push answers too
+        mine_at = mine_at.max(pr.pushed_at); // a push answers too
     }
     let assigned_to_me = item.assignees.iter().any(|login| me.is(login));
     if mine_at.is_none()
@@ -323,7 +358,7 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     }
     let after = said
         .iter()
-        .filter(|s| !me.is(s.author) && !s.bot && Some(s.at) > mine_at);
+        .filter(|s| !me.is(s.author) && !s.bot && Some(s.at) > mine_at && is_live(s.at, now));
     let (pinged, others): (Vec<&Said<'_>>, Vec<&Said<'_>>) =
         after.partition(|s| me.is_mentioned_in(s.body) || quotes(s.body, &mine));
 
@@ -380,6 +415,9 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
     if me.is(&item.author) {
         return Vec::new(); // your own PR's threads are rule 3's business
     }
+    // Any activity of yours answers what came before it, in this thread or not. Without
+    // write access you cannot resolve a thread, so an ACK is all you can say to one.
+    let engaged = engaged_at(item, me);
     let mut waiting = Vec::new();
     for thread in &pr.threads {
         let comments: Vec<_> = thread.comments.iter().filter(|c| !c.bot).collect();
@@ -389,14 +427,9 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
         let Some(newest) = comments.last().filter(|c| !me.is(&c.author)) else {
             continue;
         };
-        let mine_at = comments
-            .iter()
-            .filter(|c| me.is(&c.author))
-            .map(|c| c.at)
-            .max();
         let Some(first) = comments
             .iter()
-            .find(|c| Some(c.at) > mine_at && !me.is(&c.author))
+            .find(|c| Some(c.at) > engaged && !me.is(&c.author) && is_live(c.at, now))
         else {
             continue;
         };
@@ -435,6 +468,13 @@ fn review_request(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -
         .get(&me.login)
         .copied()
         .unwrap_or(item.created);
+    // GitHub holds the request open until a review is submitted. A comment of yours with
+    // nothing pushed since has said your piece, and the next move is the author's.
+    let answered = engaged_at(item, me)
+        .is_some_and(|mine| mine > at && pr.pushed_at.is_some_and(|head| head <= mine));
+    if answered {
+        return Vec::new();
+    }
     let text = format!("review requested {} ago", at.ago(now));
     vec![Reason::at(ReasonKind::ReviewRequested, at, text)]
 }
@@ -451,11 +491,17 @@ fn own_pr(
         return Vec::new();
     }
     let mut out = Vec::new();
+    // Dated by what someone else said. Your own reply and a bot's are no new trigger, and a
+    // thread with nothing else in it is dated from when it opened.
     let lasts: Vec<Timestamp> = pr
         .threads
         .iter()
         .filter(|t| !t.resolved)
-        .filter_map(|t| t.comments.iter().map(|c| c.at).max())
+        .filter_map(|t| {
+            let others = t.comments.iter().filter(|c| !me.is(&c.author) && !c.bot);
+            let said = others.map(|c| c.at).max();
+            said.or_else(|| t.comments.iter().map(|c| c.at).min())
+        })
         .collect();
     if let (Some(oldest), Some(newest)) = (lasts.iter().min(), lasts.iter().max()) {
         let n = lasts.len();
@@ -490,7 +536,7 @@ fn own_pr(
     }
     let blocking: Vec<&Review> = latest
         .into_iter()
-        .filter(|r| r.state == ReviewState::ChangesRequested && Some(r.at) > pr.head_at)
+        .filter(|r| r.state == ReviewState::ChangesRequested && Some(r.at) > pr.pushed_at)
         .collect();
     let oldest = blocking.iter().min_by_key(|r| r.at);
     let newest = blocking.iter().map(|r| r.at).max();
@@ -550,7 +596,7 @@ fn stale_ack(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec
         return Vec::new();
     }
     let short = prefix(&acked, 7);
-    if let Some(pushed) = pr.head_at.filter(|pushed| *pushed > at) {
+    if let Some(pushed) = pr.pushed_at.filter(|pushed| *pushed > at) {
         let text = format!("pushed {} ago, past your ACK {short}", pushed.ago(now));
         return vec![Reason::on_head(
             ReasonKind::StaleAck,
@@ -688,23 +734,89 @@ pub fn fingerprint(ob: &Obligation<'_>) -> Fingerprint {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct Seen {
+/// The newest event behind each kind of reason, in the order `kinds_text` lists them.
+/// `Seen` compares times per kind, so anything keyed on what may be new has to as well: one
+/// time across them lets a head dated ahead hide a newer ping.
+pub fn last_per_kind(ob: &Obligation<'_>) -> String {
+    let mut newest: BTreeMap<ReasonKind, Option<Timestamp>> = BTreeMap::new();
+    for reason in &ob.reasons {
+        let held = newest.entry(reason.kind).or_default();
+        *held = (*held).max(reason.last());
+    }
+    let times = newest
+        .values()
+        .map(|at| at.map_or(String::new(), |at| at.to_string()));
+    times.collect::<Vec<_>>().join(",")
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SeenKind {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     heads: BTreeSet<String>,
 }
 
-/// What every muted card for an item adds up to: for each kind of reason you muted,
-/// the newest event you saw it with and the heads you saw it on. A fingerprint whose
-/// time does not parse (a hand-edited card) counts as older than everything.
-#[derive(Clone, Debug, Default)]
-pub struct Mute(BTreeMap<ReasonKind, Seen>);
+/// What you have seen of an item: for each kind of reason, the newest event you saw it
+/// with and the heads you saw it on. A reason this does not cover is a new trigger. It is
+/// what every muted card for an item adds up to, and what `last_dm.json` keeps per item.
+/// A fingerprint whose time does not parse (a hand-edited card) counts as older than
+/// everything.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(
+    from = "BTreeMap<String, SeenKind>",
+    into = "BTreeMap<&'static str, SeenKind>"
+)]
+pub struct Seen(BTreeMap<ReasonKind, SeenKind>);
 
-impl Mute {
+/// A kind no longer known is simply not remembered, so its card comes back.
+impl From<BTreeMap<String, SeenKind>> for Seen {
+    fn from(wire: BTreeMap<String, SeenKind>) -> Self {
+        let known = wire
+            .into_iter()
+            .filter_map(|(kind, seen)| Some((ReasonKind::parse(&kind)?, seen)));
+        Self(known.collect())
+    }
+}
+
+impl From<Seen> for BTreeMap<&'static str, SeenKind> {
+    fn from(seen: Seen) -> Self {
+        let kinds = seen.0.into_iter();
+        kinds.map(|(kind, seen)| (kind.as_str(), seen)).collect()
+    }
+}
+
+impl Seen {
+    /// A record from before kinds were named, which says only how far you had read.
+    /// It names no head, so a state of the PR reads as new once.
+    pub fn read_up_to(last: Timestamp) -> Self {
+        let mut seen = Self::default();
+        for kind in ReasonKind::ALL {
+            seen.remember(kind, Some(last), None);
+        }
+        seen
+    }
+
     pub fn remember(&mut self, kind: ReasonKind, last: Option<Timestamp>, head: Option<&str>) {
         let seen = self.0.entry(kind).or_default();
         seen.last = seen.last.max(last);
         seen.heads.extend(head.map(str::to_owned));
+    }
+
+    /// Only what this says about these kinds, if anything.
+    fn about(&self, kinds: &[ReasonKind]) -> Option<Self> {
+        let kept = self.0.iter().filter(|(kind, _)| kinds.contains(kind));
+        let kept: BTreeMap<_, _> = kept.map(|(kind, seen)| (*kind, seen.clone())).collect();
+        (!kept.is_empty()).then_some(Self(kept))
+    }
+
+    /// Remember a reason as `covers` will test it.
+    fn saw(&mut self, reason: &Reason) {
+        match &reason.when {
+            When::Events { last, .. } => self.remember(reason.kind, Some(*last), None),
+            When::Head { oid, .. } => self.remember(reason.kind, None, Some(oid)),
+            When::Standing { .. } => self.remember(reason.kind, None, None),
+        }
     }
 
     fn covers(&self, reason: &Reason) -> bool {
@@ -714,6 +826,7 @@ impl Mute {
         match &reason.when {
             When::Events { last, .. } => Some(*last) <= seen.last,
             When::Head { oid, .. } => seen.heads.contains(oid),
+            When::Standing { .. } => true,
         }
     }
 }
@@ -722,8 +835,62 @@ impl Mute {
 /// it, a timed event newer than the newest one you saw, or a new head for a state of
 /// the PR. General activity on the item never re-arms it -- only what would have made
 /// it an obligation in the first place.
-pub fn is_muted(ob: &Obligation<'_>, mute: Option<&Mute>) -> bool {
+pub fn is_muted(ob: &Obligation<'_>, mute: Option<&Seen>) -> bool {
     mute.is_some_and(|mute| ob.reasons.iter().all(|reason| mute.covers(reason)))
+}
+
+// ---------------------------------------------------------------- the DM
+
+/// The reasons that are a new trigger since the last DM, by the test a mute uses.
+fn new_reasons<'o>(ob: &'o Obligation<'_>, told: Option<&Seen>) -> Vec<&'o Reason> {
+    let is_new = |reason: &&Reason| !told.is_some_and(|told| told.covers(reason));
+    ob.reasons.iter().filter(is_new).collect()
+}
+
+/// Everything the DM may interrupt you with, in the order of `obs`: a new trigger since
+/// the last DM that is an ask, either by its nature or on the model's reading. An item
+/// the model has no verdict on is kept, because a dropped ask cannot be seen to be
+/// missing and a capped message can afford a false alarm.
+pub fn new_asks<'o, 'a>(
+    obs: &'o [Obligation<'a>],
+    seen: &BTreeMap<CardKey, Seen>,
+    asks: impl Fn(&CardKey) -> Option<bool>,
+) -> Vec<&'o Obligation<'a>> {
+    obs.iter()
+        .filter(|ob| {
+            let new = new_reasons(ob, seen.get(&ob.item.key));
+            !new.is_empty()
+                && (new.iter().any(|reason| reason.kind.is_an_ask())
+                    || asks(&ob.item.key).unwrap_or(true))
+        })
+        .collect()
+}
+
+/// What to remember once a DM is delivered. `obs` is every obligation, muted ones too:
+/// an item leaves this record only by clearing. A mute is not a clearing, and neither is
+/// a kind this run could not read, so what was remembered of those stays. An ask `held`
+/// back by the cap keeps what was remembered of it, so it stays new for the next DM.
+pub fn seen_after(
+    obs: &[Obligation<'_>],
+    held: &[&Obligation<'_>],
+    seen: &BTreeMap<CardKey, Seen>,
+    unread: &[ReasonKind],
+) -> BTreeMap<CardKey, Seen> {
+    let mut after: BTreeMap<CardKey, Seen> = seen
+        .iter()
+        .filter_map(|(key, told)| Some((key.clone(), told.about(unread)?)))
+        .collect();
+    for ob in obs {
+        let key = &ob.item.key;
+        if held.iter().any(|held| held.item.key == *key) {
+            after.remove(key);
+            after.extend(seen.get(key).map(|told| (key.clone(), told.clone())));
+            continue;
+        }
+        let told = after.entry(key.clone()).or_default();
+        ob.reasons.iter().for_each(|reason| told.saw(reason));
+    }
+    after
 }
 
 #[cfg(test)]
@@ -737,7 +904,7 @@ mod tests {
     //! conversation).
 
     use super::*;
-    use crate::snapshot::{Ci, Mergeability};
+    use crate::snapshot::{Ci, Comment, Mergeability};
     use crate::testkit::{ME, bot, c, day, issue, me, now, pr, review, snap, thread};
 
     fn merge_of(number: u64, mergeable: Mergeability, ci: Option<Ci>) -> HashMap<u64, MergeState> {
@@ -844,13 +1011,15 @@ mod tests {
                 "bots never wait on you",
                 pr(8)
                     .author(ME)
-                    .head_at(day(10))
+                    .pushed_at(day(10))
                     .comments(vec![bot("ci[bot]", 2, "coverage report")]),
                 vec![],
             ),
             (
                 "PR description cc's you",
-                pr(9).body(&at_me("Fixes a stall. cc @me for review")),
+                pr(9)
+                    .created(day(3))
+                    .body(&at_me("Fixes a stall. cc @me for review")),
                 vec!["mention"],
             ),
         ]);
@@ -859,7 +1028,10 @@ mod tests {
     #[test]
     fn an_informal_ask_reads_as_one() {
         let viewer = me();
-        let snapshot = snap(vec![pr(9).body(&at_me("cc @me for review"))], vec![]);
+        let snapshot = snap(
+            vec![pr(9).created(day(3)).body(&at_me("cc @me for review"))],
+            vec![],
+        );
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let text = &obs[0].reasons[0].text;
         assert!(text.contains("asked you to review"), "{text}");
@@ -872,7 +1044,7 @@ mod tests {
                 "an answer to you stays one after a later assignment (#167)",
                 issue(167).assigned(ME, day(8)).comments(vec![
                     c(ME, 40, "What's the scope?"),
-                    c("csgui", 29, "Run a node and re-level logs"),
+                    c("csgui", 9, "Run a node and re-level logs"),
                 ]),
                 vec!["assigned", "reply"],
             ),
@@ -903,20 +1075,20 @@ mod tests {
             (
                 "a comment since your push",
                 own(20)
-                    .head_at(day(10))
+                    .pushed_at(day(10))
                     .comments(vec![c("bob", 3, "a comment")]),
                 vec!["reply"],
             ),
             (
                 "a push answers the comment before it",
                 own(21)
-                    .head_at(day(2))
+                    .pushed_at(day(2))
                     .comments(vec![c("bob", 3, "a comment")]),
                 vec![],
             ),
             (
                 "an ACK is good news, not a request",
-                own(22).head_at(day(10)).comments(vec![c(
+                own(22).pushed_at(day(10)).comments(vec![c(
                     "bob",
                     3,
                     "ACK 1a2b3c4d\n\nran the tests",
@@ -925,7 +1097,7 @@ mod tests {
             ),
             (
                 "an APPROVED review asks nothing",
-                own(23).head_at(day(10)).reviews(vec![review(
+                own(23).pushed_at(day(10)).reviews(vec![review(
                     "bob",
                     3,
                     ReviewState::Approved,
@@ -935,7 +1107,7 @@ mod tests {
             ),
             (
                 "changes requested since your push",
-                own(24).head_at(day(10)).reviews(vec![review(
+                own(24).pushed_at(day(10)).reviews(vec![review(
                     "bob",
                     3,
                     ReviewState::ChangesRequested,
@@ -945,7 +1117,7 @@ mod tests {
             ),
             (
                 "changes requested before your latest push is answered",
-                own(25).head_at(day(2)).reviews(vec![review(
+                own(25).pushed_at(day(2)).reviews(vec![review(
                     "bob",
                     3,
                     ReviewState::ChangesRequested,
@@ -955,7 +1127,7 @@ mod tests {
             ),
             (
                 "an unresolved thread blocks merge, whoever spoke last",
-                own(26).head_at(day(2)).threads(vec![thread(vec![c(
+                own(26).pushed_at(day(2)).threads(vec![thread(vec![c(
                     "jaoleal",
                     30,
                     "typo: is_backfiling",
@@ -966,6 +1138,11 @@ mod tests {
                 "a resolved thread does not",
                 own(27).threads(vec![thread(vec![c("bob", 3, "a comment")]).resolved()]),
                 vec![],
+            ),
+            (
+                "a thread with only your own words in it blocks merge too",
+                own(35).threads(vec![thread(vec![c(ME, 3, "a comment")])]),
+                vec!["unresolved_thread"],
             ),
         ]);
     }
@@ -1032,6 +1209,120 @@ mod tests {
         ]);
     }
 
+    /// Without write access you cannot resolve a thread, so these would never clear.
+    #[test]
+    fn a_later_word_of_yours_answers_a_thread_you_cannot_resolve() {
+        let replied = |n| pr(n).threads(vec![thread(vec![c(ME, 9, "nit"), c("bob", 5, "done")])]);
+        check(vec![
+            (
+                "an ACK of the head since the reply (#1417)",
+                replied(70).reviews(vec![review(ME, 3, ReviewState::Approved, "ACK fffffff")]),
+                vec![],
+            ),
+            (
+                "a comment elsewhere on the PR since the reply (#1412)",
+                replied(71).comments(vec![c(ME, 3, "one more thing")]),
+                vec![],
+            ),
+            (
+                "a word of yours from before the reply answers nothing",
+                replied(72).reviews(vec![review(ME, 7, ReviewState::Commented, "some notes")]),
+                vec!["thread"],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_review_request_you_have_answered_short_of_a_review() {
+        let requested = |n| pr(n).requested(ME, &day(10).to_string());
+        let said = || vec![c(ME, 5, "what about the pokes?")];
+        check(vec![
+            (
+                "a comment with nothing pushed since (#1336)",
+                requested(73).comments(said()),
+                vec![],
+            ),
+            (
+                "a push since your comment",
+                requested(74).pushed_at(day(2)).comments(said()),
+                vec!["review_requested"],
+            ),
+            (
+                "asked again since your comment",
+                pr(75).requested(ME, &day(2).to_string()).comments(said()),
+                vec!["review_requested"],
+            ),
+            (
+                "a comment from before the request",
+                requested(76).comments(vec![c(ME, 15, "a comment")]),
+                vec!["review_requested"],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_conversation_left_quiet_stops_asking_and_a_state_does_not() {
+        check(vec![
+            (
+                "a mention nobody followed up",
+                issue(80).comments(vec![c("bob", 15, &at_me("@me thoughts?"))]),
+                vec![],
+            ),
+            (
+                "a mention still inside the window",
+                issue(81).comments(vec![c("bob", 13, &at_me("@me thoughts?"))]),
+                vec!["mention"],
+            ),
+            (
+                "a reply in your review thread",
+                pr(82).threads(vec![thread(vec![
+                    c(ME, 30, "why?"),
+                    c("bob", 15, "because"),
+                ])]),
+                vec![],
+            ),
+            (
+                "a reply on your own issue",
+                issue(83)
+                    .author(ME)
+                    .comments(vec![c("bob", 15, "a comment")]),
+                vec![],
+            ),
+            (
+                "a formal review request",
+                pr(84).requested(ME, &day(60).to_string()),
+                vec!["review_requested"],
+            ),
+            (
+                "an assignment",
+                issue(85).assigned(ME, day(60)),
+                vec!["assigned"],
+            ),
+            (
+                "an unresolved thread on your own PR",
+                pr(86)
+                    .author(ME)
+                    .pushed_at(day(40))
+                    .threads(vec![thread(vec![c("bob", 30, "a nit")])]),
+                vec!["unresolved_thread"],
+            ),
+        ]);
+    }
+
+    #[test]
+    fn a_new_ping_brings_it_back_dated_from_itself() {
+        let viewer = me();
+        let snapshot = snap(
+            vec![],
+            vec![issue(87).comments(vec![
+                c("bob", 40, &at_me("@me thoughts?")),
+                c("carol", 2, &at_me("@me still?")),
+            ])],
+        );
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert_eq!(obs[0].reasons[0].text, "carol mentioned you 2d ago");
+    }
+
     #[test]
     fn stale_acks_and_unsubmitted_reviews() {
         let head = "abcdef0123456789abcdef0123456789abcdef01";
@@ -1040,7 +1331,7 @@ mod tests {
                 "an ACK the PR moved past",
                 pr(40)
                     .with_head(head)
-                    .head_at(day(2))
+                    .pushed_at(day(2))
                     .comments(vec![c(ME, 5, "ACK 1234567")]),
                 vec!["stale_ack"],
             ),
@@ -1087,9 +1378,9 @@ mod tests {
             vec![
                 pr(50).requested(ME, &day(2).to_string()),
                 pr(51).requested(ME, &day(40).to_string()),
-                pr(52).author(ME).updated(day(10)),
+                pr(52).author(ME).updated(day(5)),
             ],
-            vec![issue(53).comments(vec![c("bob", 20, &at_me("@me"))])],
+            vec![issue(53).comments(vec![c("bob", 12, &at_me("@me"))])],
         );
         let merge = merge_of(52, Mergeability::Conflicting, None);
         let order: Vec<u64> = collect(&snapshot, &viewer, now(), &merge)
@@ -1099,9 +1390,9 @@ mod tests {
         assert_eq!(order, [51, 53, 52, 50]);
     }
 
-    fn mute_of(ob: &Obligation<'_>) -> Mute {
+    fn mute_of(ob: &Obligation<'_>) -> Seen {
         let fp = fingerprint(ob);
-        let mut mute = Mute::default();
+        let mut mute = Seen::default();
         for kind in fp.kinds {
             mute.remember(kind, fp.last, fp.head.as_deref());
         }
@@ -1157,14 +1448,14 @@ mod tests {
             let before = pr(61)
                 .author(ME)
                 .with_head(&"a".repeat(40))
-                .head_at(day(5))
+                .pushed_at(day(5))
                 .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
             let snapshot = snap(vec![before.clone()], vec![]);
             let obs = collect(&snapshot, &viewer, now(), &merge);
             let mute = mute_of(&obs[0]);
             assert!(is_muted(&obs[0], Some(&mute)), "same head: {merge:?}");
 
-            let pushed = before.with_head(&"b".repeat(40)).head_at(day(4));
+            let pushed = before.with_head(&"b".repeat(40)).pushed_at(day(4));
             let snapshot = snap(vec![pushed], vec![]);
             let obs = collect(&snapshot, &viewer, now(), &merge);
             assert!(!is_muted(&obs[0], Some(&mute)), "new head: {merge:?}");
@@ -1177,7 +1468,7 @@ mod tests {
         let acked = |head: &str, pushed| {
             pr(63)
                 .with_head(&head.repeat(40))
-                .head_at(pushed)
+                .pushed_at(pushed)
                 .comments(vec![c(ME, 9, "ACK 1234567")])
         };
         let snapshot = snap(vec![acked("a", day(3))], vec![]);
@@ -1202,7 +1493,7 @@ mod tests {
         let acked = |head: &str, pushed| {
             pr(64)
                 .with_head(&head.repeat(40))
-                .head_at(pushed)
+                .pushed_at(pushed)
                 .comments(vec![c(ME, 9, "ACK 1234567")])
         };
         for (first, next) in [(day(12), day(11)), (day(3), day(12))] {
@@ -1222,12 +1513,276 @@ mod tests {
         let viewer = me();
         let snapshot = snap(vec![pr(62).requested(ME, &day(3).to_string())], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let mut mute = Mute::default();
+        let mut mute = Seen::default();
         mute.remember(
             ReasonKind::ReviewRequested,
             Timestamp::parse("not a time"),
             None,
         );
         assert!(!is_muted(&obs[0], Some(&mute)));
+    }
+
+    // ------------------------------------------------------------ the DM
+
+    /// What a delivered DM leaves behind when nothing was held back.
+    fn seen_of(obs: &[Obligation<'_>]) -> BTreeMap<CardKey, Seen> {
+        seen_after(obs, &[], &BTreeMap::new(), &[])
+    }
+
+    /// The numbers the DM would carry, given a model that always says the same thing.
+    fn asking(
+        item: Item,
+        merge: &HashMap<u64, MergeState>,
+        seen: &BTreeMap<CardKey, Seen>,
+        verdict: Option<bool>,
+    ) -> Vec<u64> {
+        let viewer = me();
+        let snapshot = snap(vec![item], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), merge);
+        new_asks(&obs, seen, |_| verdict)
+            .iter()
+            .map(|ob| ob.item.number)
+            .collect()
+    }
+
+    fn seen_on(item: Item, merge: &HashMap<u64, MergeState>) -> BTreeMap<CardKey, Seen> {
+        let viewer = me();
+        let snapshot = snap(vec![item], vec![]);
+        seen_of(&collect(&snapshot, &viewer, now(), merge))
+    }
+
+    #[test]
+    fn what_the_last_dm_saw_stays_quiet_until_a_new_trigger() {
+        let empty = HashMap::new();
+        let base = pr(90).comments(vec![c("bob", 5, &at_me("@me ping"))]);
+        let seen = seen_on(base.clone(), &empty);
+        assert!(asking(base.clone(), &empty, &seen, Some(true)).is_empty());
+        assert!(
+            asking(
+                base.clone().comments(vec![c("carol", 4, "+1 from me")]),
+                &empty,
+                &seen,
+                Some(true)
+            )
+            .is_empty(),
+            "general activity"
+        );
+        assert_eq!(
+            asking(
+                base.comments(vec![c("carol", 2, &at_me("@me also this"))]),
+                &empty,
+                &seen,
+                Some(true)
+            ),
+            [90],
+            "a newer mention"
+        );
+    }
+
+    /// The newest time alone cannot tell these apart: neither of them moves it.
+    #[test]
+    fn a_new_kind_or_a_new_head_is_new_though_the_time_has_not_moved() {
+        let clean = HashMap::new();
+        let conflict = merge_of(91, Mergeability::Conflicting, None);
+        let mine = pr(91)
+            .author(ME)
+            .pushed_at(day(5))
+            .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
+        let seen = seen_on(mine.clone(), &clean);
+        assert_eq!(asking(mine.clone(), &conflict, &seen, Some(false)), [91]);
+
+        let seen = seen_on(mine.clone(), &conflict);
+        assert!(asking(mine.clone(), &conflict, &seen, Some(false)).is_empty());
+        let pushed = mine.with_head(&"b".repeat(40));
+        assert_eq!(asking(pushed, &conflict, &seen, Some(false)), [91]);
+    }
+
+    /// #167 loses its mention to the expiry and stays assigned. Nothing happened.
+    #[test]
+    fn a_reason_going_away_is_not_new() {
+        let viewer = me();
+        let mentioned =
+            issue(92)
+                .assigned(ME, day(8))
+                .comments(vec![c("bob", 5, &at_me("@me scope?"))]);
+        let snapshot = snap(vec![], vec![mentioned]);
+        let seen = seen_of(&collect(&snapshot, &viewer, now(), &HashMap::new()));
+
+        let quiet = issue(92).assigned(ME, day(8));
+        let snapshot = snap(vec![], vec![quiet]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert!(new_asks(&obs, &seen, |_| Some(true)).is_empty());
+    }
+
+    #[test]
+    fn the_model_decides_only_what_is_not_an_ask_by_its_nature() {
+        let empty = HashMap::new();
+        let none = BTreeMap::new();
+        let mention = || pr(93).comments(vec![c("bob", 5, &at_me("@me thanks!"))]);
+        assert_eq!(asking(mention(), &empty, &none, Some(true)), [93]);
+        assert!(asking(mention(), &empty, &none, Some(false)).is_empty());
+        assert_eq!(
+            asking(mention(), &empty, &none, None),
+            [93],
+            "no verdict keeps it"
+        );
+
+        let requested = pr(94).requested(ME, &day(5).to_string());
+        assert_eq!(asking(requested.clone(), &empty, &none, Some(false)), [94]);
+
+        let seen = seen_on(requested.clone(), &empty);
+        let then_thanked = requested.comments(vec![c("bob", 2, &at_me("@me thanks!"))]);
+        assert!(
+            asking(then_thanked, &empty, &seen, Some(false)).is_empty(),
+            "only what is new counts: the request was already seen"
+        );
+    }
+
+    #[test]
+    fn an_ask_held_back_by_the_cap_stays_new_for_the_next_dm() {
+        let viewer = me();
+        let pinged = |comments| pr(99).comments(comments);
+        let first = c("bob", 8, &at_me("@me first"));
+        let told = seen_on(pinged(vec![first.clone()]), &HashMap::new());
+        let snapshot = snap(
+            vec![
+                pr(95).requested(ME, &day(9).to_string()),
+                pr(96).requested(ME, &day(7).to_string()),
+                pinged(vec![first, c("bob", 2, &at_me("@me second"))]),
+            ],
+            vec![],
+        );
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let waiting = new_asks(&obs, &told, |_| None);
+        let (shown, held) = waiting.split_at(1);
+        assert_eq!(shown[0].item.number, 95);
+
+        let seen = seen_after(&obs, held, &told, &[]);
+        let next: Vec<u64> = new_asks(&obs, &seen, |_| None)
+            .iter()
+            .map(|ob| ob.item.number)
+            .collect();
+        assert_eq!(next, [99, 96], "new when held, with a record or without");
+    }
+
+    /// What the next DM says about a conflict you were told about on this PR, after a morning
+    /// that read `between` with these kinds unread.
+    fn conflict_after(
+        between: Item,
+        between_merge: &HashMap<u64, MergeState>,
+        unread: &[ReasonKind],
+        next: Item,
+    ) -> Vec<u64> {
+        let viewer = me();
+        let conflict = merge_of(91, Mergeability::Conflicting, None);
+        let told = seen_on(next.clone(), &conflict);
+        let snapshot = snap(vec![between], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), between_merge);
+        let seen = seen_after(&obs, &[], &told, unread);
+        asking(next, &conflict, &seen, Some(false))
+    }
+
+    /// The whole run proves the plain case. These are what the record must tell apart.
+    #[test]
+    fn only_clearing_forgets_what_you_were_told() {
+        let head = "a".repeat(40);
+        let mine = pr(91).author(ME).with_head(&head).pushed_at(day(5));
+        let listed = mine
+            .clone()
+            .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
+        let computing = merge_of(91, Mergeability::Unknown, None);
+        let clean = merge_of(91, Mergeability::Mergeable, None);
+        let unread = [ReasonKind::Conflict];
+
+        assert!(
+            conflict_after(listed.clone(), &computing, &unread, listed.clone()).is_empty(),
+            "unread, with another reason keeping the item listed"
+        );
+        assert_eq!(
+            conflict_after(mine.clone(), &clean, &[], mine.clone()),
+            [91],
+            "read and clean, so it cleared and coming back is news"
+        );
+    }
+
+    /// What is kept for an unread kind is what you were told, so it stops at that head.
+    #[test]
+    fn a_conflict_on_a_head_pushed_while_it_went_unread_is_new() {
+        let viewer = me();
+        let conflict = merge_of(91, Mergeability::Conflicting, None);
+        let mine = |head: &str| {
+            pr(91)
+                .author(ME)
+                .with_head(&head.repeat(40))
+                .pushed_at(day(5))
+        };
+        let told = seen_on(mine("a"), &conflict);
+        let snapshot = snap(vec![mine("b")], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let seen = seen_after(&obs, &[], &told, &[ReasonKind::Conflict]);
+        assert_eq!(asking(mine("b"), &conflict, &seen, Some(false)), [91]);
+    }
+
+    /// What you said yourself is not news to you, and a request you answered with "this
+    /// weekend" would otherwise come back the next morning.
+    #[test]
+    fn only_someone_elses_word_on_your_own_thread_is_new() {
+        let empty = HashMap::new();
+        let asked = || c("bob", 5, "can you rename this?");
+        let own = |comments: Vec<Comment>| pr(88).author(ME).threads(vec![thread(comments)]);
+        let seen = seen_on(own(vec![asked()]), &empty);
+        for (name, word, new) in [
+            ("your reply", c(ME, 1, "this weekend"), false),
+            ("a bot's", bot("cov[bot]", 1, "coverage report"), false),
+            ("bob's", c("bob", 1, "any news?"), true),
+        ] {
+            let got = asking(own(vec![asked(), word]), &empty, &seen, Some(true));
+            assert_eq!(!got.is_empty(), new, "{name}");
+        }
+    }
+
+    /// Its date is your own work on it, which nobody has to tell you about. The record goes
+    /// through the file, because what it keeps of this kind has no time and no head.
+    #[test]
+    fn unshipped_work_is_new_once_whatever_you_do_to_it() {
+        let viewer = me();
+        let snapshot = snap(vec![], vec![issue(89).assigned(ME, day(20))]);
+        let plain = || collect(&snapshot, &viewer, now(), &HashMap::new());
+        let with_fork = |worked_on| {
+            let mut obs = plain();
+            let text = "your fork#6 would fix this".to_owned();
+            let reason = Reason::standing(ReasonKind::Unshipped, worked_on, text);
+            add_reason(&mut obs, &snapshot.items[0], reason);
+            obs
+        };
+        let carried = |obs: &[Obligation<'_>], seen: &BTreeMap<CardKey, Seen>| {
+            !new_asks(obs, seen, |_| Some(true)).is_empty()
+        };
+        let before = seen_of(&plain());
+        assert!(carried(&with_fork(day(5)), &before), "a new kind of reason");
+
+        let told = seen_of(&with_fork(day(5)));
+        let file = serde_json::to_string(&told).unwrap();
+        let told = serde_json::from_str(&file).unwrap();
+        assert!(!carried(&with_fork(day(5)), &told), "nothing moved");
+        assert!(!carried(&with_fork(day(1)), &told), "you worked on it");
+    }
+
+    /// A mention the record has seen, on an item whose head was committed ahead of the next
+    /// ping. Dates from different kinds of reason say nothing about each other.
+    #[test]
+    fn a_commit_dated_ahead_does_not_cover_a_newer_mention() {
+        let empty = HashMap::new();
+        let acked = |comments: Vec<Comment>| {
+            let mut said = vec![c(ME, 9, "ACK 1234567"), c("bob", 5, &at_me("@me first"))];
+            said.extend(comments);
+            pr(98)
+                .with_head(&"a".repeat(40))
+                .pushed_at(day(-30))
+                .comments(said)
+        };
+        let seen = seen_on(acked(vec![]), &empty);
+        let pinged = acked(vec![c("bob", 1, &at_me("@me a question"))]);
+        assert_eq!(asking(pinged, &empty, &seen, Some(true)), [98]);
     }
 }

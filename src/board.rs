@@ -42,7 +42,7 @@ use anyhow::{Context, Result, bail};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::obligations::{Fingerprint, Mute, ReasonKind};
+use crate::obligations::{Fingerprint, ReasonKind, Seen};
 use crate::timestamp::Timestamp;
 
 const LANE_ORDER: [&str; 7] = [
@@ -394,8 +394,8 @@ impl Board {
 
     /// Obligation cards dragged to Passed. Muting the same item twice leaves two
     /// cards, and both count.
-    pub fn mutes(&self) -> HashMap<CardKey, Mute> {
-        let mut out: HashMap<CardKey, Mute> = HashMap::new();
+    pub fn mutes(&self) -> HashMap<CardKey, Seen> {
+        let mut out: HashMap<CardKey, Seen> = HashMap::new();
         for line in self.cards(PASSED) {
             let (Some(key), Some(found)) = (card_key(line), MUTE_RE.captures(line)) else {
                 continue;
@@ -965,7 +965,7 @@ mod tests {
     fn muting_an_item_twice_counts_both_cards_in_either_order() {
         let viewer = me();
         let merge = HashMap::from([(61, crate::snapshot::MergeState::conflicting())]);
-        let snapshot = snap(vec![pr(61).author(ME).head_at(day(2))], vec![]);
+        let snapshot = snap(vec![pr(61).author(ME).pushed_at(day(2))], vec![]);
         let obs = obligations::collect(&snapshot, &viewer, now(), &merge);
         let dragged = render::ob_card(&obs[0], None).as_str().to_owned();
         let older = format!("- [ ] old [#61]({F}/pull/61) <!--t:2026-01-01T00:00:00Z|mention-->");

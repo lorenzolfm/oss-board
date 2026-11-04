@@ -1,4 +1,5 @@
-//! Floresta triage: what is blocked on you, then what is worth your evening.
+//! Floresta triage: what is waiting on you, and one short DM a morning about what is
+//! new in it.
 //!
 //! Order of operations matters:
 //!   1. Read the board FIRST -- mutes, tombstones and claims are user state and must
@@ -8,7 +9,7 @@
 //!      leaves what it fed as it was, and the run says so.
 //!   3. Ask the model for gists and an opportunity ranking. Either can fail; the
 //!      board and the DM are still written, from computed reasons and ranking order,
-//!      and say so.
+//!      and the run says so.
 //!   4. Write the board deterministically, on top of the file as it is by then. Only
 //!      then write briefings, which can take minutes and must not hold the board up.
 //!   5. DM if a slot is due.
@@ -42,13 +43,13 @@ use std::process::ExitCode;
 use anyhow::Result;
 use chrono::{DateTime, Days, FixedOffset, Local, SecondsFormat, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use board::{AgentLane, Board, Card, CardKey, Changes, Claim, ClaimLane, GitHubItem};
 use brief::{BriefKind, Target};
 use footprint::Footprint;
 use model::Ranked;
-use obligations::{Obligation, Reason, ReasonKind, Viewer};
+use obligations::{Obligation, Reason, ReasonKind, Seen, Viewer};
 use opportunities::Opportunity;
 use render::{Degraded, Dm};
 use snapshot::{Item, Snapshot};
@@ -118,7 +119,7 @@ fn take_lock(state: &Path) -> Result<Option<File>> {
 
 /// The DM slot this run should answer for, or `None`.
 ///
-/// The timer is hourly; the DM is twice a day. A run sends when the most recent slot
+/// The timer is hourly; the DM is once a day. A run sends when the most recent slot
 /// at or before `now` has not been answered yet. A missed slot (the desktop was off)
 /// is sent by the first run after it -- unless it is so old that the next one is the
 /// better message.
@@ -146,8 +147,54 @@ fn due_slot(
 #[derive(Default, Deserialize, Serialize)]
 struct LastDm {
     at: Option<DateTime<FixedOffset>>,
+    #[serde(default, deserialize_with = "seen_records")]
+    seen: BTreeMap<CardKey, Seen>,
+    /// What each claimed card's alert last said.
     #[serde(default)]
-    seen: BTreeMap<CardKey, String>,
+    alerted: BTreeMap<CardKey, String>,
+}
+
+impl LastDm {
+    /// An alert is news when it says something the last DM did not.
+    fn new_alerts(&self, alerts: &BTreeMap<CardKey, String>) -> Vec<String> {
+        alerts
+            .iter()
+            .filter(|(key, said)| self.alerted.get(*key) != Some(*said))
+            .map(|(_, said)| said.clone())
+            .collect()
+    }
+
+    /// What to remember once a DM is delivered. As in `obligations::seen_after`, only
+    /// clearing forgets, so a claim this run could not read keeps what was said about it.
+    fn alerted_after(
+        &self,
+        alerts: BTreeMap<CardKey, String>,
+        unread: &[&CardKey],
+    ) -> BTreeMap<CardKey, String> {
+        let kept = unread
+            .iter()
+            .filter_map(|key| Some(((*key).clone(), self.alerted.get(*key)?.clone())));
+        alerts.into_iter().chain(kept).collect()
+    }
+}
+
+/// Parsed once, here. Earlier versions wrote a bare time for how far you had read, and a
+/// bare head for an opportunity, which says nothing about an obligation.
+fn seen_records<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<CardKey, Seen>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Triggers(Seen),
+        Legacy(String),
+    }
+    let wire = BTreeMap::<CardKey, Wire>::deserialize(deserializer)?;
+    let records = wire.into_iter().filter_map(|(key, record)| match record {
+        Wire::Triggers(told) => Some((key, told)),
+        Wire::Legacy(text) => Timestamp::parse(&text).map(|at| (key, Seen::read_up_to(at))),
+    });
+    Ok(records.collect())
 }
 
 // ---------------------------------------------------------------- gathering
@@ -186,7 +233,8 @@ fn promote_unshipped<'a>(
         };
         let at = Timestamp::at_midnight(u.last);
         let text = format!("your {what} would fix this and never went upstream");
-        obligations::add_reason(obs, issue, Reason::at(ReasonKind::Unshipped, at, text));
+        let reason = Reason::standing(ReasonKind::Unshipped, at, text);
+        obligations::add_reason(obs, issue, reason);
         promoted.insert(u.key.clone());
     }
     promoted
@@ -226,12 +274,11 @@ fn enrich_stale_acks(obs: &mut [Obligation<'_>], me: &Viewer) {
     }
 }
 
-/// What the briefing pass did: the links to add to cards, and which items it wrote a
-/// note for.
+/// What the briefing pass did: the links to add to cards, and how many notes it wrote.
 #[derive(Default)]
 struct Briefings {
     links: Vec<(CardKey, String)>,
-    briefed: Vec<String>,
+    written: usize,
 }
 
 /// Briefing notes for newly claimed cards. A note under its real name is complete, so
@@ -263,7 +310,7 @@ fn write_briefings(
             out.links.push((claim.key.clone(), link));
             continue;
         }
-        if out.briefed.len() >= limit {
+        if out.written >= limit {
             continue;
         }
         let kind = if item.pr().is_some() {
@@ -285,7 +332,7 @@ fn write_briefings(
             Ok(written) => {
                 log(&format!("  written: {}", written.display()));
                 out.links.push((claim.key.clone(), link));
-                out.briefed.push(format!("#{}", item.number));
+                out.written += 1;
             }
         }
     }
@@ -464,7 +511,7 @@ fn run(args: &Refresh) -> Result<()> {
     let opp_merge = snapshot::merge_state(config::REPO, &pr_numbers);
     if !opp_merge.unread.is_empty() {
         log(&format!("  merge state unread for {:?}", opp_merge.unread));
-        degraded.insert(Degraded::Merge);
+        degraded.insert(Degraded::OpportunityMerge);
     }
     for o in &mut opps {
         o.merge = opp_merge.states.get(&o.item.number).copied();
@@ -488,6 +535,14 @@ fn run(args: &Refresh) -> Result<()> {
             config::JUDGE_TTL_HOURS,
             model::claude,
         )?;
+        // Both fall back without a mark on the board, so the run has to say so. A cached
+        // answer is an answer: nothing was asked, so nothing failed.
+        let no_gist = visible.iter().any(|ob| !gists.contains_key(&ob.item.key));
+        let no_ranking = !ranked.is_judged() && !opps.is_empty();
+        if no_gist || no_ranking {
+            log("  the model did not answer");
+            degraded.insert(Degraded::Model);
+        }
         (gists, ranked)
     };
     log(&format!(
@@ -510,7 +565,7 @@ fn run(args: &Refresh) -> Result<()> {
     let mut needs_me: Vec<Card> = visible
         .iter()
         .filter(|ob| !active.contains_key(&ob.item.key))
-        .map(|ob| render::ob_card(ob, gists.get(&ob.item.key).map(String::as_str)))
+        .map(|ob| render::ob_card(ob, gists.get(&ob.item.key).map(|gist| gist.text.as_str())))
         .collect();
     let computed: HashSet<&CardKey> = visible.iter().map(|ob| &ob.item.key).collect();
     needs_me.extend(board.carried(&unread_kinds, &computed));
@@ -542,11 +597,15 @@ fn run(args: &Refresh) -> Result<()> {
         log("  some claimed cards could not be read");
         degraded.insert(Degraded::Claims);
     }
-    let mut claim_alerts: Vec<String> = Vec::new();
+    let mut claim_alerts: BTreeMap<CardKey, String> = BTreeMap::new();
+    let mut unread_claims: Vec<&CardKey> = Vec::new();
     for claim in &claimed {
         let held = match claim.key.github() {
             // Not read, which says nothing, so the card keeps what it says.
-            Some(item) if !status.contains_key(item) => continue,
+            Some(item) if !status.contains_key(item) => {
+                unread_claims.push(&claim.key);
+                continue;
+            }
             Some(item) => status.get(item),
             None => None,
         };
@@ -556,8 +615,11 @@ fn run(args: &Refresh) -> Result<()> {
         }
         notes.extend(held.iter().flat_map(|s| s.notes.iter().cloned()));
         changes.notes.push((claim.key.clone(), notes.join(" · ")));
-        if let (Some(held), Some(item)) = (held.filter(|s| s.urgent), claim.key.github()) {
-            claim_alerts.push(format!("#{} — {}", item.number(), held.notes.join(" · ")));
+        // Done is finished with, so what happens upstream of it is no alarm. The card says it.
+        let urgent = held.filter(|s| s.urgent && claim.lane.is_active());
+        if let (Some(held), Some(item)) = (urgent, claim.key.github()) {
+            let said = format!("#{} — {}", item.number(), held.notes.join(" · "));
+            claim_alerts.insert(claim.key.clone(), said);
         }
     }
 
@@ -571,9 +633,7 @@ fn run(args: &Refresh) -> Result<()> {
     }
 
     let today = local.date_naive().to_string();
-    let briefed = if args.no_briefings || args.dry_run {
-        Vec::new()
-    } else {
+    if !args.no_briefings && !args.dry_run {
         let done = write_briefings(
             &claimed,
             &snap,
@@ -588,8 +648,7 @@ fn run(args: &Refresh) -> Result<()> {
                 ..Changes::default()
             })?;
         }
-        done.briefed
-    };
+    }
 
     // 5. DM
     let last_dm = match model::read_state::<LastDm>(&state_path("last_dm.json")) {
@@ -600,41 +659,20 @@ fn run(args: &Refresh) -> Result<()> {
             LastDm::default()
         }
     };
-    let mut marks: BTreeMap<CardKey, String> = visible
-        .iter()
-        .map(|ob| {
-            let mark = obligations::fingerprint(ob).last_text();
-            (ob.item.key.clone(), mark)
-        })
-        .collect();
-    for (opp, _) in ranked.picks() {
-        let item = opp.item;
-        let mark = item
-            .head()
-            .map_or_else(|| item.created.to_string(), str::to_owned);
-        marks.insert(item.key.clone(), mark);
-    }
-    let new_keys: HashSet<CardKey> = marks
-        .iter()
-        .filter(|(key, mark)| last_dm.seen.get(key) != Some(mark))
-        .map(|(key, _)| key.clone())
-        .collect();
+    let waiting = obligations::new_asks(&visible, &last_dm.seen, |key| {
+        gists.get(key).map(|gist| gist.asks)
+    });
+    let (asks, held) = waiting.split_at(waiting.len().min(config::DM_ASKS));
     let n_gists = gists.len();
     let n_picks = ranked.picks().len();
     let judged = ranked.is_judged();
     let text = Dm {
-        today: &local.format("%a %d %b %H:%M").to_string(),
-        obs: &visible,
-        gists,
-        claimed_lane: active,
-        ranked,
-        unshipped: shelf.len(),
-        new_keys,
-        degraded: degraded.clone(),
-        claim_alerts: &claim_alerts,
-        muted: n_muted,
-        briefed: &briefed,
-        cap: config::DM_OPPORTUNITIES,
+        asks,
+        on_board: visible.len() - asks.len(),
+        gists: &gists,
+        claimed_lane: &active,
+        degraded: &degraded,
+        claim_alerts: &last_dm.new_alerts(&claim_alerts),
     }
     .render();
     fs::write(state_path("summary.txt"), &text)?;
@@ -653,7 +691,8 @@ fn run(args: &Refresh) -> Result<()> {
         if results.iter().any(|delivery| delivery.ok) {
             let record = LastDm {
                 at: Some(local),
-                seen: marks,
+                seen: obligations::seen_after(&obs, held, &last_dm.seen, &unread_kinds),
+                alerted: last_dm.alerted_after(claim_alerts, &unread_claims),
             };
             model::save(&state_path("last_dm.json"), &record)?;
         }
@@ -720,9 +759,12 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obligations::{collect, new_asks};
+    use crate::snapshot::MergeState;
+    use crate::testkit::{ME, c, day, me, now, pr, snap};
     use chrono::TimeZone;
 
-    const SLOTS: [(u32, u32); 2] = [(8, 7), (19, 23)];
+    const SLOTS: [(u32, u32); 1] = [(8, 7)];
 
     fn at(day: u32, hour: u32, minute: u32) -> DateTime<FixedOffset> {
         FixedOffset::west_opt(3 * 3600)
@@ -732,13 +774,13 @@ mod tests {
     }
 
     #[test]
-    fn twice_a_day_from_an_hourly_timer() {
+    fn once_a_morning_from_an_hourly_timer() {
         type Clock = (u32, u32, u32);
-        let cases: [(&str, Clock, Option<Clock>, Option<Clock>); 8] = [
+        let cases: [(&str, Clock, Option<Clock>, Option<Clock>); 7] = [
             (
-                "the first run after a slot sends",
+                "the first run after the slot sends",
                 (15, 8, 7),
-                Some((14, 19, 23)),
+                Some((14, 8, 7)),
                 Some((15, 8, 7)),
             ),
             (
@@ -748,33 +790,27 @@ mod tests {
                 None,
             ),
             (
-                "a run before the evening slot does not",
-                (15, 19, 7),
+                "nothing goes out in the evening",
+                (15, 19, 23),
                 Some((15, 8, 7)),
                 None,
             ),
             (
-                "the evening slot sends",
-                (15, 19, 23),
+                "a run before the slot does not",
+                (16, 7, 7),
                 Some((15, 8, 7)),
-                Some((15, 19, 23)),
-            ),
-            (
-                "overnight runs stay quiet",
-                (16, 3, 7),
-                Some((15, 19, 23)),
                 None,
             ),
             (
                 "a slot missed while the desktop was off is sent late",
                 (15, 11, 30),
-                Some((14, 19, 23)),
+                Some((14, 8, 7)),
                 Some((15, 8, 7)),
             ),
             (
-                "one missed by more than the grace waits for the next",
-                (16, 6, 0),
-                Some((15, 8, 7)),
+                "one missed by more than the grace waits for tomorrow",
+                (15, 17, 0),
+                Some((14, 8, 7)),
                 None,
             ),
             ("a first run ever sends", (15, 8, 7), None, Some((15, 8, 7))),
@@ -795,9 +831,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(due_slot(at(15, 9, 7), &SLOTS, record.at), None);
-        assert_eq!(
-            record.seen[&"getfloresta/floresta#7".parse().unwrap()],
-            "2026-10-08T17:14:49Z"
+        assert!(
+            record
+                .seen
+                .contains_key(&"getfloresta/floresta#7".parse().unwrap())
         );
+    }
+
+    /// Whether item 97 is new to a `last_dm.json` holding this entry for it.
+    fn is_new_to(item: Item, merge: &HashMap<u64, MergeState>, entry: &str) -> bool {
+        let text = format!(r#"{{"at": null, "seen": {{"getfloresta/Floresta#97": {entry}}}}}"#);
+        let record: LastDm = serde_json::from_str(&text).unwrap();
+        let snapshot = snap(vec![item], vec![]);
+        let viewer = me();
+        let obs = collect(&snapshot, &viewer, now(), merge);
+        !new_asks(&obs, &record.seen, |_| Some(true)).is_empty()
+    }
+
+    #[test]
+    fn what_a_record_says_about_a_mention() {
+        let mention = format!("@{ME} ping");
+        let at_day = |n| format!(r#""{}""#, day(n));
+        let cases = [
+            ("a bare time at the mention", at_day(5), false),
+            ("a bare time before the mention", at_day(6), true),
+            (
+                "a bare head says nothing",
+                r#""d6c385e521c36cc9c24bc534db3f4b1693194a20""#.to_owned(),
+                true,
+            ),
+            (
+                "a kind no longer known does not cost the file",
+                format!(
+                    r#"{{"a_retired_kind": {{"last": "{0}"}}, "mention": {{"last": "{0}"}}}}"#,
+                    day(5)
+                ),
+                false,
+            ),
+        ];
+        for (name, entry, new) in cases {
+            let item = pr(97).comments(vec![c("bob", 5, &mention)]);
+            assert_eq!(is_new_to(item, &HashMap::new(), &entry), new, "{name}");
+        }
+    }
+
+    /// A bare time names no head, so the morning after deploy repeats this once.
+    #[test]
+    fn a_conflict_on_a_bare_time_reads_as_new() {
+        let merge = HashMap::from([(97, MergeState::conflicting())]);
+        let item = pr(97).author(ME).pushed_at(day(5));
+        assert!(is_new_to(item, &merge, &format!(r#""{}""#, day(0))));
     }
 }

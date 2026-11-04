@@ -1,10 +1,10 @@
 //! Cards for the board and the DM text. Formatting only -- every decision about
 //! what appears, and in what order, has been made before anything gets here.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::board::{Card, CardKey, ClaimLane};
-use crate::model::Ranked;
+use crate::model::Gist;
 use crate::obligations::{Obligation, ReasonKind, fingerprint};
 use crate::opportunities::{Opportunity, Source};
 use crate::snapshot::{Ci, Item, MergeState, PrDetail};
@@ -33,17 +33,20 @@ const OPP_ICONS: [(Source, &str); 4] = [
     (Source::NewIssue, "📥"),
 ];
 
-/// A source this run could not read. What it would have said is unknown, so the DM,
-/// the heartbeat and `last_run.json` all say so rather than read as a clear board.
+/// A source this run could not read. What it would have said is unknown, so the
+/// heartbeat and `last_run.json` always say so, and the DM does when it touches what the
+/// DM says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Degraded {
     Unshipped,
     Project,
     Merge,
     MergeComputing,
+    OpportunityMerge,
     Claims,
     Footprint,
     LastDm,
+    Model,
 }
 
 impl Degraded {
@@ -53,26 +56,29 @@ impl Degraded {
             Self::Project => "project",
             Self::Merge => "merge",
             Self::MergeComputing => "merge_computing",
+            Self::OpportunityMerge => "opportunity_merge",
             Self::Claims => "claims",
             Self::Footprint => "footprint",
             Self::LastDm => "last_dm",
+            Self::Model => "model",
         }
     }
 
-    fn warning(self) -> &'static str {
+    /// `None` for what only feeds the opportunity ranking, which the DM does not carry.
+    fn warning(self) -> Option<&'static str> {
         match self {
-            Self::Unshipped => "Unshipped not refreshed: its source failed",
-            Self::Project => "project board unreadable — does the token have read:project?",
-            Self::Merge => "merge state unread: a conflict or red CI may be missing",
-            Self::MergeComputing => "GitHub is still computing conflicts: one may be missing",
-            Self::Claims => "claimed cards not checked upstream: their notes are as they were",
-            Self::Footprint => "footprint unread: ranked without knowing your areas",
-            Self::LastDm => "last_dm.json unreadable: everything reads as new",
+            Self::Unshipped => Some("Unshipped not refreshed: its source failed"),
+            Self::Merge => Some("merge state unread: a conflict or red CI may be missing"),
+            Self::MergeComputing => Some("GitHub is still computing conflicts: one may be missing"),
+            Self::Claims => {
+                Some("claimed cards not checked upstream: their notes are as they were")
+            }
+            Self::LastDm => Some("last_dm.json unreadable: everything reads as new"),
+            Self::Model => Some(
+                "the model did not answer: the board falls back to computed reasons and ranking order",
+            ),
+            Self::Project | Self::Footprint | Self::OpportunityMerge => None,
         }
-    }
-
-    fn can_hide_an_obligation(self) -> bool {
-        matches!(self, Self::Unshipped | Self::Merge | Self::MergeComputing)
     }
 }
 
@@ -200,151 +206,58 @@ pub fn unshipped_card(u: &Unshipped) -> Card {
 
 // ---------------------------------------------------------------- DM
 
-/// The phone message: every obligation, then the top picks, then counts. Plain
-/// text: Telegram autolinks bare URLs, and markdown would have to survive whatever
-/// transport carries it.
-#[derive(Default)]
-pub struct Dm<'a, 'o, 'p> {
-    pub today: &'a str,
-    pub obs: &'a [Obligation<'o>],
-    pub gists: BTreeMap<CardKey, String>,
-    pub claimed_lane: HashMap<CardKey, ClaimLane>,
-    pub ranked: Ranked<'p, 'o>,
-    pub unshipped: usize,
-    pub new_keys: HashSet<CardKey>,
-    pub degraded: BTreeSet<Degraded>,
+/// The morning message: one header line, then only the new asks. What was not new is on
+/// the board and is not repeated here. Plain text: Telegram autolinks bare URLs, and
+/// markdown would have to survive whatever transport carries it.
+pub struct Dm<'a, 'o> {
+    pub asks: &'a [&'a Obligation<'o>],
+    pub on_board: usize,
+    pub gists: &'a BTreeMap<CardKey, Gist>,
+    pub claimed_lane: &'a HashMap<CardKey, ClaimLane>,
+    pub degraded: &'a BTreeSet<Degraded>,
     pub claim_alerts: &'a [String],
-    pub muted: usize,
-    pub briefed: &'a [String],
-    pub cap: usize,
 }
 
-impl Dm<'_, '_, '_> {
-    fn obligations(&self, lines: &mut Vec<String>) {
-        if self.obs.is_empty() {
-            let unread = self
-                .degraded
-                .iter()
-                .any(|source| source.can_hide_an_obligation());
-            lines.push(
-                if unread {
-                    "⚠ Found nothing blocked on you, but could not read everything (see below)."
-                } else {
-                    "✅ Nothing is blocked on you."
-                }
-                .to_owned(),
-            );
-            return;
-        }
-        lines.push(format!("🔴 Needs you · {}", self.obs.len()));
-        for (index, ob) in self.obs.iter().enumerate() {
-            let new = if self.new_keys.contains(&ob.item.key) {
-                "🆕 "
-            } else {
-                ""
-            };
-            let place = self
-                .claimed_lane
-                .get(&ob.item.key)
-                .map_or(String::new(), |lane| format!(" (in your {})", lane.name()));
-            lines.push(format!(
-                "{}. {new}{} #{} {}{place}",
-                index + 1,
-                ob_icon(ob),
-                ob.item.number,
-                prefix(&ob.item.title, 70),
-            ));
-            lines.push(format!("   {}", reasons_text(ob)));
-            if let Some(gist) = self.gists.get(&ob.item.key).filter(|gist| !gist.is_empty()) {
-                lines.push(format!("   {gist}"));
-            }
-            lines.push(format!("   {}", ob.item.url));
-        }
-    }
-
-    fn top_picks(&self, lines: &mut Vec<String>) {
-        let picks = self.ranked.picks();
-        let top = &picks[..picks.len().min(self.cap)];
-        if top.is_empty() {
-            return;
-        }
-        let caveat = if self.ranked.is_judged() {
-            ""
-        } else {
-            " (ranking order — judge unavailable)"
-        };
-        lines.push(format!("🎯 Worth a look{caveat}"));
-        for (index, (o, verdict)) in top.iter().enumerate() {
-            let item = o.item;
-            let new = if self.new_keys.contains(&item.key) {
-                "🆕 "
-            } else {
-                ""
-            };
-            lines.push(format!(
-                "{}. {new}{} #{} {}",
-                index + 1,
-                opp_icon(o),
-                item.number,
-                prefix(&item.title, 70)
-            ));
-            let mut facts = match item.pr() {
-                Some(pr) => format!("{} · CI {}", size(pr), ci_word(o.merge)),
-                None => format!("{:.0}d old", o.age_days),
-            };
-            if let Some(note) = &o.note {
-                facts.push_str(&format!(" · {note}"));
-            }
-            let est = verdict
-                .and_then(|v| v.est.as_deref())
-                .map_or(String::new(), |est| format!("~{est} · "));
-            lines.push(format!("   {est}{facts}"));
-            let said = verdict.and_then(|v| v.pitch.as_deref().or(v.why.as_deref()));
-            if let Some(said) = said {
-                lines.push(format!("   {said}"));
-            }
-            lines.push(format!("   {}", item.url));
-        }
-        lines.push(String::new());
-    }
-
-    fn counts(&self) -> String {
-        let rest = self.ranked.picks().len().saturating_sub(self.cap);
-        let mut counts = Vec::new();
-        if rest > 0 {
-            let ending = if rest == 1 { "y" } else { "ies" };
-            counts.push(format!("{rest} more opportunit{ending}"));
-        }
-        if self.unshipped > 0 {
-            counts.push(format!("⚡ {} unshipped", self.unshipped));
-        }
-        if self.muted > 0 {
-            counts.push(format!("🔕 {} muted", self.muted));
-        }
-        if counts.is_empty() {
-            "nothing else".to_owned()
-        } else {
-            counts.join(" · ")
-        }
+impl Dm<'_, '_> {
+    fn ask(&self, ob: &Obligation<'_>, lines: &mut Vec<String>) {
+        let item = ob.item;
+        let place = self
+            .claimed_lane
+            .get(&item.key)
+            .map_or(String::new(), |lane| format!(" (in your {})", lane.name()));
+        let said = self.gists.get(&item.key).map_or_else(
+            || format!("{} · {}", prefix(&item.title, 70), reasons_text(ob)),
+            |gist| gist.text.clone(),
+        );
+        lines.push(format!("#{} {said}{place}", item.number));
+        lines.push(item.url.clone());
     }
 
     pub fn render(&self) -> String {
-        let mut lines = vec![format!("Floresta · {}", self.today), String::new()];
+        let new = match self.asks.len() {
+            0 => "nothing new".to_owned(),
+            n => format!("{n} new"),
+        };
+        let mut lines = vec![format!("Floresta · {new} · {} on the board", self.on_board)];
         for alert in self.claim_alerts {
             lines.push(format!("⚠ {alert}"));
         }
-        if !self.claim_alerts.is_empty() {
+        lines.extend(
+            self.degraded
+                .iter()
+                .filter_map(|source| source.warning())
+                .map(|warning| format!("⚠ {warning}")),
+        );
+        if self
+            .asks
+            .iter()
+            .any(|ob| !self.gists.contains_key(&ob.item.key))
+        {
+            lines.push("⚠ not filtered: the model gave no verdict".to_owned());
+        }
+        for ob in self.asks {
             lines.push(String::new());
-        }
-        self.obligations(&mut lines);
-        lines.push(String::new());
-        self.top_picks(&mut lines);
-        lines.push(format!("📋 board: {}", self.counts()));
-        if !self.briefed.is_empty() {
-            lines.push(format!("📝 briefed: {}", self.briefed.join(", ")));
-        }
-        for source in &self.degraded {
-            lines.push(format!("⚠ {}", source.warning()));
+            self.ask(ob, &mut lines);
         }
         lines.join("\n")
     }
@@ -352,92 +265,95 @@ impl Dm<'_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
-    //! The DM lists every obligation, however many there are.
-
     use super::*;
-    use crate::notify::chunks;
     use crate::obligations::collect;
-    use crate::snapshot::{Item, Mergeability};
+    use crate::snapshot::Mergeability;
     use crate::testkit::{ME, day, me, now, opportunity, pr, snap};
 
-    fn waiting_prs() -> Vec<Item> {
-        (0..25)
-            .map(|i| {
-                pr(100 + i)
-                    .requested(ME, &day(i as i64 + 1).to_string())
-                    .title(&"t".repeat(120))
-            })
-            .collect()
+    fn message(
+        asks: &[&Obligation<'_>],
+        gists: &BTreeMap<CardKey, Gist>,
+        degraded: &[Degraded],
+    ) -> String {
+        Dm {
+            asks,
+            on_board: 2,
+            gists,
+            claimed_lane: &HashMap::new(),
+            degraded: &degraded.iter().copied().collect(),
+            claim_alerts: &[],
+        }
+        .render()
     }
 
     #[test]
-    fn the_message_lists_every_obligation_uncapped() {
-        let viewer = me();
-        let snapshot = snap(waiting_prs(), vec![]);
-        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let message = Dm {
-            today: "Wed 15 Oct 08:07",
-            obs: &obs,
-            cap: 3,
-            ..Dm::default()
-        }
-        .render();
-        for (item, _) in snapshot.prs() {
-            assert!(
-                message.contains(&format!("#{} ", item.number)),
-                "#{}",
-                item.number
-            );
-        }
-        assert!(!message.contains("]("), "plain text, no markdown links");
-
-        let parts = chunks(&message, 3900);
-        assert!(parts.len() > 1, "split for Telegram");
-        assert!(parts.iter().all(|part| part.chars().count() <= 3900));
-        assert_eq!(parts.join("\n"), message, "split, not truncated");
-    }
-
-    #[test]
-    fn an_empty_day_says_so_only_when_everything_was_read() {
-        let message = |degraded: &[Degraded]| {
-            Dm {
-                today: "d",
-                cap: 3,
-                degraded: degraded.iter().copied().collect(),
-                ..Dm::default()
-            }
-            .render()
-        };
-        assert!(message(&[]).contains("✅ Nothing is blocked on you"));
-        assert!(
-            message(&[Degraded::Project]).contains("✅ Nothing is blocked on you"),
-            "the project column cannot hide an obligation"
+    fn a_quiet_morning_is_one_line() {
+        assert_eq!(
+            message(&[], &BTreeMap::new(), &[]),
+            "Floresta · nothing new · 2 on the board"
         );
-        for source in [
-            Degraded::Merge,
-            Degraded::MergeComputing,
-            Degraded::Unshipped,
+    }
+
+    #[test]
+    fn an_ask_is_its_gist_and_a_link() {
+        let viewer = me();
+        let snapshot = snap(vec![pr(7).requested(ME, &day(1).to_string())], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let gist = Gist {
+            text: "wants a yes/no".to_owned(),
+            asks: true,
+        };
+        let gists = BTreeMap::from([(obs[0].item.key.clone(), gist)]);
+        assert_eq!(
+            message(&[&obs[0]], &gists, &[]),
+            "Floresta · 1 new · 2 on the board\n\n\
+             #7 wants a yes/no\n\
+             https://github.com/getfloresta/Floresta/pull/7"
+        );
+    }
+
+    #[test]
+    fn with_no_verdict_an_ask_shows_its_computed_reasons_and_says_it_was_not_filtered() {
+        let viewer = me();
+        let snapshot = snap(vec![pr(7).requested(ME, &day(1).to_string())], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let text = message(&[&obs[0]], &BTreeMap::new(), &[]);
+        assert!(text.contains("#7 pr 7 · review requested 1d ago"), "{text}");
+        assert!(text.contains("not filtered"), "{text}");
+    }
+
+    /// Those not warned about only feed the opportunity ranking, which the DM does not carry.
+    #[test]
+    fn only_a_source_that_touches_what_the_dm_says_is_warned_about() {
+        for (source, warned) in [
+            (Degraded::Unshipped, true),
+            (Degraded::Merge, true),
+            (Degraded::MergeComputing, true),
+            (Degraded::Claims, true),
+            (Degraded::LastDm, true),
+            (Degraded::Project, false),
+            (Degraded::Footprint, false),
         ] {
-            let said = message(&[source]);
-            assert!(!said.contains('✅'), "{said}");
-            assert!(said.contains(source.warning()), "{said}");
+            let text = message(&[], &BTreeMap::new(), &[source]);
+            assert_eq!(text.contains('⚠'), warned, "{source:?}: {text}");
         }
     }
 
     #[test]
     fn an_obligation_you_already_took_says_where() {
         let viewer = me();
-        let snapshot = snap(waiting_prs(), vec![]);
+        let snapshot = snap(vec![pr(7).requested(ME, &day(1).to_string())], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let message = Dm {
-            today: "d",
-            obs: &obs[..1],
-            claimed_lane: HashMap::from([(obs[0].item.key.clone(), ClaimLane::Doing)]),
-            cap: 3,
-            ..Dm::default()
+        let text = Dm {
+            asks: &[&obs[0]],
+            on_board: 0,
+            gists: &BTreeMap::new(),
+            claimed_lane: &HashMap::from([(obs[0].item.key.clone(), ClaimLane::Doing)]),
+            degraded: &BTreeSet::new(),
+            claim_alerts: &[],
         }
         .render();
-        assert!(message.contains("(in your Doing)"), "{message}");
+        assert!(text.contains("(in your Doing)"), "{text}");
     }
 
     /// Half days round to even, as the card has always shown them.

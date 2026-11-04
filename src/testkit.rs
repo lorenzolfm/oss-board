@@ -119,7 +119,7 @@ pub fn pr(number: u64) -> Item {
             deletions: 2,
             changed_files: 1,
             head: "f".repeat(40),
-            head_at: Some(day(20)),
+            pushed_at: Some(day(20)),
             review_decision: None,
             requested: vec![],
             requested_at: HashMap::new(),
@@ -172,6 +172,11 @@ impl Item {
         self
     }
 
+    pub fn created(mut self, at: Timestamp) -> Self {
+        self.created = at;
+        self
+    }
+
     pub fn updated(mut self, at: Timestamp) -> Self {
         self.updated = at;
         self
@@ -187,8 +192,8 @@ impl Item {
         self
     }
 
-    pub fn head_at(mut self, at: Timestamp) -> Self {
-        self.pr_mut().head_at = Some(at);
+    pub fn pushed_at(mut self, at: Timestamp) -> Self {
+        self.pr_mut().pushed_at = Some(at);
         self
     }
 

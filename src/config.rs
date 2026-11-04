@@ -32,9 +32,12 @@ pub const BRANCH_IGNORE: [&str; 2] = ["backup/", "worktree-agent-"];
 
 /// Board lane.
 pub const OPPORTUNITY_CAP: usize = 8;
-/// Top of that lane, in the DM.
-pub const DM_OPPORTUNITIES: usize = 3;
-/// The "new" issue window; 🆕 in the DM is "since the last DM".
+/// New asks in one DM. Any beyond this wait for the next one.
+pub const DM_ASKS: usize = 3;
+/// A mention or reply nobody has followed up in this long has stopped being an ask.
+/// If it still matters someone will ping again, and that brings it back.
+pub const CONVERSATION_TTL_DAYS: f64 = 14.0;
+/// The "new" issue window.
 pub const NEW_ISSUE_DAYS: f64 = 14.0;
 /// Re-rank at least this often even if nothing moved.
 pub const JUDGE_TTL_HOURS: f64 = 12.0;
@@ -42,9 +45,9 @@ pub const JUDGE_TTL_HOURS: f64 = 12.0;
 /// Bound the cost of a claim spree.
 pub const MAX_BRIEFINGS: usize = 2;
 
-/// The DM goes out on the first run at or after each of these, local time. The
-/// board itself refreshes on every (hourly) run.
-pub const DM_SLOTS: [(u32, u32); 2] = [(8, 7), (19, 23)];
+/// The DM goes out on the first run at or after this, local time. The board itself
+/// refreshes on every (hourly) run.
+pub const DM_SLOTS: [(u32, u32); 1] = [(8, 7)];
 /// A slot missed by more than this is skipped, not sent late.
 pub const SLOT_GRACE_HOURS: i64 = 8;
 

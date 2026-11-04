@@ -12,6 +12,7 @@ use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use chrono::{SecondsFormat, TimeDelta, Utc};
 use tempfile::TempDir;
 
 const FAKE_GH: &str = r#"#!/bin/sh
@@ -52,10 +53,13 @@ case "$prompt" in
   "Each item below"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     echo 'Sure, here you go:'
-    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no"}]}';;
+    asks=true
+    [ -f "$FIXTURE_DIR/nobody_asks" ] && asks=false
+    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no","asks":'"$asks"'}]}';;
   "You are picking"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
-    echo '{"picks":[{"number":8,"why":"small and yours","pitch":"read it first","est":"1h"}]}';;
+    [ -f "$FIXTURE_DIR/no_judge" ] && exit 1
+    echo '{"picks":[{"number":8,"why":"small and yours"}]}';;
   "Write an Obsidian"*)
     echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     cp "$FIXTURE_DIR/vault/Tasks.md" "$FIXTURE_DIR/board_at_brief.md"
@@ -73,17 +77,19 @@ printf 'TODO' > "$note"
 exit 1
 "#;
 
-/// An open PR, as the bulk query returns one.
+/// An open PR, as the bulk query returns one, opened recently enough that a mention in
+/// its description is still asking.
 fn pr_node(number: u64, title: &str, body: &str, head: &str, author: &str) -> String {
+    let opened = (Utc::now() - TimeDelta::days(1)).to_rfc3339_opts(SecondsFormat::Secs, true);
     format!(
         r#"{{"number":{number},"title":"{title}","url":"https://github.com/getfloresta/Floresta/pull/{number}",
-        "body":"{body}","isDraft":false,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z",
+        "body":"{body}","isDraft":false,"createdAt":"{opened}","updatedAt":"{opened}",
         "additions":1,"deletions":0,"changedFiles":1,"headRefOid":"{head}",
         "author":{{"__typename":"User","login":"{author}"}},"milestone":null,"labels":{{"nodes":[]}},
         "assignees":{{"nodes":[]}},"reviewDecision":null,"reviewRequests":{{"nodes":[]}},
         "commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-01T00:00:00Z"}}}}]}},
         "reviews":{{"nodes":[]}},"comments":{{"nodes":[]}},"reviewThreads":{{"nodes":[]}},
-        "timelineItems":{{"nodes":[]}},"files":{{"nodes":[]}}}}"#
+        "timelineItems":{{"nodes":[]}},"forcePushes":{{"nodes":[]}},"files":{{"nodes":[]}}}}"#
     )
 }
 
@@ -488,7 +494,6 @@ fn a_failed_merge_read_keeps_the_card_and_is_not_an_all_clear() {
     let beat = beats.recv().unwrap();
     assert!(beat.contains("degraded"), "{beat}");
     let dm = fixture.read_state("summary.txt");
-    assert!(!dm.contains('✅'), "{dm}");
     assert!(dm.contains("merge state unread"), "{dm}");
 }
 
@@ -516,14 +521,24 @@ fn a_conflict_still_being_computed_keeps_the_card_and_is_not_an_all_clear() {
     assert_eq!(lane(&board, "Needs me"), [card.as_str()]);
     assert_eq!(fixture.degraded(), serde_json::json!(["merge_computing"]));
     let dm = fixture.read_state("summary.txt");
-    assert!(!dm.contains('✅'), "{dm}");
     assert!(dm.contains("still computing conflicts"), "{dm}");
 
     answer_with("MERGEABLE");
     let board = fixture.read_board();
     assert!(lane(&board, "Needs me").is_empty(), "answered: {board}");
     assert_eq!(fixture.degraded(), serde_json::json!([]));
-    assert!(fixture.read_state("summary.txt").contains('✅'));
+    assert!(!fixture.read_state("summary.txt").contains('⚠'));
+}
+
+/// What you do with the first card in `Needs me` to mute it. Hands back the card.
+fn drag_to_passed(fixture: &Fixture) -> String {
+    let board = fixture.read_board();
+    let card = lane(&board, "Needs me")[0].to_owned();
+    let dragged = board
+        .replace(&format!("{card}\n"), "")
+        .replace("## Passed\n", &format!("## Passed\n\n{card}\n"));
+    fs::write(fixture.board(), dragged).unwrap();
+    card
 }
 
 /// You muted it red. A push is a new trigger, and it comes back only then.
@@ -535,12 +550,7 @@ fn a_push_rearms_a_muted_red_pr() {
     fs::write(fixture.path("merge.json"), merge).unwrap();
     run(&mut fixture.command(&["--no-model", "--no-briefings"]));
 
-    let board = fixture.read_board();
-    let card = lane(&board, "Needs me")[0].to_owned();
-    let dragged = board
-        .replace(&format!("{card}\n"), "")
-        .replace("## Passed\n", &format!("## Passed\n\n{card}\n"));
-    fs::write(fixture.board(), dragged).unwrap();
+    let card = drag_to_passed(&fixture);
 
     run(&mut fixture.command(&["--no-model", "--no-briefings"]));
     let board = fixture.read_board();
@@ -551,6 +561,70 @@ fn a_push_rearms_a_muted_red_pr() {
     let board = fixture.read_board();
     assert_eq!(lane(&board, "Needs me").len(), 1, "re-armed: {board}");
     assert_eq!(lane(&board, "Passed"), [card.as_str()], "your card stays");
+}
+
+/// GitHub keeps no push time, so the head's date is the later of its commit and the last
+/// force-push. A request stays open past your comment only if that is later than it.
+#[test]
+fn a_push_is_dated_by_its_force_push_or_failing_that_its_commit() {
+    let spoke = "2026-02-01T00:00:00Z";
+    let before = "2026-01-15T00:00:00Z";
+    let after = "2026-03-01T00:00:00Z";
+    let cases = [
+        (
+            "a commit from before you spoke, and no force-push",
+            before,
+            None,
+            false,
+        ),
+        (
+            "the same commit, force-pushed since",
+            before,
+            Some(after),
+            true,
+        ),
+        ("force-pushed before you spoke", before, Some(before), false),
+        (
+            "a commit since a force-push from before you spoke",
+            after,
+            Some(before),
+            true,
+        ),
+    ];
+    for (name, committed, forced, open) in cases {
+        let forced = forced.map_or(String::new(), |at| format!(r#"{{"createdAt":"{at}"}}"#));
+        let node = pr_node(50, "x", "", "ccccccc", "alice")
+            .replace("2026-01-01T00:00:00Z", committed)
+            .replace(
+                r#""reviewRequests":{"nodes":[]}"#,
+                r#""reviewRequests":{"nodes":[{"requestedReviewer":{"login":"me"}}]}"#,
+            )
+            .replace(
+                r#""timelineItems":{"nodes":[]}"#,
+                r#""timelineItems":{"nodes":[{"createdAt":"2025-12-01T00:00:00Z","requestedReviewer":{"login":"me"}}]}"#,
+            )
+            .replace(
+                r#""comments":{"nodes":[]}"#,
+                &format!(
+                    r#""comments":{{"nodes":[{{"author":{{"__typename":"User","login":"me"}},
+                    "body":"what about the pokes?","createdAt":"{spoke}"}}]}}"#
+                ),
+            )
+            .replace(
+                r#""forcePushes":{"nodes":[]}"#,
+                &format!(r#""forcePushes":{{"nodes":[{forced}]}}"#),
+            );
+        let fixture = Fixture::new();
+        fs::write(fixture.path("prs.json"), prs_page(&[node])).unwrap();
+        run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+        let board = fixture.read_board();
+        let needs_me = lane(&board, "Needs me");
+        assert_eq!(
+            needs_me.iter().any(|card| card.contains("[#50](")),
+            open,
+            "{name}: {board}"
+        );
+    }
 }
 
 /// A failed read says nothing about the card, so it must not erase what it says.
@@ -673,7 +747,7 @@ fn a_corrupt_last_dm_means_never_sent_and_says_so() {
             "{record}"
         );
         let dm = fixture.read_state("summary.txt");
-        assert!(dm.contains("🆕"), "{record}: {dm}");
+        assert!(dm.contains("1 new"), "{record}: {dm}");
     }
 }
 
@@ -821,20 +895,22 @@ fn without_a_read_only_token_a_briefing_is_refused_not_run_on_your_own_auth() {
     assert_eq!(fixture.claude_log(), "");
 }
 
+/// One DM through the transport the tests can read, handing back what it sent.
+fn deliver(fixture: &Fixture, url: &str, messages: &Receiver<String>, flags: &[&str]) -> String {
+    run(fixture
+        .command(&[&["--notify", "--dm-now", "--no-briefings"], flags].concat())
+        .env("OPENCLAW_ENABLED", "1")
+        .env("OPENCLAW_URL", url)
+        .env("OPENCLAW_GATEWAY_TOKEN", "gateway-token"));
+    messages.recv().unwrap()
+}
+
 #[test]
-fn a_delivered_dm_is_remembered_so_the_next_one_marks_only_what_changed() {
+fn a_delivered_dm_is_remembered_so_the_next_one_says_nothing_new() {
     let fixture = Fixture::new();
     let (url, messages) = listener();
-    let notify = |fixture: &Fixture| {
-        run(fixture
-            .command(&["--notify", "--dm-now", "--no-model", "--no-briefings"])
-            .env("OPENCLAW_ENABLED", "1")
-            .env("OPENCLAW_URL", &url)
-            .env("OPENCLAW_GATEWAY_TOKEN", "gateway-token"));
-    };
 
-    notify(&fixture);
-    let first = messages.recv().unwrap();
+    let first = deliver(&fixture, &url, &messages, &["--no-model"]);
     assert!(
         first.contains("POST /api/channels/telegram/send"),
         "{first}"
@@ -845,15 +921,242 @@ fn a_delivered_dm_is_remembered_so_the_next_one_marks_only_what_changed() {
             .contains("authorization: bearer gateway-token"),
         "{first}"
     );
-    assert!(
-        first.contains("🆕"),
-        "everything is new the first time: {first}"
-    );
-    let record: serde_json::Value =
-        serde_json::from_str(&fixture.read_state("last_dm.json")).unwrap();
-    assert_eq!(record["seen"]["getfloresta/floresta#8"], "bbbbbbb");
+    assert!(first.contains("1 new"), "{first}");
+    assert!(first.contains("pull/7"), "{first}");
 
-    notify(&fixture);
-    let second = messages.recv().unwrap();
-    assert!(!second.contains("🆕"), "nothing moved: {second}");
+    let second = deliver(&fixture, &url, &messages, &["--no-model"]);
+    assert!(second.contains("nothing new"), "{second}");
+    assert!(!second.contains("pull/7"), "{second}");
+    assert!(second.contains("1 on the board"), "{second}");
+}
+
+/// The verdict decides what interrupts you. It never decides what is on the board, so a
+/// comment that talks the model out of an ask cannot make it disappear.
+#[test]
+fn what_the_model_says_asks_nothing_stays_on_the_board_and_out_of_the_dm() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("nobody_asks"), "").unwrap();
+    let (url, messages) = listener();
+    let dm = deliver(&fixture, &url, &messages, &[]);
+    assert!(dm.contains("nothing new"), "{dm}");
+    assert!(!dm.contains("pull/7"), "{dm}");
+    assert!(!dm.contains("not filtered"), "{dm}");
+
+    let board = fixture.read_board();
+    assert!(lane(&board, "Needs me")[0].contains("[#7]("), "{board}");
+}
+
+/// GitHub answers UNKNOWN at 08:07 because master just moved. That says nothing about the
+/// conflict, so it must not forget that you were told.
+#[test]
+fn a_conflict_you_were_told_about_is_not_news_after_a_morning_it_went_unread() {
+    let fixture = Fixture::new();
+    let (prs, _) = my_broken_pr();
+    fs::write(fixture.path("prs.json"), prs).unwrap();
+    let (url, messages) = listener();
+    let morning = |mergeable: &str| {
+        let node = merge_node(mergeable, "null");
+        let merge = format!(r#"{{"data":{{"repository":{{"p9":{node}}}}}}}"#);
+        fs::write(fixture.path("merge.json"), merge).unwrap();
+        deliver(&fixture, &url, &messages, &["--no-model"])
+    };
+
+    let told = morning("CONFLICTING");
+    assert!(told.contains("1 new"), "{told}");
+    let computing = morning("UNKNOWN");
+    assert!(computing.contains("nothing new"), "{computing}");
+    let answered = morning("CONFLICTING");
+    assert!(answered.contains("nothing new"), "{answered}");
+}
+
+/// Dragging a card to Passed does not clear it. A thank-you re-arms the mute, and only the
+/// thank-you is new, so the request you were already told about does not come back with it.
+#[test]
+fn what_re_arms_a_mute_does_not_resend_what_you_were_told() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("nobody_asks"), "").unwrap();
+    let requested = pr_node(7, "waiting on you", "", "aaaaaaa", "bob")
+        .replace(
+            r#""reviewRequests":{"nodes":[]}"#,
+            r#""reviewRequests":{"nodes":[{"requestedReviewer":{"login":"me"}}]}"#,
+        )
+        .replace(
+            r#""timelineItems":{"nodes":[]}"#,
+            r#""timelineItems":{"nodes":[{"createdAt":"2026-01-01T00:00:00Z","requestedReviewer":{"login":"me"}}]}"#,
+        );
+    fs::write(
+        fixture.path("prs.json"),
+        prs_page(std::slice::from_ref(&requested)),
+    )
+    .unwrap();
+    let (url, messages) = listener();
+
+    let told = deliver(&fixture, &url, &messages, &[]);
+    assert!(told.contains("1 new"), "{told}");
+    drag_to_passed(&fixture);
+    let muted = deliver(&fixture, &url, &messages, &[]);
+    assert!(muted.contains("nothing new"), "{muted}");
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let thanked = requested.replace(
+        r#""comments":{"nodes":[]}"#,
+        &format!(
+            r#""comments":{{"nodes":[{{"author":{{"__typename":"User","login":"bob"}},
+            "body":"thanks @me","createdAt":"{now}"}}]}}"#
+        ),
+    );
+    fs::write(fixture.path("prs.json"), prs_page(&[thanked])).unwrap();
+    let rearmed = deliver(&fixture, &url, &messages, &[]);
+    assert!(
+        lane(&fixture.read_board(), "Needs me")[0].contains("[#7]("),
+        "the mute re-armed"
+    );
+    assert!(rearmed.contains("nothing new"), "{rearmed}");
+}
+
+/// Opportunities stay on the board.
+#[test]
+fn the_dm_carries_no_opportunities() {
+    let fixture = Fixture::new();
+    let (url, messages) = listener();
+    let dm = deliver(&fixture, &url, &messages, &[]);
+    assert!(!dm.contains("pull/8"), "{dm}");
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Opportunities")[0].contains("[#8]("),
+        "{board}"
+    );
+}
+
+const CLAIMED_ISSUE: &str = "- [ ] mine [#98](https://github.com/getfloresta/Floresta/issues/98)";
+
+/// Issue #98, as the claims read finds it.
+fn claimed_issue(state: &str, assignee: &str) -> String {
+    format!(
+        r#"{{"data":{{"n0":{{"issueOrPullRequest":{{"__typename":"Issue","state":"{state}",
+        "closedAt":"2026-01-01T00:00:00Z","assignees":{{"nodes":[{{"login":"{assignee}"}}]}},
+        "timelineItems":{{"nodes":[]}}}}}}}}}}"#
+    )
+}
+
+/// An alert is news once, and the card goes on saying it. Only saying something else, or
+/// clearing and coming back, sends it again.
+#[test]
+fn a_claim_alert_goes_out_once_and_stays_on_the_card() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), board_text("", CLAIMED_ISSUE)).unwrap();
+    let (url, messages) = listener();
+    let closed = claimed_issue("CLOSED", "me");
+    let taken = claimed_issue("CLOSED", "bob");
+    let open = claimed_issue("OPEN", "me");
+    for (name, claims, sent) in [
+        ("the first morning", closed.as_str(), true),
+        ("the next one", &closed, false),
+        ("it says something else", &taken, true),
+        ("a read that failed says nothing", "not json", false),
+        ("and is no reason to say it again", &taken, false),
+        ("it cleared", &open, false),
+        ("it came back", &taken, true),
+    ] {
+        fs::write(fixture.path("claims.json"), claims).unwrap();
+        let dm = deliver(&fixture, &url, &messages, &["--no-model"]);
+        assert_eq!(dm.contains("#98 —"), sent, "{name}: {dm}");
+    }
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Doing")[0].contains("assigned to bob"),
+        "{board}"
+    );
+}
+
+/// Finished with, so a closed issue there is how it should be.
+#[test]
+fn a_card_in_done_raises_no_alert() {
+    let fixture = Fixture::new();
+    let board =
+        board_text("", "").replace("## Done\n\n", &format!("## Done\n\n{CLAIMED_ISSUE}\n\n"));
+    fs::write(fixture.board(), board).unwrap();
+    fs::write(fixture.path("claims.json"), claimed_issue("CLOSED", "me")).unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    let dm = fixture.read_state("summary.txt");
+    assert!(!dm.contains("#98 —"), "{dm}");
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Done")[0].contains("closed upstream"),
+        "the card still says so: {board}"
+    );
+}
+
+/// With the opportunities gone from the DM, nothing else would say so on a morning with
+/// no ask for the "not filtered" line to go on.
+#[test]
+fn a_model_that_does_not_answer_is_said_on_a_quiet_morning_too() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("bin/claude"), "#!/bin/sh\nexit 1\n").unwrap();
+    let (url, messages) = listener();
+    let first = deliver(&fixture, &url, &messages, &[]);
+    assert!(first.contains("did not answer"), "{first}");
+    let quiet = deliver(&fixture, &url, &messages, &[]);
+    assert!(quiet.contains("nothing new"), "{quiet}");
+    assert!(quiet.contains("did not answer"), "{quiet}");
+    assert_eq!(fixture.degraded(), serde_json::json!(["model"]));
+}
+
+#[test]
+fn what_counts_as_the_model_not_answering() {
+    let waiting = pr_node(7, "waiting on you", "cc @me please", "aaaaaaa", "bob");
+    let also = pr_node(50, "also waiting", "cc @me too", "ddddddd", "bob");
+    let answered = serde_json::json!([]);
+    let unanswered = serde_json::json!(["model"]);
+    let asks_the_model: &[&str] = &["--no-briefings"];
+    for (name, prs, flags, judge_fails, want) in [
+        (
+            "told not to ask",
+            prs(),
+            &["--no-briefings", "--no-model"][..],
+            false,
+            &answered,
+        ),
+        (
+            "nothing to rank is not a failed judge",
+            prs_page(std::slice::from_ref(&waiting)),
+            asks_the_model,
+            false,
+            &answered,
+        ),
+        (
+            "the judge alone failed",
+            prs(),
+            asks_the_model,
+            true,
+            &unanswered,
+        ),
+        (
+            "one item got no gist",
+            prs_page(&[waiting.clone(), also.clone()]),
+            asks_the_model,
+            false,
+            &unanswered,
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("prs.json"), prs).unwrap();
+        if judge_fails {
+            fs::write(fixture.path("no_judge"), "").unwrap();
+        }
+        run(&mut fixture.command(flags));
+        assert_eq!(&fixture.degraded(), want, "{name}");
+    }
+}
+
+/// The shortlist only feeds the ranking, so losing it says nothing about your own PRs.
+#[test]
+fn a_failed_read_of_the_shortlist_does_not_warn_about_your_prs() {
+    let fixture = Fixture::new();
+    run(fixture
+        .command(&["--no-model", "--no-briefings"])
+        .env("GH_FAIL_ON", "mergeable"));
+    assert_eq!(fixture.degraded(), serde_json::json!(["opportunity_merge"]));
+    let dm = fixture.read_state("summary.txt");
+    assert!(!dm.contains("merge state unread"), "{dm}");
 }

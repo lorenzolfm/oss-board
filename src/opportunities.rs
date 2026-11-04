@@ -71,7 +71,7 @@ fn since_you(item: &Item, pr: &PrDetail, me: &Viewer, mine_at: Timestamp) -> (bo
         .chain(inline)
         .filter(|c| c.author != me.login && !c.bot && c.at > mine_at)
         .count();
-    (pr.head_at.is_some_and(|pushed| pushed > mine_at), others)
+    (pr.pushed_at.is_some_and(|pushed| pushed > mine_at), others)
 }
 
 /// One decimal place, rounded as the DM and the judge have always seen it: on the

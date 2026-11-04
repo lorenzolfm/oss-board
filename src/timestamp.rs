@@ -4,7 +4,7 @@
 use std::fmt;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, Utc};
-use serde::{Deserialize, Deserializer, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 const DAY_MICROS: i64 = 86_400_000_000;
 
@@ -51,6 +51,12 @@ impl Timestamp {
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
     }
 }
 

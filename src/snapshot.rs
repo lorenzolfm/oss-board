@@ -54,6 +54,8 @@ const PR_FIELDS: &str = r#"
     comments(first: 30) { totalCount nodes { author { __typename login } body createdAt } } } }
   timelineItems(last: 20, itemTypes: [REVIEW_REQUESTED_EVENT]) { nodes {
     ... on ReviewRequestedEvent { createdAt requestedReviewer { ... on User { login } } } } }
+  forcePushes: timelineItems(last: 1, itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT]) { nodes {
+    ... on HeadRefForcePushedEvent { createdAt } } }
   files(first: 100) { nodes { path } }
 "#;
 
@@ -139,7 +141,10 @@ pub struct PrDetail {
     pub deletions: u64,
     pub changed_files: u64,
     pub head: String,
-    pub head_at: Option<Timestamp>,
+    /// The head was pushed no earlier than this. GitHub keeps no push time, so a
+    /// force-push is dated by its event and a fast-forward only by the commit it adds,
+    /// which can be older than the push.
+    pub pushed_at: Option<Timestamp>,
     pub review_decision: Option<ReviewDecision>,
     pub requested: Vec<String>,
     pub requested_at: HashMap<String, Timestamp>,
@@ -470,6 +475,12 @@ struct ReviewRequestedEvent {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForcePush {
+    created_at: Timestamp,
+}
+
+#[derive(Deserialize)]
 struct FileNode {
     path: String,
 }
@@ -499,6 +510,7 @@ struct PrNode {
     comments: Conn<CommentNode>,
     review_threads: Conn<ThreadNode>,
     timeline_items: Conn<ReviewRequestedEvent>,
+    force_pushes: Conn<ForcePush>,
     files: Option<Conn<FileNode>>,
 }
 
@@ -552,11 +564,11 @@ impl TryFrom<PrNode> for Item {
                 *held = (*held).max(event.created_at);
             }
         }
-        let head_at = n
-            .commits
-            .into_nodes()
-            .next()
-            .map(|node| node.commit.committed_date);
+        let committed = n.commits.into_nodes().next();
+        let forced = n.force_pushes.into_nodes().next();
+        let pushed_at = committed
+            .map(|node| node.commit.committed_date)
+            .max(forced.map(|push| push.created_at));
         Ok(Self {
             key: item_key(&n.url)?,
             number: n.number,
@@ -577,7 +589,7 @@ impl TryFrom<PrNode> for Item {
                 deletions: n.deletions,
                 changed_files: n.changed_files,
                 head: n.head_ref_oid,
-                head_at,
+                pushed_at,
                 review_decision: n.review_decision,
                 requested: requested.into_iter().collect(),
                 requested_at,
