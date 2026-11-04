@@ -1,0 +1,23 @@
+[package]
+name = "oss-board"
+version = "0.1.0"
+edition = "2024"
+description = "Floresta triage: what is blocked on you, then what is worth your evening"
+repository = "https://github.com/lorenzolfm/oss-board"
+publish = false
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+ureq = "3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = true

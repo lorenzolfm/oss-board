@@ -1,0 +1,686 @@
+//! Your Floresta work that exists but never reached upstream.
+//!
+//! Two sources:
+//!   * open PRs against your own fork. They look reviewed-and-done there, but
+//!     nobody upstream has seen them.
+//!   * local branches carrying commits you wrote that upstream does not have.
+//!
+//! The false positives the old stranded scan produced are the design here:
+//!   * a branch counts only for commits *you* authored that `git cherry` says are
+//!     not upstream -- so a checkout of someone else's PR for review never does;
+//!   * anything already carried by an upstream PR of yours, in any state, is
+//!     hidden: matched on title, branch name, or commit. A fork PR you later opened
+//!     upstream (fork #8 -> #1330) is not stranded;
+//!   * branches named after a PR (`pr-1105`, `review-1252`) are review checkouts.
+
+use std::collections::{BTreeSet, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::LazyLock;
+use std::time::Duration;
+
+use anyhow::{Result, bail};
+use regex::Regex;
+use serde::Deserialize;
+
+use crate::config;
+use crate::gh;
+use crate::proc::{self, Failure};
+use crate::snapshot::{Item, UpstreamPr};
+use crate::text::prefix;
+
+const GIT_TIMEOUT: Duration = Duration::from_secs(30);
+
+static CHECKOUT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:pr|review)[-_]?\d+(?:-head)?$").expect("a constant pattern compiles")
+});
+/// Consuming the character before a bare `#` stands in for the lookbehind the regex
+/// crate does not have: a match never starts inside the previous one, since that
+/// ends in a digit, which already rules the next `#` out.
+static REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:github\.com/getfloresta/floresta/(?:issues|pull)/|getfloresta/floresta#|(?:^|[^\w/])#)(\d+)",
+    )
+    .expect("a constant pattern compiles")
+});
+const STOP: [&str; 39] = [
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into", "is", "it",
+    "its", "of", "on", "or", "per", "the", "to", "with", "without", "when", "not", "no", "via",
+    "this", "that", "fix", "feat", "chore", "refactor", "test", "tests", "docs", "make", "add",
+    "use",
+];
+
+/// Which upstream issue a piece of work fixes, and how sure we are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkHow {
+    /// It names the issue explicitly.
+    Refs,
+    /// Title match on at least two shared words, which is why the card says "probably".
+    Guess,
+}
+
+#[derive(Clone, Debug)]
+pub struct IssueLink {
+    pub number: u64,
+    pub url: String,
+    pub how: LinkHow,
+}
+
+#[derive(Clone, Debug)]
+pub enum Origin {
+    ForkPr {
+        number: u64,
+        url: String,
+        additions: u64,
+        deletions: u64,
+    },
+    Branch,
+}
+
+#[derive(Clone, Debug)]
+pub struct Unshipped {
+    pub key: String,
+    pub origin: Origin,
+    pub title: String,
+    pub branch: String,
+    pub commits: usize,
+    pub last: String,
+    pub issue: Option<IssueLink>,
+}
+
+/// Empty on a timeout or a non-zero exit. Only a git that cannot start at all is an
+/// error, so the lane reports its source as failed rather than as empty.
+fn git(path: &Path, args: &[&str]) -> Result<String> {
+    let result = proc::run(
+        Command::new("git").arg("-C").arg(path).args(args),
+        GIT_TIMEOUT,
+    );
+    match result {
+        Ok(out) if out.success => Ok(out.stdout),
+        Ok(_) | Err(Failure::TimedOut(_)) => Ok(String::new()),
+        Err(failure @ Failure::Spawn(_)) => bail!("git: {failure}"),
+    }
+}
+
+pub fn my_emails(clones: &[PathBuf]) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for clone in clones {
+        let email = git(clone, &["config", "user.email"])?.trim().to_lowercase();
+        if !email.is_empty() {
+            out.insert(email);
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------- matching
+
+fn split_alnum(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .split(|ch: char| !ch.is_ascii_lowercase() && !ch.is_ascii_digit())
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn norm_title(title: &str) -> String {
+    split_alnum(title).join(" ")
+}
+
+/// Comparable words: lowercase, split on punctuation (config.toml is two words),
+/// stopwords out, crude suffix stemming so parse/parsed/parsing meet.
+fn tokens(text: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for word in split_alnum(text) {
+        if word.len() < 3
+            || STOP.contains(&word.as_str())
+            || word.bytes().all(|b| b.is_ascii_digit())
+        {
+            continue;
+        }
+        let mut word = word.as_str();
+        for suffix in ["ing", "ed", "es", "s"] {
+            if let Some(stem) = word.strip_suffix(suffix)
+                && stem.len() >= 4
+            {
+                word = stem;
+                break;
+            }
+        }
+        let bytes = word.as_bytes();
+        if bytes.len() >= 4 && bytes[bytes.len() - 1] == bytes[bytes.len() - 2] {
+            word = &word[..word.len() - 1]; // logg -> log
+        }
+        out.insert(word.to_owned());
+    }
+    out
+}
+
+/// The open upstream issue this work most likely fixes.
+///
+/// An explicit reference wins. Bare `#N` in a fork PR means the fork's own numbering
+/// unless N is too big to be one, hence the >= 100 floor. Failing that, a title
+/// match on at least two shared words.
+fn link_issue<'a>(
+    text: &str,
+    words: &HashSet<String>,
+    issues: &'a [Item],
+) -> Option<(&'a Item, LinkHow)> {
+    for found in REF_RE.captures_iter(text) {
+        let Ok(number) = found[1].parse::<u64>() else {
+            continue;
+        };
+        let named = found[0].to_lowercase().contains("floresta");
+        if (number >= 100 || named)
+            && let Some(issue) = issues.iter().find(|issue| issue.number == number)
+        {
+            return Some((issue, LinkHow::Refs));
+        }
+    }
+    let mut best = None;
+    let mut score = 0;
+    for issue in issues {
+        let shared = tokens(&issue.title).intersection(words).count();
+        if shared > score {
+            best = Some(issue);
+            score = shared;
+        }
+    }
+    if score >= 2 {
+        best.map(|issue| (issue, LinkHow::Guess))
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------- sources
+
+/// An open PR against your own fork.
+pub struct ForkPr {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub url: String,
+    pub branch: String,
+    pub head: String,
+    pub last: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub commits: usize,
+}
+
+#[derive(Deserialize)]
+struct ForkAuthor {
+    login: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkCommits {
+    total_count: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkNode {
+    number: u64,
+    title: String,
+    body: Option<String>,
+    url: String,
+    updated_at: String,
+    additions: u64,
+    deletions: u64,
+    head_ref_name: String,
+    head_ref_oid: String,
+    author: Option<ForkAuthor>,
+    commits: Option<ForkCommits>,
+}
+
+#[derive(Deserialize)]
+struct ForkConn {
+    nodes: Option<Vec<ForkNode>>,
+}
+
+fn fork_prs(fork: &str, me: &str) -> Result<Vec<ForkPr>> {
+    let Some((owner, name)) = fork.split_once('/') else {
+        bail!("not owner/name: {fork}");
+    };
+    let mut data = gh::graphql(&format!(
+        r#"query {{ repository(owner: "{owner}", name: "{name}") {{
+      pullRequests(states: OPEN, first: 50) {{ nodes {{
+        number title body url createdAt updatedAt additions deletions
+        headRefName headRefOid author {{ login }}
+        commits(first: 100) {{ totalCount nodes {{ commit {{ oid }} }} }} }} }} }} }}"#
+    ))?;
+    let conn: ForkConn = gh::decode(data["repository"]["pullRequests"].take())?;
+    Ok(conn
+        .nodes
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|node| {
+            let author = node.author.as_ref().and_then(|a| a.login.as_deref());
+            author.unwrap_or("").eq_ignore_ascii_case(me)
+        })
+        .map(|node| ForkPr {
+            number: node.number,
+            title: node.title,
+            body: node.body.unwrap_or_default(),
+            url: node.url,
+            branch: node.head_ref_name,
+            head: node.head_ref_oid,
+            last: prefix(&node.updated_at, 10).to_owned(),
+            additions: node.additions,
+            deletions: node.deletions,
+            commits: node.commits.and_then(|c| c.total_count).unwrap_or(0),
+        })
+        .collect())
+}
+
+struct LocalBranch {
+    branch: String,
+    title: String,
+    subjects: Vec<String>,
+    commits: usize,
+    last: String,
+    oids: HashSet<String>,
+}
+
+/// Branches with commits you wrote that upstream does not carry.
+fn local_branches(
+    clone: &Path,
+    emails: &BTreeSet<String>,
+    upstream_ref: &str,
+) -> Result<Vec<LocalBranch>> {
+    let mut out = Vec::new();
+    if !clone.join(".git").is_dir() {
+        return Ok(out);
+    }
+    let refs = git(
+        clone,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+    )?;
+    for branch in refs.split_whitespace() {
+        if matches!(branch, "master" | "main")
+            || config::BRANCH_IGNORE.iter().any(|p| branch.starts_with(p))
+            || CHECKOUT_RE.is_match(branch)
+        {
+            continue;
+        }
+        // `git cherry` compares patches, so a commit cherry-picked or rebased into
+        // upstream counts as shipped even though its hash differs.
+        let cherry = git(clone, &["cherry", upstream_ref, branch])?;
+        let fresh: Vec<&str> = cherry
+            .lines()
+            .filter_map(|line| line.strip_prefix("+ "))
+            .map(str::trim)
+            .collect();
+        if fresh.is_empty() {
+            continue;
+        }
+        let mut args = vec!["log", "--no-walk", "--format=%H%x09%ae%x09%cs%x09%s"];
+        args.extend(&fresh);
+        let log = git(clone, &args)?;
+        let mut mine: Vec<(&str, &str, &str)> = Vec::new();
+        for line in log.lines() {
+            let mut fields = line.split('\t');
+            let oid = fields.next().unwrap_or("");
+            let email = fields.next().unwrap_or("");
+            let day = fields.next().unwrap_or("");
+            let subject = fields.next().unwrap_or("");
+            if emails.contains(&email.to_lowercase()) {
+                mine.push((oid, day, subject));
+            }
+        }
+        mine.sort_by_key(|(_, day, _)| *day);
+        let Some((_, last, title)) = mine.last().copied() else {
+            continue;
+        };
+        out.push(LocalBranch {
+            branch: branch.to_owned(),
+            title: title.to_owned(),
+            subjects: mine.iter().map(|(_, _, s)| (*s).to_owned()).collect(),
+            commits: mine.len(),
+            last: last.to_owned(),
+            oids: mine.iter().map(|(oid, _, _)| (*oid).to_owned()).collect(),
+        });
+    }
+    Ok(out)
+}
+
+fn link_of(text: &str, words: &HashSet<String>, issues: &[Item]) -> Option<IssueLink> {
+    link_issue(text, words, issues).map(|(issue, how)| IssueLink {
+        number: issue.number,
+        url: issue.url.clone(),
+        how,
+    })
+}
+
+/// Every piece of unshipped work, given your fork's PRs. `upstream_mine` is
+/// `snapshot::mine`: every PR you opened upstream.
+fn assemble(
+    prs: Vec<ForkPr>,
+    issues: &[Item],
+    upstream_mine: &[UpstreamPr],
+    clones: &[PathBuf],
+    upstream_ref: &str,
+) -> Result<Vec<Unshipped>> {
+    let up_titles: HashSet<String> = upstream_mine.iter().map(|p| norm_title(&p.title)).collect();
+    let up_refs: HashSet<&str> = upstream_mine.iter().map(|p| p.head_ref.as_str()).collect();
+    let up_oids: HashSet<&String> = upstream_mine.iter().flat_map(|p| &p.commits).collect();
+    let fork_refs: HashSet<String> = prs.iter().map(|p| p.branch.clone()).collect();
+
+    let mut items = Vec::new();
+    for pr in prs {
+        if up_titles.contains(&norm_title(&pr.title))
+            || up_refs.contains(pr.branch.as_str())
+            || up_oids.contains(&pr.head)
+        {
+            continue;
+        }
+        let words = tokens(&format!("{} {}", pr.title, pr.branch));
+        let text = format!("{}\n{}", pr.body, pr.title);
+        items.push(Unshipped {
+            key: crate::snapshot::item_key(&pr.url),
+            issue: link_of(&text, &words, issues),
+            origin: Origin::ForkPr {
+                number: pr.number,
+                url: pr.url,
+                additions: pr.additions,
+                deletions: pr.deletions,
+            },
+            title: pr.title,
+            branch: pr.branch,
+            commits: pr.commits,
+            last: pr.last,
+        });
+    }
+
+    let emails = my_emails(clones)?;
+    for clone in clones {
+        for branch in local_branches(clone, &emails, upstream_ref)? {
+            if up_refs.contains(branch.branch.as_str())
+                || fork_refs.contains(&branch.branch)
+                || branch.oids.iter().any(|oid| up_oids.contains(oid))
+            {
+                continue;
+            }
+            let words = tokens(&format!("{} {}", branch.branch, branch.subjects.join(" ")));
+            let text = format!("{}\n{}", branch.subjects.join("\n"), branch.title);
+            items.push(Unshipped {
+                key: format!("branch:{}", branch.branch),
+                issue: link_of(&text, &words, issues),
+                origin: Origin::Branch,
+                title: branch.title,
+                branch: branch.branch,
+                commits: branch.commits,
+                last: branch.last,
+            });
+        }
+    }
+    Ok(items)
+}
+
+pub fn run(issues: &[Item], upstream_mine: &[UpstreamPr], me: &str) -> Result<Vec<Unshipped>> {
+    assemble(
+        fork_prs(config::FORK, me)?,
+        issues,
+        upstream_mine,
+        &config::clones(),
+        config::UPSTREAM_REF,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unshipped work, against real git repos built in a temp dir.
+    //!
+    //! The old stranded scan's failures are the cases: a review checkout reported
+    //! as your work, a fork PR already upstream under the same title (fork #8 /
+    //! #1330), and a cherry-picked commit counted as unshipped because its hash
+    //! changed.
+
+    use super::*;
+    use crate::testkit::issue;
+    use std::fs;
+    use tempfile::TempDir;
+
+    const MINE: &str = "me@example.com";
+    const OTHER: &str = "other@example.com";
+    const UPSTREAM: &str = "upstream/master";
+
+    fn run_git(path: &Path, args: &[&str], email: &str) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "x")
+            .env("GIT_AUTHOR_EMAIL", email)
+            .env("GIT_COMMITTER_NAME", "x")
+            .env("GIT_COMMITTER_EMAIL", email)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn commit(path: &Path, name: &str, email: &str, message: &str) {
+        fs::write(path.join(name), name).unwrap();
+        run_git(path, &["add", name], email);
+        run_git(path, &["commit", "-qm", message], email);
+    }
+
+    struct Repos {
+        _tmp: TempDir,
+        clone: PathBuf,
+    }
+
+    fn branch(repos: &Repos, name: &str, files: &[&str], email: &str, message: Option<&str>) {
+        let clone = &repos.clone;
+        run_git(clone, &["checkout", "-q", "-b", name, UPSTREAM], email);
+        for file in files {
+            let default = format!("add {file}");
+            commit(clone, file, email, message.unwrap_or(&default));
+        }
+        run_git(clone, &["checkout", "-q", "master"], email);
+    }
+
+    fn repos() -> Repos {
+        let tmp = TempDir::new().unwrap();
+        let up = tmp.path().join("upstream");
+        fs::create_dir(&up).unwrap();
+        run_git(&up, &["init", "-q", "-b", "master"], MINE);
+        commit(&up, "base", OTHER, "add base");
+        let clone = tmp.path().join("clone");
+        run_git(
+            tmp.path(),
+            &[
+                "clone",
+                "-q",
+                "-o",
+                "upstream",
+                up.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ],
+            MINE,
+        );
+        run_git(&clone, &["config", "user.email", MINE], MINE);
+        let repos = Repos { _tmp: tmp, clone };
+
+        branch(
+            &repos,
+            "dedup-config-parse",
+            &["cfg1", "cfg2"],
+            MINE,
+            Some("fix(node): parse config.toml once"),
+        );
+        branch(&repos, "review-of-bobs-pr", &["bob1"], OTHER, None); // someone else's commits
+        branch(&repos, "pr-1105", &["c1"], MINE, None); // a PR checkout by name
+        branch(&repos, "backup/old-wip", &["w1"], MINE, None);
+        branch(&repos, "already-up", &["picked"], MINE, None);
+        // Upstream takes the "already-up" patch by cherry-pick: same change, new hash.
+        run_git(
+            &up,
+            &["fetch", "-q", repos.clone.to_str().unwrap(), "already-up"],
+            OTHER,
+        );
+        run_git(&up, &["cherry-pick", "FETCH_HEAD"], OTHER);
+        run_git(&repos.clone, &["fetch", "-q", "upstream"], MINE);
+        branch(&repos, "shipped-as-pr", &["s1"], MINE, None);
+        repos
+    }
+
+    fn emails() -> BTreeSet<String> {
+        BTreeSet::from([MINE.to_owned()])
+    }
+
+    #[test]
+    fn local_branches_are_only_commits_you_wrote_that_upstream_lacks() {
+        let repos = repos();
+        let found = local_branches(&repos.clone, &emails(), UPSTREAM).unwrap();
+        let names: Vec<&str> = found.iter().map(|b| b.branch.as_str()).collect();
+        assert!(names.contains(&"dedup-config-parse"), "{names:?}");
+        let dedup = found
+            .iter()
+            .find(|b| b.branch == "dedup-config-parse")
+            .unwrap();
+        assert_eq!(dedup.commits, 2);
+        assert!(
+            !names.contains(&"review-of-bobs-pr"),
+            "a review checkout of others' work"
+        );
+        assert!(
+            !names.contains(&"pr-1105"),
+            "a branch named after a PR is a checkout"
+        );
+        assert!(
+            !names.contains(&"backup/old-wip"),
+            "ignored prefixes stay ignored"
+        );
+        assert!(
+            !names.contains(&"already-up"),
+            "a cherry-picked patch counts as shipped"
+        );
+    }
+
+    fn fork_pr(number: u64, title: &str, branch: &str, head: &str) -> ForkPr {
+        ForkPr {
+            number,
+            title: title.to_owned(),
+            body: String::new(),
+            url: format!("https://github.com/lorenzolfm/Floresta/pull/{number}"),
+            branch: branch.to_owned(),
+            head: head.repeat(40),
+            last: "2026-09-12".to_owned(),
+            additions: 1,
+            deletions: 0,
+            commits: 2,
+        }
+    }
+
+    fn upstream_pr(title: &str, head_ref: &str) -> UpstreamPr {
+        UpstreamPr {
+            title: title.to_owned(),
+            head_ref: head_ref.to_owned(),
+            commits: HashSet::new(),
+        }
+    }
+
+    fn linkable_issues() -> Vec<Item> {
+        vec![
+            issue(1308).title("config.toml is read and parsed three times per startup"),
+            issue(167).title("[tracking-issue] Audit logging and identify improvements"),
+            issue(6).title("Unrelated wording entirely"),
+        ]
+    }
+
+    #[test]
+    fn what_an_upstream_pr_already_carries_is_hidden() {
+        let repos = repos();
+        let shipped_title = "fix(wire): report block download progress on a time interval";
+        let prs = vec![
+            fork_pr(8, shipped_title, "fix/time-log", "a"),
+            fork_pr(
+                6,
+                "Read and parse config.toml once per boot",
+                "other-name",
+                "b",
+            ),
+        ];
+        let upstream = vec![
+            upstream_pr(shipped_title, "fix/time-based-ibd-progress-log"),
+            upstream_pr("x", "shipped-as-pr"),
+        ];
+        let items = assemble(
+            prs,
+            &linkable_issues(),
+            &upstream,
+            std::slice::from_ref(&repos.clone),
+            UPSTREAM,
+        )
+        .unwrap();
+        let keys: Vec<&str> = items.iter().map(|u| u.key.as_str()).collect();
+        assert!(
+            !keys.contains(&"lorenzolfm/Floresta#8"),
+            "already upstream under its title: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"lorenzolfm/Floresta#6"),
+            "nobody upstream has seen it: {keys:?}"
+        );
+        assert!(
+            !keys.contains(&"branch:shipped-as-pr"),
+            "upstream merged it as a PR: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"branch:dedup-config-parse"),
+            "an unpushed branch stays: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn linking_work_to_the_issue_it_fixes() {
+        let issues = linkable_issues();
+        let link = |text: &str, words: &str| {
+            link_issue(text, &tokens(words), &issues).map(|(issue, how)| (issue.number, how))
+        };
+        assert_eq!(
+            link(
+                "",
+                "Read and parse config.toml once per boot dedup-config-parse"
+            ),
+            Some((1308, LinkHow::Guess)),
+            "fork #6 probably fixes #1308"
+        );
+        assert_eq!(
+            link("", "feat(florestad): prototype OTLP/HTTP JSON log export"),
+            None,
+            "one shared word is not a link (OTLP vs the logging audit)"
+        );
+        assert_eq!(
+            link("See https://github.com/getfloresta/Floresta/issues/167", ""),
+            Some((167, LinkHow::Refs)),
+            "an explicit upstream URL wins"
+        );
+        assert_eq!(
+            link("follow-up to #6", ""),
+            None,
+            "a small bare #N is the fork's own numbering, not upstream"
+        );
+        assert_eq!(
+            link("see getfloresta/floresta#6", ""),
+            Some((6, LinkHow::Refs)),
+            "naming the repo makes even a small number upstream's"
+        );
+    }
+
+    #[test]
+    fn stemming_makes_parse_parsed_and_parsing_meet() {
+        assert_eq!(tokens("parsed"), tokens("parsing"));
+        assert_eq!(tokens("logging"), HashSet::from(["log".to_owned()]));
+    }
+}

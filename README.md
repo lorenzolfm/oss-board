@@ -15,7 +15,7 @@ and it answered "what could I pick up?" when the question that matters is
 
 **Obligations** are found by code alone, are never capped, and are listed
 longest-waiting first. The model may add a one-line gist to one; it can never
-hide, drop or reorder it. Six rules (`lib/obligations.py`):
+hide, drop or reorder it. Six rules (`src/obligations.rs`):
 
 1. **A review was requested from you**, formally or by an informal "@you can
    you review" comment.
@@ -89,37 +89,45 @@ a slot missed while the desktop was off is sent late -- unless it is more than
 ## Layout
 
 ```
-run.py                 orchestrator; board always written, DM when a slot is due
+flake.nix              the package, and the gates `nix flake check` runs
 oss-board.nix          systemd timer (hourly) + service; copy to /etc/nixos
-lib/config.py          the repo, the clone, caps, DM slots, the project column
-lib/snapshot.py        one GraphQL read of every open PR and issue; merge state;
+src/main.rs            orchestrator; board always written, DM when a slot is due
+src/config.rs          the repo, the clone, caps, DM slots, the project column
+src/snapshot.rs        one GraphQL read of every open PR and issue; merge state;
                        your upstream PRs; the stale-ACK interdiff
-lib/obligations.py     the six rules and the mute logic -- pure functions
-lib/opportunities.py   the four opportunity sources and the fallback ranking
-lib/unshipped.py       fork PRs and local branches, and issue linking
-lib/footprint.py       which crates are yours, from git history
-lib/project.py         the org board's Needs Review column (+ a survey tool)
-lib/model.py           gists and the judge, both cached in state/
-lib/render.py          cards and the DM text
-lib/board.py           kanban parse/merge/write, migration -- owns the state contract
-lib/claims.py          upstream status of claimed cards
-lib/brief.py           issue and review briefs for claimed cards
-lib/notify.py          Telegram (chunked) + uptime-kuma heartbeat
-lib/testkit.py         snapshot-shaped fixtures
-lib/test_*.py          board, obligations, unshipped, DM
+src/obligations.rs     the six rules and the mute logic -- pure functions
+src/opportunities.rs   the four opportunity sources and the fallback ranking
+src/unshipped.rs       fork PRs and local branches, and issue linking
+src/footprint.rs       which crates are yours, from git history
+src/project.rs         the org board's Needs Review column (+ a survey tool)
+src/model.rs           gists and the judge, both cached in state/
+src/prompts.rs         what the model is told, byte for byte
+src/render.rs          cards and the DM text
+src/board.rs           kanban parse/merge/write, migration -- owns the state contract
+src/claims.rs          upstream status of claimed cards
+src/brief.rs           issue and review briefs for claimed cards
+src/notify.rs          Telegram (chunked) + uptime-kuma heartbeat
+src/gh.rs, src/proc.rs the `gh` CLI, and subprocesses with a deadline
+src/testkit.rs         snapshot-shaped fixtures for the unit tests
+tests/run.rs           the whole binary against fake gh, git and claude on PATH
 state/                 gists.json, rank.json, last_dm.json, last_run.json, summary.txt
 ```
 
 ## Running by hand
 
+From the repo root, since `--state` defaults to `./state`:
+
 ```sh
-python3 run.py --dry-run --no-model      # board + DM to stdout, no writes, no model
-python3 run.py --dry-run                 # ...with gists and the judge
-python3 run.py                           # update the board
-python3 run.py --notify --dm-now         # ...and DM now regardless of the slot
-python3 lib/project.py                   # survey the org board's columns
-for t in lib/test_*.py; do python3 "$t" || break; done
+cargo run -- --dry-run --no-model      # board + DM to stdout, no vault writes, no model
+cargo run -- --dry-run                 # ...with gists and the judge
+cargo run                              # update the board
+cargo run -- --notify --dm-now         # ...and DM now regardless of the slot
+cargo run -- survey                    # survey the org board's columns
+cargo test                             # or: nix flake check
 ```
+
+A dry run still refreshes `state/summary.txt` and `state/last_run.json`, and the
+model caches when the model runs, so point `--state` elsewhere to leave them alone.
 
 A run takes under a minute without the model, a few with it; the hourly runs
 reuse cached gists and rankings unless something they look at moved.
@@ -141,14 +149,14 @@ reuse cached gists and rankings unless something they look at moved.
 - **`mergeable` and the CI rollup are fetched only where needed** (your PRs,
   the opportunity shortlist). They force GitHub to compute state on demand and
   502'd the old bulk scan.
-- **The board write is deterministic Python, not model output.** The model
+- **The board write is deterministic code, not model output.** The model
   writes gists and ranks opportunities; it cannot invent an item, hide an
   obligation, or touch your lanes. Any model failure degrades to computed
   reasons and mechanical order, and says so.
 - **Read-only, enforced by the token.** The scanner sends only GETs and
   GraphQL queries. The one exception is the briefing note, authored by a
   `claude -p` subprocess holding the `gh` CLI -- there the prompt's "do NOT
-  post anything" is guidance, and the token is what enforces it. `brief.py`
+  post anything" is guidance, and the token is what enforces it. `brief.rs`
   refuses to run without `GH_TOKEN` rather than fall back to your own keyring
   auth, which carries `repo`.
 - **Migration was a one-off.** The first run on the old board dropped its agent
@@ -164,15 +172,30 @@ reuse cached gists and rankings unless something they look at moved.
    sops /etc/nixos/hosts/desktop/secrets.yaml
    sudo nixos-rebuild switch
    ```
-2. **The unit.** `oss-board.nix` is the deployed copy; the timer runs `run.py`
-   from this working tree, so whatever is checked out here is what runs.
-   Deployed copies have drifted before -- diff before syncing:
+2. **The unit.** `oss-board.nix` is the deployed copy, and the binary comes from
+   this repo as a flake input, like `wt` and `claude-ps`: what runs is what the
+   lock pins, not whatever is checked out here. So a change reaches the timer only
+   when you commit it and update the input:
+   ```sh
+   cd /etc/nixos
+   nix flake update oss-board
+   sudo nixos-rebuild switch
+   ```
+   The repo is private, so the input is a local one rather than `github:`, and
+   only what is committed on `main` can deploy:
+   ```nix
+   oss-board = {
+     url = "git+file:///home/lorenzo/Projects/misc/opensource?ref=main";
+     inputs.nixpkgs.follows = "nixpkgs";
+     inputs.rust-overlay.follows = "rust-overlay";
+   };
+   ```
+   Deployed copies of the module have drifted before -- diff before syncing:
    ```sh
    diff oss-board.nix /etc/nixos/hosts/desktop/oss-board.nix
    cp oss-board.nix /etc/nixos/hosts/desktop/oss-board.nix
-   sudo nixos-rebuild switch
    ```
 3. **The Needs review column** is on. It was checked before enabling
    (2026-10-14: 23 open PRs, 13 moved in the previous two weeks).
-   `python3 lib/project.py` re-runs that survey; if the column ever goes
-   stale, set `config.PROJECT["enabled"]` back to `False`.
+   `oss-board survey` re-runs that survey; if the column ever goes stale, set
+   `enabled` in `config::PROJECT` back to `false`.
