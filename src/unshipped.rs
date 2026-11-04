@@ -23,7 +23,7 @@ use chrono::NaiveDate;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::board::CardKey;
+use crate::board::{CardKey, GitHubItem};
 use crate::config::{self, LocalClone, Project, Repo};
 use crate::proc;
 use crate::snapshot::{self, Item, UpstreamPr};
@@ -73,7 +73,7 @@ pub struct IssueLink {
 #[derive(Clone, Debug)]
 pub enum Origin {
     ForkPr {
-        number: u64,
+        item: GitHubItem,
         url: String,
         additions: u64,
         deletions: u64,
@@ -84,13 +84,23 @@ pub enum Origin {
 #[derive(Clone, Debug)]
 pub struct Unshipped {
     pub repo: Repo,
-    pub key: CardKey,
     pub origin: Origin,
     pub title: String,
     pub branch: String,
     pub commits: usize,
     pub last: NaiveDate,
     pub issue: Option<IssueLink>,
+}
+
+impl Unshipped {
+    /// What its card is about. Two clones can both have a `fix-tests`, and they are not one
+    /// card.
+    pub fn key(&self) -> CardKey {
+        match &self.origin {
+            Origin::ForkPr { item, .. } => CardKey::GitHub(item.clone()),
+            Origin::Branch => CardKey::branch(&format!("{}/{}", self.repo.label(), self.branch)),
+        }
+    }
 }
 
 fn git(path: &Path, args: &[&str]) -> Result<String> {
@@ -192,7 +202,6 @@ fn link_issue<'a>(
 
 /// An open PR against your own fork.
 pub struct ForkPr {
-    pub number: u64,
     pub title: String,
     pub body: String,
     pub url: String,
@@ -218,7 +227,6 @@ struct ForkCommits {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForkNode {
-    number: u64,
     title: String,
     body: String,
     url: String,
@@ -232,7 +240,7 @@ struct ForkNode {
 }
 
 const FORK_FIELDS: &str = "
-  number title body url updatedAt additions deletions
+  title body url updatedAt additions deletions
   headRefName headRefOid author { login }
   commits(first: 1) { totalCount }
 ";
@@ -249,7 +257,6 @@ fn fork_prs(fork: Repo, me: &str) -> Result<Vec<ForkPr>> {
                 .is_some_and(|author| author.login.eq_ignore_ascii_case(me))
         })
         .map(|node| ForkPr {
-            number: node.number,
             title: node.title,
             body: node.body,
             url: node.url,
@@ -371,10 +378,9 @@ fn assemble(
         let text = format!("{}\n{}", pr.body, pr.title);
         items.push(Unshipped {
             repo,
-            key: snapshot::item_key(&pr.url)?,
             issue: link_of(&refs, &text, &words, issues),
             origin: Origin::ForkPr {
-                number: pr.number,
+                item: snapshot::github_item(&pr.url)?,
                 url: pr.url,
                 additions: pr.additions,
                 deletions: pr.deletions,
@@ -398,8 +404,6 @@ fn assemble(
         let text = format!("{}\n{}", branch.subjects.join("\n"), branch.title);
         items.push(Unshipped {
             repo,
-            // Two clones can both have a `fix-tests`, and they are not one card.
-            key: CardKey::branch(&format!("{}/{}", repo.label(), branch.branch)),
             issue: link_of(&refs, &text, &words, issues),
             origin: Origin::Branch,
             title: branch.title,
@@ -621,7 +625,6 @@ mod tests {
 
     fn fork_pr(number: u64, title: &str, branch: &str, head: &str) -> ForkPr {
         ForkPr {
-            number,
             title: title.to_owned(),
             body: String::new(),
             url: format!("https://github.com/lorenzolfm/Floresta/pull/{number}"),
@@ -670,21 +673,21 @@ mod tests {
         let issues = linkable_issues();
         let issues: Vec<&Item> = issues.iter().collect();
         let items = assemble(prs, &issues, &upstream, &clone_at(&repos.clone)).unwrap();
-        let keys: Vec<&CardKey> = items.iter().map(|u| &u.key).collect();
+        let keys: Vec<CardKey> = items.iter().map(Unshipped::key).collect();
         assert!(
-            !keys.contains(&&key("lorenzolfm/floresta#8")),
+            !keys.contains(&key("lorenzolfm/floresta#8")),
             "already upstream under its title: {keys:?}"
         );
         assert!(
-            keys.contains(&&key("lorenzolfm/floresta#6")),
+            keys.contains(&key("lorenzolfm/floresta#6")),
             "nobody upstream has seen it: {keys:?}"
         );
         assert!(
-            !keys.contains(&&CardKey::branch("floresta/shipped-as-pr")),
+            !keys.contains(&CardKey::branch("floresta/shipped-as-pr")),
             "upstream merged it as a PR: {keys:?}"
         );
         assert!(
-            keys.contains(&&CardKey::branch("floresta/dedup-config-parse")),
+            keys.contains(&CardKey::branch("floresta/dedup-config-parse")),
             "an unpushed branch stays: {keys:?}"
         );
     }
@@ -764,7 +767,7 @@ mod tests {
                 ..clone_at(&repos.clone)
             };
             let items = assemble(vec![], &[], &[], &local).unwrap();
-            items.into_iter().map(|u| u.key).collect::<Vec<_>>()
+            items.iter().map(Unshipped::key).collect::<Vec<_>>()
         };
         assert!(keys(FLORESTA).contains(&CardKey::branch("floresta/fix-tests")));
         assert!(keys(CDK).contains(&CardKey::branch("cdk/fix-tests")));

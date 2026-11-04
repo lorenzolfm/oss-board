@@ -205,7 +205,7 @@ fn seen_records<'de, D: Deserializer<'de>>(
 /// `fork#N` or a named branch, as a card says it.
 fn unshipped_name(u: &Unshipped, quote: &str) -> String {
     match &u.origin {
-        Origin::ForkPr { number, .. } => format!("fork#{number}"),
+        Origin::ForkPr { item, .. } => format!("fork#{}", item.number()),
         Origin::Branch => format!("{quote}{}{quote}", u.branch),
     }
 }
@@ -238,7 +238,7 @@ fn promote_unshipped<'a>(
         let text = format!("your {what} would fix this and never went upstream");
         let reason = Reason::standing(ReasonKind::Unshipped, at, text);
         obligations::add_reason(obs, issue, reason);
-        promoted.insert(u.key.clone());
+        promoted.insert(u.key());
     }
     promoted
 }
@@ -433,7 +433,7 @@ fn gather<'s>(
     let promoted = promote_unshipped(&mut obs, items, snap, me);
     // Work you have already done for an issue that is waiting on you is worth saying
     // on that card, even when it isn't yours enough to promote.
-    for u in items.iter().filter(|u| !promoted.contains(&u.key)) {
+    for u in items.iter().filter(|u| !promoted.contains(&u.key())) {
         let Some(number) = u.issue.as_ref().map(|issue| issue.number) else {
             continue;
         };
@@ -461,7 +461,8 @@ fn gather<'s>(
     let is_claimed = |key: &CardKey| claimed.iter().any(|claim| claim.key == *key);
     let shelf = read_unshipped.map(|items| {
         let keep = |u: &Unshipped| {
-            !promoted.contains(&u.key) && !tombstones.contains(&u.key) && !is_claimed(&u.key)
+            let key = u.key();
+            !promoted.contains(&key) && !tombstones.contains(&key) && !is_claimed(&key)
         };
         items.into_iter().filter(|u| keep(u)).collect()
     });

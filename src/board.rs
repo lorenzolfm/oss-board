@@ -89,6 +89,12 @@ pub struct GitHubItem {
 }
 
 impl GitHubItem {
+    /// The issue or PR at the first GitHub URL in `text`.
+    pub fn of_url(text: &str) -> Option<Self> {
+        let found = URL_RE.captures(text)?;
+        Self::from_captures(&found)
+    }
+
     pub fn owner(&self) -> &str {
         &self.owner
     }
@@ -126,10 +132,8 @@ pub enum CardKey {
 }
 
 impl CardKey {
-    /// The issue or PR at the first GitHub URL in `text`.
     pub fn of_url(text: &str) -> Option<Self> {
-        let found = URL_RE.captures(text)?;
-        GitHubItem::from_captures(&found).map(Self::GitHub)
+        GitHubItem::of_url(text).map(Self::GitHub)
     }
 
     pub fn branch(name: &str) -> Self {
@@ -876,9 +880,9 @@ mod tests {
                     owner: "getfloresta",
                     name: "Floresta",
                 },
-                key: key("lorenzolfm/floresta#6"),
                 origin: Origin::ForkPr {
-                    number: 6,
+                    item: GitHubItem::of_url("https://github.com/lorenzolfm/Floresta/pull/6")
+                        .unwrap(),
                     url: "https://github.com/lorenzolfm/Floresta/pull/6".to_owned(),
                     additions: 1,
                     deletions: 0,

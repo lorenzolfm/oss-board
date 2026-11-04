@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::board::CardKey;
+use crate::board::{CardKey, GitHubItem};
 use crate::config::{Project, Repo};
 use crate::gh::{self, Conn, GhError, Login, Page};
 use crate::timestamp::Timestamp;
@@ -363,9 +363,13 @@ pub fn fold_reviews(comments: &mut Vec<Comment>, reviews: &[Review]) {
     comments.sort_by_key(|comment| comment.at);
 }
 
-/// The key of an item, from the URL GitHub gave for it.
+/// An issue or PR, from the URL GitHub gave for it.
+pub fn github_item(url: &str) -> Result<GitHubItem, GhError> {
+    GitHubItem::of_url(url).ok_or_else(|| GhError(format!("not an issue or PR url: {url}")))
+}
+
 pub fn item_key(url: &str) -> Result<CardKey, GhError> {
-    CardKey::of_url(url).ok_or_else(|| GhError(format!("not an issue or PR url: {url}")))
+    github_item(url).map(CardKey::GitHub)
 }
 
 // ---------------------------------------------------------------- the wire

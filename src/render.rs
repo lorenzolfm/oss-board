@@ -175,12 +175,13 @@ pub fn unshipped_card(u: &Unshipped) -> Card {
     let repo = u.repo.label();
     let head = match &u.origin {
         Origin::ForkPr {
-            number,
+            item,
             url,
             additions,
             deletions,
         } => format!(
-            "[{repo} fork#{number}]({url}) {} · +{additions}/-{deletions} · {} commit{} · last {}",
+            "[{repo} fork#{}]({url}) {} · +{additions}/-{deletions} · {} commit{} · last {}",
+            item.number(),
             prefix(&u.title, 80),
             u.commits,
             plural(u.commits),
@@ -202,7 +203,7 @@ pub fn unshipped_card(u: &Unshipped) -> Card {
         };
         format!(" · {verb} [#{}]({})", issue.number, issue.url)
     });
-    Card::with_key(&format!("⚡ {head}{link}"), &u.key)
+    Card::with_key(&format!("⚡ {head}{link}"), &u.key())
 }
 
 // ---------------------------------------------------------------- DM
