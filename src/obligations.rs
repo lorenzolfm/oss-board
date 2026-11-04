@@ -465,8 +465,18 @@ fn thread_wait<'t>(
     Some((*first, newest))
 }
 
-/// What dates an open thread on your own PR, if it still counts. Dated by what someone else
-/// said: your own reply and a bot's are no new trigger.
+/// When someone else last said anything in this thread. Your own reply and a bot's are no new
+/// trigger.
+pub fn others_last_word(thread: &Thread, me: &Viewer) -> Option<Timestamp> {
+    thread
+        .comments
+        .iter()
+        .filter(|c| !me.is(&c.author) && !c.bot)
+        .map(|c| c.at)
+        .max()
+}
+
+/// What dates an open thread on your own PR, if it still counts.
 fn own_thread_said(
     thread: &Thread,
     me: &Viewer,
@@ -476,11 +486,7 @@ fn own_thread_said(
     if thread.resolved {
         return None;
     }
-    let others = thread
-        .comments
-        .iter()
-        .filter(|c| !me.is(&c.author) && !c.bot);
-    let said = others.map(|c| c.at).max();
+    let said = others_last_word(thread, me);
     if threads_block_merge {
         // It has to be resolved all the same, so with nothing else in it, it is dated from
         // when it opened.
