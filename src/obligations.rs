@@ -209,7 +209,7 @@ impl<'a> Obligation<'a> {
 
     /// Longest-waiting first. A state with no visible start (a conflict) sorts by
     /// when the item last moved, so it neither jumps the queue nor sinks.
-    fn sort_key(&self) -> Timestamp {
+    pub fn sort_key(&self) -> Timestamp {
         self.reasons
             .iter()
             .filter_map(Reason::since)
@@ -486,13 +486,13 @@ fn own_pr(
     me: &Viewer,
     now: DateTime<Utc>,
     merge: Option<&MergeState>,
+    threads_block_merge: bool,
 ) -> Vec<Reason> {
     if !me.is(&item.author) {
         return Vec::new();
     }
     let mut out = Vec::new();
-    // Dated by what someone else said. Your own reply and a bot's are no new trigger, and a
-    // thread with nothing else in it is dated from when it opened.
+    // Dated by what someone else said. Your own reply and a bot's are no new trigger.
     let lasts: Vec<Timestamp> = pr
         .threads
         .iter()
@@ -500,17 +500,24 @@ fn own_pr(
         .filter_map(|t| {
             let others = t.comments.iter().filter(|c| !me.is(&c.author) && !c.bot);
             let said = others.map(|c| c.at).max();
-            said.or_else(|| t.comments.iter().map(|c| c.at).min())
+            if threads_block_merge {
+                // It has to be resolved all the same, so with nothing else in it, it is
+                // dated from when it opened.
+                said.or_else(|| t.comments.iter().map(|c| c.at).min())
+            } else {
+                said.filter(|at| is_live(*at, now))
+            }
         })
         .collect();
     if let (Some(oldest), Some(newest)) = (lasts.iter().min(), lasts.iter().max()) {
         let n = lasts.len();
-        // The ruleset refuses to merge with an open thread, even a typo nit.
-        let text = format!(
-            "{n} unresolved thread{} block{} merge",
-            plural(n),
-            if n == 1 { "s" } else { "" }
-        );
+        let text = if threads_block_merge {
+            // The ruleset refuses to merge with an open thread, even a typo nit.
+            let verb = if n == 1 { "blocks" } else { "block" };
+            format!("{n} unresolved thread{} {verb} merge", plural(n))
+        } else {
+            format!("{n} unresolved thread{}", plural(n))
+        };
         out.push(Reason::between(
             ReasonKind::UnresolvedThread,
             *oldest,
@@ -556,7 +563,7 @@ fn own_pr(
 
     if let Some(merge) = merge {
         if merge.is_conflicting() {
-            let text = "conflicts with master, needs a rebase".to_owned();
+            let text = "conflicts with its base, needs a rebase".to_owned();
             out.push(Reason::on_head(ReasonKind::Conflict, pr, None, text));
         }
         if merge.is_red() {
@@ -613,7 +620,7 @@ fn stale_ack(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec
 
 /// Rule 5: assigned to you and nothing links a fix yet.
 fn assigned(item: &Item, issue: &IssueDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
-    if !item.assignees.iter().any(|login| me.is(login)) || !issue.linked_prs.is_empty() {
+    if !item.assignees.iter().any(|login| me.is(login)) || issue.has_linked_pr {
         return Vec::new();
     }
     let at = issue
@@ -665,7 +672,7 @@ pub fn collect<'a>(
     snap: &'a Snapshot,
     me: &Viewer,
     now: DateTime<Utc>,
-    merge: &HashMap<u64, MergeState>,
+    merge: &HashMap<CardKey, MergeState>,
 ) -> Vec<Obligation<'a>> {
     let mut out = Vec::new();
     for item in &snap.items {
@@ -674,7 +681,8 @@ pub fn collect<'a>(
                 let mut reasons = review_request(item, pr, me, now);
                 reasons.extend(conversation(item, me, now));
                 reasons.extend(threads(item, pr, me, now));
-                reasons.extend(own_pr(item, pr, me, now, merge.get(&item.number)));
+                let blocks = snap.project.threads_block_merge;
+                reasons.extend(own_pr(item, pr, me, now, merge.get(&item.key), blocks));
                 reasons.extend(stale_ack(item, pr, me, now));
                 reasons.extend(pending_review(pr, me, now));
                 reasons
@@ -695,7 +703,7 @@ pub fn collect<'a>(
 
 /// Attach a reason to the item's obligation, creating it if needed.
 pub fn add_reason<'a>(obs: &mut Vec<Obligation<'a>>, item: &'a Item, reason: Reason) {
-    if let Some(ob) = obs.iter_mut().find(|ob| ob.item.number == item.number) {
+    if let Some(ob) = obs.iter_mut().find(|ob| ob.item.key == item.key) {
         ob.reasons.push(reason);
         return;
     }
@@ -904,11 +912,17 @@ mod tests {
     //! conversation).
 
     use super::*;
-    use crate::snapshot::{Ci, Comment, Mergeability};
-    use crate::testkit::{ME, bot, c, day, issue, me, now, pr, review, snap, thread};
+    use crate::snapshot::{Ci, Comment, Mergeability, Thread};
+    use crate::testkit::{
+        ME, bot, c, day, floresta, issue, key, me, now, pr, review, snap, thread,
+    };
 
-    fn merge_of(number: u64, mergeable: Mergeability, ci: Option<Ci>) -> HashMap<u64, MergeState> {
-        HashMap::from([(number, MergeState { mergeable, ci })])
+    fn merge_of(
+        number: u64,
+        mergeable: Mergeability,
+        ci: Option<Ci>,
+    ) -> HashMap<CardKey, MergeState> {
+        HashMap::from([(floresta(number), MergeState { mergeable, ci })])
     }
 
     #[test]
@@ -932,7 +946,7 @@ mod tests {
         }
     }
 
-    fn kinds_with(item: Item, merge: &HashMap<u64, MergeState>) -> Vec<&'static str> {
+    fn kinds_with(item: Item, merge: &HashMap<CardKey, MergeState>) -> Vec<&'static str> {
         let viewer = me();
         let snapshot = match item.detail {
             Detail::Pr(_) => snap(vec![item], vec![]),
@@ -1057,7 +1071,7 @@ mod tests {
             ),
             (
                 "an assigned issue with a fix linked is not idle",
-                issue(12).assigned(ME, day(5)).linked_pr(1327),
+                issue(12).assigned(ME, day(5)).linked_pr(),
                 vec![],
             ),
             (
@@ -1147,6 +1161,85 @@ mod tests {
         ]);
     }
 
+    /// What your own PR with these threads says on a project's board.
+    fn thread_reasons(project: &'static config::Project, threads: Vec<Thread>) -> Vec<String> {
+        let viewer = me();
+        let repo = project.repo.to_string();
+        let item = pr(1).author(ME).in_repo(&repo).threads(threads);
+        let snapshot = Snapshot {
+            project,
+            items: vec![item],
+        };
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let reasons = obs.iter().flat_map(|ob| &ob.reasons);
+        reasons.map(|reason| reason.text.clone()).collect()
+    }
+
+    #[test]
+    fn floresta_says_a_thread_blocks_merge_because_its_ruleset_refuses() {
+        let floresta = &config::PROJECTS[0];
+        let nit = || thread(vec![c("bob", 3, "a nit")]);
+        assert_eq!(
+            thread_reasons(floresta, vec![nit()]),
+            ["1 unresolved thread blocks merge"]
+        );
+        assert_eq!(
+            thread_reasons(floresta, vec![nit(), nit()]),
+            ["2 unresolved threads block merge"]
+        );
+    }
+
+    /// cdk merges with a thread open, so one is only a conversation there: someone else has
+    /// to have said something in it, and lately.
+    #[test]
+    fn where_a_thread_cannot_block_merge_it_is_only_a_conversation() {
+        let cases: Vec<(&str, Vec<Thread>, Vec<&str>)> = vec![
+            (
+                "someone said something lately",
+                vec![thread(vec![c("bob", 3, "a nit")])],
+                vec!["1 unresolved thread"],
+            ),
+            (
+                "only the threads still live are counted",
+                vec![
+                    thread(vec![c("bob", 3, "a nit")]),
+                    thread(vec![c("carol", 5, "a nit")]),
+                    thread(vec![c("dave", 30, "a nit")]),
+                ],
+                vec!["2 unresolved threads"],
+            ),
+            (
+                "it went quiet",
+                vec![thread(vec![c("bob", 30, "a nit")])],
+                vec![],
+            ),
+            (
+                "your own reply does not keep it going",
+                vec![thread(vec![c("bob", 30, "a nit"), c(ME, 1, "done")])],
+                vec![],
+            ),
+            (
+                "someone else speaking again brings it back",
+                vec![thread(vec![c("bob", 30, "a nit"), c("carol", 2, "still?")])],
+                vec!["1 unresolved thread"],
+            ),
+            (
+                "only your own words",
+                vec![thread(vec![c(ME, 3, "a note for reviewers")])],
+                vec![],
+            ),
+            (
+                "only a review bot's",
+                vec![thread(vec![bot("chatgpt-codex-connector", 3, "a nit")])],
+                vec![],
+            ),
+        ];
+        let cdk = &config::PROJECTS[1];
+        for (name, threads, want) in cases {
+            assert_eq!(thread_reasons(cdk, threads), want, "{name}");
+        }
+    }
+
     #[test]
     fn conflicts_and_red_ci_come_from_merge_state() {
         let merge = merge_of(28, Mergeability::Conflicting, Some(Ci::Failure));
@@ -1154,6 +1247,19 @@ mod tests {
             kinds_with(pr(28).author(ME).draft(), &merge),
             ["ci_failed", "conflict"]
         );
+    }
+
+    /// Two repos' #28 are two PRs, so one's state says nothing about the other.
+    #[test]
+    fn a_merge_state_belongs_to_the_item_not_its_number() {
+        let conflict = MergeState {
+            mergeable: Mergeability::Conflicting,
+            ci: None,
+        };
+        let merge = HashMap::from([(key("cashubtc/cdk#28"), conflict)]);
+        assert!(kinds_with(pr(28).author(ME), &merge).is_empty());
+        let on_cdk = pr(28).author(ME).in_repo("cashubtc/cdk");
+        assert_eq!(kinds_with(on_cdk, &merge), ["conflict"]);
     }
 
     #[test]
@@ -1385,7 +1491,7 @@ mod tests {
         let merge = merge_of(52, Mergeability::Conflicting, None);
         let order: Vec<u64> = collect(&snapshot, &viewer, now(), &merge)
             .iter()
-            .map(|ob| ob.item.number)
+            .map(|ob| ob.item.number())
             .collect();
         assert_eq!(order, [51, 53, 52, 50]);
     }
@@ -1532,7 +1638,7 @@ mod tests {
     /// The numbers the DM would carry, given a model that always says the same thing.
     fn asking(
         item: Item,
-        merge: &HashMap<u64, MergeState>,
+        merge: &HashMap<CardKey, MergeState>,
         seen: &BTreeMap<CardKey, Seen>,
         verdict: Option<bool>,
     ) -> Vec<u64> {
@@ -1541,11 +1647,11 @@ mod tests {
         let obs = collect(&snapshot, &viewer, now(), merge);
         new_asks(&obs, seen, |_| verdict)
             .iter()
-            .map(|ob| ob.item.number)
+            .map(|ob| ob.item.number())
             .collect()
     }
 
-    fn seen_on(item: Item, merge: &HashMap<u64, MergeState>) -> BTreeMap<CardKey, Seen> {
+    fn seen_on(item: Item, merge: &HashMap<CardKey, MergeState>) -> BTreeMap<CardKey, Seen> {
         let viewer = me();
         let snapshot = snap(vec![item], vec![]);
         seen_of(&collect(&snapshot, &viewer, now(), merge))
@@ -1655,12 +1761,12 @@ mod tests {
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let waiting = new_asks(&obs, &told, |_| None);
         let (shown, held) = waiting.split_at(1);
-        assert_eq!(shown[0].item.number, 95);
+        assert_eq!(shown[0].item.number(), 95);
 
         let seen = seen_after(&obs, held, &told, &[]);
         let next: Vec<u64> = new_asks(&obs, &seen, |_| None)
             .iter()
-            .map(|ob| ob.item.number)
+            .map(|ob| ob.item.number())
             .collect();
         assert_eq!(next, [99, 96], "new when held, with a record or without");
     }
@@ -1669,7 +1775,7 @@ mod tests {
     /// that read `between` with these kinds unread.
     fn conflict_after(
         between: Item,
-        between_merge: &HashMap<u64, MergeState>,
+        between_merge: &HashMap<CardKey, MergeState>,
         unread: &[ReasonKind],
         next: Item,
     ) -> Vec<u64> {

@@ -42,6 +42,7 @@ use anyhow::{Context, Result, bail};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+use crate::config;
 use crate::obligations::{Fingerprint, ReasonKind, Seen};
 use crate::timestamp::Timestamp;
 
@@ -88,6 +89,12 @@ pub struct GitHubItem {
 }
 
 impl GitHubItem {
+    /// The issue or PR at the first GitHub URL in `text`.
+    pub fn of_url(text: &str) -> Option<Self> {
+        let found = URL_RE.captures(text)?;
+        Self::from_captures(&found)
+    }
+
     pub fn owner(&self) -> &str {
         &self.owner
     }
@@ -107,6 +114,14 @@ impl GitHubItem {
             number: found[3].parse().ok()?,
         })
     }
+
+    /// In one of the repos you work in, not a fork of one.
+    fn is_upstream(&self) -> bool {
+        config::PROJECTS.iter().any(|project| {
+            self.owner.eq_ignore_ascii_case(project.repo.owner)
+                && self.name.eq_ignore_ascii_case(project.repo.name)
+        })
+    }
 }
 
 /// What a card is about.
@@ -117,14 +132,22 @@ pub enum CardKey {
 }
 
 impl CardKey {
-    /// The issue or PR at the first GitHub URL in `text`.
     pub fn of_url(text: &str) -> Option<Self> {
-        let found = URL_RE.captures(text)?;
-        GitHubItem::from_captures(&found).map(Self::GitHub)
+        GitHubItem::of_url(text).map(Self::GitHub)
     }
 
     pub fn branch(name: &str) -> Self {
         Self::Branch(name.to_owned())
+    }
+
+    /// What a card or the DM calls it: `cdk#2778`. A bare number could be any repo's, and
+    /// a fork has its upstream's name but not its numbers, so its owner stays.
+    pub fn short(&self) -> String {
+        match self {
+            Self::GitHub(item) if item.is_upstream() => format!("{}#{}", item.name, item.number),
+            Self::GitHub(_) => self.to_string(),
+            Self::Branch(name) => name.clone(),
+        }
     }
 
     /// The issue or PR, for a key GitHub can be asked about.
@@ -564,9 +587,10 @@ mod tests {
     //! on.
 
     use super::*;
+    use crate::config::Repo;
     use crate::obligations::{self, is_muted};
     use crate::render;
-    use crate::testkit::{ME, c, day, key, me, now, opportunity, pr, snap, thread};
+    use crate::testkit::{ME, c, day, floresta, key, me, now, opportunity, pr, snap, thread};
     use crate::unshipped::{IssueLink, LinkHow, Origin, Unshipped};
     use chrono::NaiveDate;
     use tempfile::TempDir;
@@ -815,6 +839,19 @@ mod tests {
         }
     }
 
+    /// A DM line has no link on it, so its name is all that says which item it means.
+    #[test]
+    fn a_short_name_tells_a_fork_from_its_upstream() {
+        for (text, want) in [
+            ("getfloresta/Floresta#6", "floresta#6"),
+            ("cashubtc/cdk#6", "cdk#6"),
+            ("lorenzolfm/floresta#6", "lorenzolfm/floresta#6"),
+            ("branch:cdk/wip", "cdk/wip"),
+        ] {
+            assert_eq!(key(text).short(), want, "{text}");
+        }
+    }
+
     #[test]
     fn every_rendered_card_yields_its_key_back_through_the_parser() {
         let viewer = me();
@@ -839,9 +876,13 @@ mod tests {
             );
 
             let fork = Unshipped {
-                key: key("lorenzolfm/floresta#6"),
+                repo: Repo {
+                    owner: "getfloresta",
+                    name: "Floresta",
+                },
                 origin: Origin::ForkPr {
-                    number: 6,
+                    item: GitHubItem::of_url("https://github.com/lorenzolfm/Floresta/pull/6")
+                        .unwrap(),
                     url: "https://github.com/lorenzolfm/Floresta/pull/6".to_owned(),
                     additions: 1,
                     deletions: 0,
@@ -851,7 +892,7 @@ mod tests {
                 commits: 1,
                 last: NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(),
                 issue: Some(IssueLink {
-                    number: 1308,
+                    key: floresta(1308),
                     url: format!("{F}/issues/1308"),
                     how: LinkHow::Guess,
                 }),
@@ -882,7 +923,11 @@ mod tests {
             vec![],
         );
         let obs = obligations::collect(&snapshot, &viewer, now(), &HashMap::new());
-        let of = |number| obs.iter().find(|ob| ob.item.number == number).unwrap();
+        let of = |number| {
+            obs.iter()
+                .find(|ob| ob.item.key == floresta(number))
+                .unwrap()
+        };
         let line = render::ob_card(of(71), None);
         assert_eq!(line.as_str().lines().count(), 1);
 
@@ -964,7 +1009,7 @@ mod tests {
     #[test]
     fn muting_an_item_twice_counts_both_cards_in_either_order() {
         let viewer = me();
-        let merge = HashMap::from([(61, crate::snapshot::MergeState::conflicting())]);
+        let merge = HashMap::from([(floresta(61), crate::snapshot::MergeState::conflicting())]);
         let snapshot = snap(vec![pr(61).author(ME).pushed_at(day(2))], vec![]);
         let obs = obligations::collect(&snapshot, &viewer, now(), &merge);
         let dragged = render::ob_card(&obs[0], None).as_str().to_owned();
@@ -1000,7 +1045,7 @@ mod tests {
     #[test]
     fn an_old_card_with_no_head_does_not_hold_a_state_on_any_head() {
         let viewer = me();
-        let merge = HashMap::from([(61, crate::snapshot::MergeState::red())]);
+        let merge = HashMap::from([(floresta(61), crate::snapshot::MergeState::red())]);
         let snapshot = snap(vec![pr(61).author(ME)], vec![]);
         let obs = obligations::collect(&snapshot, &viewer, now(), &merge);
         let passed = [format!("- [ ] c [#61]({F}/pull/61) <!--t:|ci_failed-->")];

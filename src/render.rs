@@ -134,9 +134,9 @@ pub fn ob_card(ob: &Obligation<'_>, gist: Option<&str>) -> Card {
     };
     let tail = gist.map_or(String::new(), |gist| format!(" *({gist})*"));
     let body = format!(
-        "{} [#{}]({}) {} · {}{size_text}{tail}",
+        "{} [{}]({}) {} · {}{size_text}{tail}",
         ob_icon(ob),
-        item.number,
+        item.key.short(),
         item.url,
         prefix(&item.title, 80),
         reasons_text(ob),
@@ -162,9 +162,9 @@ pub fn opp_card(o: &Opportunity<'_>, why: Option<&str>) -> Card {
     }
     let tail = why.map_or(String::new(), |why| format!(" *({why})*"));
     Card::plain(&format!(
-        "{} [#{}]({}) {} · {}{tail}",
+        "{} [{}]({}) {} · {}{tail}",
         opp_icon(o),
-        item.number,
+        item.key.short(),
         item.url,
         prefix(&item.title, 80),
         bits.join(" · ")
@@ -172,21 +172,23 @@ pub fn opp_card(o: &Opportunity<'_>, why: Option<&str>) -> Card {
 }
 
 pub fn unshipped_card(u: &Unshipped) -> Card {
+    let repo = u.repo.label();
     let head = match &u.origin {
         Origin::ForkPr {
-            number,
+            item,
             url,
             additions,
             deletions,
         } => format!(
-            "[fork#{number}]({url}) {} · +{additions}/-{deletions} · {} commit{} · last {}",
+            "[{repo} fork#{}]({url}) {} · +{additions}/-{deletions} · {} commit{} · last {}",
+            item.number(),
             prefix(&u.title, 80),
             u.commits,
             plural(u.commits),
             u.last
         ),
         Origin::Branch => format!(
-            "`{}` {} · {} commit{} · last {} · no PR anywhere",
+            "{repo} `{}` {} · {} commit{} · last {} · no PR anywhere",
             u.branch,
             prefix(&u.title, 70),
             u.commits,
@@ -199,9 +201,9 @@ pub fn unshipped_card(u: &Unshipped) -> Card {
             LinkHow::Refs => "fixes",
             LinkHow::Guess => "probably fixes",
         };
-        format!(" · {verb} [#{}]({})", issue.number, issue.url)
+        format!(" · {verb} [{}]({})", issue.key.short(), issue.url)
     });
-    Card::with_key(&format!("⚡ {head}{link}"), &u.key)
+    Card::with_key(&format!("⚡ {head}{link}"), &u.key())
 }
 
 // ---------------------------------------------------------------- DM
@@ -229,7 +231,7 @@ impl Dm<'_, '_> {
             || format!("{} · {}", prefix(&item.title, 70), reasons_text(ob)),
             |gist| gist.text.clone(),
         );
-        lines.push(format!("#{} {said}{place}", item.number));
+        lines.push(format!("{} {said}{place}", item.key.short()));
         lines.push(item.url.clone());
     }
 
@@ -238,7 +240,7 @@ impl Dm<'_, '_> {
             0 => "nothing new".to_owned(),
             n => format!("{n} new"),
         };
-        let mut lines = vec![format!("Floresta · {new} · {} on the board", self.on_board)];
+        let mut lines = vec![format!("OSS · {new} · {} on the board", self.on_board)];
         for alert in self.claim_alerts {
             lines.push(format!("⚠ {alert}"));
         }
@@ -290,7 +292,7 @@ mod tests {
     fn a_quiet_morning_is_one_line() {
         assert_eq!(
             message(&[], &BTreeMap::new(), &[]),
-            "Floresta · nothing new · 2 on the board"
+            "OSS · nothing new · 2 on the board"
         );
     }
 
@@ -306,8 +308,8 @@ mod tests {
         let gists = BTreeMap::from([(obs[0].item.key.clone(), gist)]);
         assert_eq!(
             message(&[&obs[0]], &gists, &[]),
-            "Floresta · 1 new · 2 on the board\n\n\
-             #7 wants a yes/no\n\
+            "OSS · 1 new · 2 on the board\n\n\
+             floresta#7 wants a yes/no\n\
              https://github.com/getfloresta/Floresta/pull/7"
         );
     }
@@ -318,7 +320,10 @@ mod tests {
         let snapshot = snap(vec![pr(7).requested(ME, &day(1).to_string())], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let text = message(&[&obs[0]], &BTreeMap::new(), &[]);
-        assert!(text.contains("#7 pr 7 · review requested 1d ago"), "{text}");
+        assert!(
+            text.contains("floresta#7 pr 7 · review requested 1d ago"),
+            "{text}"
+        );
         assert!(text.contains("not filtered"), "{text}");
     }
 

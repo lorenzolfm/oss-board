@@ -44,7 +44,9 @@ struct ClaimedPr {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CrossReference {
+    is_cross_repository: bool,
     source: ReferenceSource,
 }
 
@@ -79,7 +81,7 @@ fn alias_query(alias: usize, item: &GitHubItem) -> String {
         state closedAt
         assignees(first: 5) {{ nodes {{ login }} }}
         timelineItems(last: 20, itemTypes: [CROSS_REFERENCED_EVENT]) {{
-          nodes {{ ... on CrossReferencedEvent {{ source {{
+          nodes {{ ... on CrossReferencedEvent {{ isCrossRepository source {{
             __typename
             ... on PullRequest {{ number state author {{ login }} }}
           }} }} }}
@@ -154,7 +156,10 @@ fn interpret_issue(issue: ClaimedIssue, me: &str, status: &mut Status) {
         status.notes.push(format!("assigned to {other}"));
         status.urgent = true;
     }
-    for event in issue.timeline_items.into_nodes() {
+    // A PR elsewhere that mentions this issue is not a fix for it here, and its number
+    // would name something else in this repo. A PR from a fork lands here, so it counts.
+    let events = issue.timeline_items.into_nodes();
+    for event in events.filter(|event| !event.is_cross_repository) {
         let ReferenceSource::PullRequest(source) = event.source else {
             continue;
         };
@@ -245,8 +250,9 @@ mod tests {
                     Value::Null,
                     json!([]),
                     json!([
-                        {"source": {"__typename": "Issue"}},
-                        {"source": {"__typename": "PullRequest", "number": 9, "state": "OPEN",
+                        {"isCrossRepository": false, "source": {"__typename": "Issue"}},
+                        {"isCrossRepository": false,
+                         "source": {"__typename": "PullRequest", "number": 9, "state": "OPEN",
                                     "author": {"login": "bob"}}},
                     ]),
                 ),
@@ -260,8 +266,24 @@ mod tests {
                     Value::Null,
                     json!([]),
                     json!([
-                        {"source": {"__typename": "PullRequest", "number": 9, "state": "OPEN",
+                        {"isCrossRepository": false,
+                         "source": {"__typename": "PullRequest", "number": 9, "state": "OPEN",
                                     "author": {"login": "me"}}},
+                    ]),
+                ),
+                vec![],
+                false,
+            ),
+            (
+                "a PR in another repo only mentions it",
+                issue(
+                    "OPEN",
+                    Value::Null,
+                    json!([]),
+                    json!([
+                        {"isCrossRepository": true,
+                         "source": {"__typename": "PullRequest", "number": 9, "state": "OPEN",
+                                    "author": {"login": "bob"}}},
                     ]),
                 ),
                 vec![],
@@ -318,6 +340,12 @@ mod tests {
             json!({"__typename": "Discussion"}),
             json!({"__typename": "Issue", "state": "OPEN"}),
             json!({"__typename": "PullRequest", "state": "DRAFTED", "mergedAt": null, "author": null}),
+            issue(
+                "OPEN",
+                Value::Null,
+                json!([]),
+                json!([{"source": {"__typename": "Issue"}}]),
+            ),
         ] {
             assert!(
                 serde_json::from_value::<Claimed>(node.clone()).is_err(),

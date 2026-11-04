@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::board::CardKey;
-use crate::config::Repo;
+use crate::board::{CardKey, GitHubItem};
+use crate::config::{Project, Repo};
 use crate::gh::{self, Conn, GhError, Login, Page};
 use crate::timestamp::Timestamp;
 
@@ -156,7 +156,8 @@ pub struct PrDetail {
 #[derive(Clone, Debug)]
 pub struct IssueDetail {
     pub assigned_at: HashMap<String, Timestamp>,
-    pub linked_prs: Vec<u64>,
+    /// An open PR says it closes this.
+    pub has_linked_pr: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +169,9 @@ pub enum Detail {
 #[derive(Clone, Debug)]
 pub struct Item {
     pub key: CardKey,
-    pub number: u64,
+    /// Only the queries in this file spell it. Numbers repeat between repos, so everywhere
+    /// else an item is its key.
+    number: u64,
     pub title: String,
     pub url: String,
     pub author: String,
@@ -202,10 +205,50 @@ impl Item {
     pub fn head(&self) -> Option<&str> {
         self.pr().map(|pr| pr.head.as_str())
     }
+
+    /// Whether a number read from text about this item's repo names it.
+    pub fn is_number(&self, number: u64) -> bool {
+        self.number == number
+    }
 }
 
-/// Every open item, PRs first. One list, so nothing can be filed under the wrong kind.
+#[cfg(test)]
+impl Item {
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
+    pub fn fixture(
+        number: u64,
+        title: String,
+        url: String,
+        created: Timestamp,
+        updated: Timestamp,
+        detail: Detail,
+    ) -> Self {
+        Self {
+            key: item_key(&url).unwrap(),
+            number,
+            title,
+            url,
+            author: "alice".to_owned(),
+            author_bot: false,
+            created,
+            updated,
+            body: String::new(),
+            milestone: None,
+            labels: vec![],
+            assignees: vec![],
+            comments: vec![],
+            detail,
+        }
+    }
+}
+
+/// Every open item in one repo, PRs first. One list, so nothing can be filed under the wrong
+/// kind, and it says whose, so nothing can ask one repo about another's.
 pub struct Snapshot {
+    pub project: &'static Project,
     pub items: Vec<Item>,
 }
 
@@ -306,23 +349,23 @@ impl MergeState {
 /// What `merge_state` could and could not find out.
 #[derive(Debug, Default)]
 pub struct MergeRead {
-    pub states: HashMap<u64, MergeState>,
-    pub unread: Vec<u64>,
+    pub states: HashMap<CardKey, MergeState>,
+    pub unread: Vec<CardKey>,
 }
 
 impl MergeRead {
     /// PRs GitHub has not finished testing for conflicts. It answers `UNKNOWN` while it
-    /// recomputes, as it does after master moves, so these say nothing about a conflict
+    /// recomputes, as it does after the base moves, so these say nothing about a conflict
     /// either way. Their CI was read.
-    pub fn computing(&self) -> Vec<u64> {
-        let mut numbers: Vec<u64> = self
+    pub fn computing(&self) -> Vec<&CardKey> {
+        let mut keys: Vec<&CardKey> = self
             .states
             .iter()
             .filter(|(_, state)| state.mergeable == Mergeability::Unknown)
-            .map(|(number, _)| *number)
+            .map(|(key, _)| key)
             .collect();
-        numbers.sort_unstable();
-        numbers
+        keys.sort_unstable();
+        keys
     }
 }
 
@@ -333,7 +376,7 @@ pub struct UpstreamPr {
     pub commits: HashSet<String>,
 }
 
-/// What changed between the commit you ACKed and the head, wherever in master
+/// What changed between the commit you ACKed and the head, wherever in the base
 /// each sits.
 #[derive(Clone, Debug)]
 pub struct Interdiff {
@@ -363,9 +406,13 @@ pub fn fold_reviews(comments: &mut Vec<Comment>, reviews: &[Review]) {
     comments.sort_by_key(|comment| comment.at);
 }
 
-/// The key of an item, from the URL GitHub gave for it.
+/// An issue or PR, from the URL GitHub gave for it.
+pub fn github_item(url: &str) -> Result<GitHubItem, GhError> {
+    GitHubItem::of_url(url).ok_or_else(|| GhError(format!("not an issue or PR url: {url}")))
+}
+
 pub fn item_key(url: &str) -> Result<CardKey, GhError> {
-    CardKey::of_url(url).ok_or_else(|| GhError(format!("not an issue or PR url: {url}")))
+    github_item(url).map(CardKey::GitHub)
 }
 
 // ---------------------------------------------------------------- the wire
@@ -608,10 +655,9 @@ struct AssignedEvent {
     assignee: Option<Login>,
 }
 
+/// That there is one is all the rules read.
 #[derive(Deserialize)]
-struct LinkedPrNode {
-    number: u64,
-}
+struct LinkedPrNode {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -665,11 +711,11 @@ impl TryFrom<IssueNode> for Item {
             comments,
             detail: Detail::Issue(IssueDetail {
                 assigned_at,
-                linked_prs: n
+                has_linked_pr: n
                     .closed_by_pull_requests_references
                     .into_nodes()
-                    .map(|p| p.number)
-                    .collect(),
+                    .next()
+                    .is_some(),
             }),
         })
     }
@@ -708,13 +754,15 @@ pub fn page_through<T: DeserializeOwned>(
     }
 }
 
-/// Every open item in `repo`.
-pub fn fetch(repo: Repo) -> Result<Snapshot, GhError> {
+/// Every open item in `project`'s repo.
+pub fn fetch(project: &'static Project) -> Result<Snapshot, GhError> {
+    let repo = project.repo;
     let prs: Vec<PrNode> = page_through(repo, "pullRequests", PR_FIELDS, PR_PAGE)?;
     let issues: Vec<IssueNode> = page_through(repo, "issues", ISSUE_FIELDS, ISSUE_PAGE)?;
     let prs = prs.into_iter().map(Item::try_from);
     let issues = issues.into_iter().map(Item::try_from);
     Ok(Snapshot {
+        project,
         items: prs.chain(issues).collect::<Result<_, _>>()?,
     })
 }
@@ -755,47 +803,51 @@ impl From<MergeNode> for MergeState {
     }
 }
 
-/// `mergeable` and the CI rollup for just these PRs. What could not be read is listed
-/// as such, because it cannot be told from a PR with nothing wrong with it.
-pub fn merge_state(repo: Repo, numbers: &[u64]) -> MergeRead {
-    let Repo { owner, name } = repo;
-    let mut read = MergeRead::default();
-    let numbers: Vec<u64> = numbers
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    for chunk in numbers.chunks(MERGE_CHUNK) {
-        let body: String = chunk
-            .iter()
-            .map(|n| {
-                format!(
-                    r#"
+impl Snapshot {
+    /// `mergeable` and the CI rollup for just the PRs `wanted` picks. What could not be read
+    /// is listed as such, because it cannot be told from a PR with nothing wrong with it.
+    pub fn merge_state(&self, wanted: impl Fn(&Item) -> bool) -> MergeRead {
+        let Repo { owner, name } = self.project.repo;
+        let mut read = MergeRead::default();
+        let mut prs: Vec<&Item> = self
+            .prs()
+            .map(|(item, _)| item)
+            .filter(|item| wanted(item))
+            .collect();
+        prs.sort_unstable_by_key(|item| item.number);
+        for chunk in prs.chunks(MERGE_CHUNK) {
+            let body: String = chunk
+                .iter()
+                .map(|item| {
+                    let n = item.number;
+                    format!(
+                        r#"
           p{n}: pullRequest(number: {n}) {{ mergeable
             commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }} }}"#
-                )
-            })
-            .collect();
-        let query =
-            format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{{body}\n}} }}");
-        let mut answered = match gh::query::<Repository<Option<MergeNode>>>(&query) {
-            Ok(data) => data.repository,
-            Err(err) => {
-                eprintln!("[snapshot] merge state unread: {err}");
-                HashMap::new()
-            }
-        };
-        for n in chunk {
-            match answered.remove(&format!("p{n}")).flatten() {
-                Some(node) => {
-                    read.states.insert(*n, node.into());
+                    )
+                })
+                .collect();
+            let query = format!(
+                "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{{body}\n}} }}"
+            );
+            let mut answered = match gh::query::<Repository<Option<MergeNode>>>(&query) {
+                Ok(data) => data.repository,
+                Err(err) => {
+                    eprintln!("[snapshot] merge state unread: {err}");
+                    HashMap::new()
                 }
-                None => read.unread.push(*n),
+            };
+            for item in chunk {
+                match answered.remove(&format!("p{}", item.number)).flatten() {
+                    Some(node) => {
+                        read.states.insert(item.key.clone(), node.into());
+                    }
+                    None => read.unread.push(item.key.clone()),
+                }
             }
         }
+        read
     }
-    read
 }
 
 #[derive(Deserialize)]
@@ -874,10 +926,11 @@ struct DiffFile {
 
 /// `file -> patch without hunk headers` for the PR as it stood at `sha`. Three-dot
 /// compare diffs from the merge base, which is the PR's own diff at that commit no
-/// matter how far master has moved since.
-fn pr_diff(repo: Repo, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
+/// matter how far the base has moved since.
+fn pr_diff(project: &Project, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
+    let Project { repo, base, .. } = project;
     let raw = gh::rest(
-        &format!("repos/{repo}/compare/master...{sha}"),
+        &format!("repos/{repo}/compare/{base}...{sha}"),
         false,
         Some(r#"[.files[] | {filename, patch: (.patch // "")}]"#),
     )?;
@@ -899,9 +952,9 @@ fn pr_diff(repo: Repo, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
 
 /// `None` if either side cannot be compared (an ACKed commit GitHub has since
 /// dropped).
-pub fn ack_interdiff(repo: Repo, acked: &str, head: &str) -> Option<Interdiff> {
-    let before = pr_diff(repo, acked).ok()?;
-    let after = pr_diff(repo, head).ok()?;
+pub fn ack_interdiff(project: &Project, acked: &str, head: &str) -> Option<Interdiff> {
+    let before = pr_diff(project, acked).ok()?;
+    let after = pr_diff(project, head).ok()?;
     let files: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
     let changed: Vec<String> = files
         .into_iter()

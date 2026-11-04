@@ -1,4 +1,4 @@
-//! Your Floresta work that exists but never reached upstream.
+//! Your work on a project that exists but never reached upstream.
 //!
 //! Two sources:
 //!   * open PRs against your own fork. They look reviewed-and-done there, but
@@ -13,8 +13,8 @@
 //!     upstream (fork #8 -> #1330) is not stranded;
 //!   * branches named after a PR (`pr-1105`, `review-1252`) are review checkouts.
 
-use std::collections::{BTreeSet, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -23,8 +23,8 @@ use chrono::NaiveDate;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::board::CardKey;
-use crate::config::{self, Repo};
+use crate::board::{CardKey, GitHubItem};
+use crate::config::{self, LocalClone, Project, Repo};
 use crate::proc;
 use crate::snapshot::{self, Item, UpstreamPr};
 use crate::timestamp::Timestamp;
@@ -34,15 +34,19 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 static CHECKOUT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:pr|review)[-_]?\d+(?:-head)?$").expect("a constant pattern compiles")
 });
-/// Consuming the character before a bare `#` stands in for the lookbehind the regex
-/// crate does not have: a match never starts inside the previous one, since that
-/// ends in a digit, which already rules the next `#` out.
-static REF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)(?:github\.com/getfloresta/floresta/(?:issues|pull)/|getfloresta/floresta#|(?:^|[^\w/])#)(\d+)",
-    )
-    .expect("a constant pattern compiles")
-});
+
+/// A reference to one of `repo`'s issues, spelled out or as a bare `#N`. Consuming the
+/// character before a bare `#` stands in for the lookbehind the regex crate does not
+/// have: a match never starts inside the previous one, since that ends in a digit, which
+/// already rules the next `#` out. It also means only a match naming the repo holds a `/`.
+fn ref_re(repo: Repo) -> Regex {
+    let repo = regex::escape(&repo.to_string());
+    Regex::new(&format!(
+        r"(?i)(?:github\.com/{repo}/(?:issues|pull)/|{repo}#|(?:^|[^\w/])#)(\d+)"
+    ))
+    .expect("an escaped repo compiles")
+}
+
 const STOP: [&str; 39] = [
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into", "is", "it",
     "its", "of", "on", "or", "per", "the", "to", "with", "without", "when", "not", "no", "via",
@@ -61,7 +65,7 @@ pub enum LinkHow {
 
 #[derive(Clone, Debug)]
 pub struct IssueLink {
-    pub number: u64,
+    pub key: CardKey,
     pub url: String,
     pub how: LinkHow,
 }
@@ -69,7 +73,7 @@ pub struct IssueLink {
 #[derive(Clone, Debug)]
 pub enum Origin {
     ForkPr {
-        number: u64,
+        item: GitHubItem,
         url: String,
         additions: u64,
         deletions: u64,
@@ -79,7 +83,7 @@ pub enum Origin {
 
 #[derive(Clone, Debug)]
 pub struct Unshipped {
-    pub key: CardKey,
+    pub repo: Repo,
     pub origin: Origin,
     pub title: String,
     pub branch: String,
@@ -88,22 +92,29 @@ pub struct Unshipped {
     pub issue: Option<IssueLink>,
 }
 
+impl Unshipped {
+    /// What its card is about. Two clones can both have a `fix-tests`, and they are not one
+    /// card.
+    pub fn key(&self) -> CardKey {
+        match &self.origin {
+            Origin::ForkPr { item, .. } => CardKey::GitHub(item.clone()),
+            Origin::Branch => CardKey::branch(&format!("{}/{}", self.repo.label(), self.branch)),
+        }
+    }
+}
+
 fn git(path: &Path, args: &[&str]) -> Result<String> {
     proc::git(path, args, GIT_TIMEOUT)
 }
 
-/// The emails your commits are recognised by. Without one every commit would read as
+/// The email your commits are recognised by. Without one every commit would read as
 /// someone else's, and the lane as nothing to ship, so no email is a failed read.
-pub fn my_emails(clones: &[PathBuf]) -> Result<BTreeSet<String>> {
-    let mut out = BTreeSet::new();
-    for clone in clones {
-        let email = git(clone, &["config", "user.email"])?.trim().to_lowercase();
-        if email.is_empty() {
-            bail!("user.email is empty in {}", clone.display());
-        }
-        out.insert(email);
+pub fn my_email(clone: &Path) -> Result<String> {
+    let email = git(clone, &["config", "user.email"])?.trim().to_lowercase();
+    if email.is_empty() {
+        bail!("user.email is empty in {}", clone.display());
     }
-    Ok(out)
+    Ok(email)
 }
 
 // ---------------------------------------------------------------- matching
@@ -155,17 +166,18 @@ fn tokens(text: &str) -> HashSet<String> {
 /// unless N is too big to be one, hence the >= 100 floor. Failing that, a title
 /// match on at least two shared words.
 fn link_issue<'a>(
+    refs: &Regex,
     text: &str,
     words: &HashSet<String>,
     issues: &[&'a Item],
 ) -> Option<(&'a Item, LinkHow)> {
-    for found in REF_RE.captures_iter(text) {
+    for found in refs.captures_iter(text) {
         let Ok(number) = found[1].parse::<u64>() else {
             continue;
         };
-        let named = found[0].to_lowercase().contains("floresta");
+        let named = found[0].contains('/');
         if (number >= 100 || named)
-            && let Some(issue) = issues.iter().find(|issue| issue.number == number)
+            && let Some(issue) = issues.iter().find(|issue| issue.is_number(number))
         {
             return Some((*issue, LinkHow::Refs));
         }
@@ -190,7 +202,6 @@ fn link_issue<'a>(
 
 /// An open PR against your own fork.
 pub struct ForkPr {
-    pub number: u64,
     pub title: String,
     pub body: String,
     pub url: String,
@@ -216,7 +227,6 @@ struct ForkCommits {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForkNode {
-    number: u64,
     title: String,
     body: String,
     url: String,
@@ -230,7 +240,7 @@ struct ForkNode {
 }
 
 const FORK_FIELDS: &str = "
-  number title body url updatedAt additions deletions
+  title body url updatedAt additions deletions
   headRefName headRefOid author { login }
   commits(first: 1) { totalCount }
 ";
@@ -247,7 +257,6 @@ fn fork_prs(fork: Repo, me: &str) -> Result<Vec<ForkPr>> {
                 .is_some_and(|author| author.login.eq_ignore_ascii_case(me))
         })
         .map(|node| ForkPr {
-            number: node.number,
             title: node.title,
             body: node.body,
             url: node.url,
@@ -271,18 +280,15 @@ struct LocalBranch {
 }
 
 /// Branches with commits you wrote that upstream does not carry.
-fn local_branches(
-    clone: &Path,
-    emails: &BTreeSet<String>,
-    upstream_ref: &str,
-) -> Result<Vec<LocalBranch>> {
+fn local_branches(local: &LocalClone, me: &str) -> Result<Vec<LocalBranch>> {
+    let clone = local.path.as_path();
     let mut out = Vec::new();
     let refs = git(
         clone,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
     )?;
     for branch in refs.split_whitespace() {
-        if matches!(branch, "master" | "main")
+        if branch == local.base
             || config::BRANCH_IGNORE.iter().any(|p| branch.starts_with(p))
             || CHECKOUT_RE.is_match(branch)
         {
@@ -290,7 +296,7 @@ fn local_branches(
         }
         // `git cherry` compares patches, so a commit cherry-picked or rebased into
         // upstream counts as shipped even though its hash differs.
-        let cherry = git(clone, &["cherry", upstream_ref, branch])?;
+        let cherry = git(clone, &["cherry", &local.upstream_ref, branch])?;
         let fresh: Vec<&str> = cherry
             .lines()
             .filter_map(|line| line.strip_prefix("+ "))
@@ -309,7 +315,7 @@ fn local_branches(
             let email = fields.next().unwrap_or("");
             let day = fields.next().unwrap_or("");
             let subject = fields.next().unwrap_or("");
-            if emails.contains(&email.to_lowercase()) {
+            if email.to_lowercase() == me {
                 let day = day
                     .parse()
                     .with_context(|| format!("git log gave {oid} the date {day:?}"))?;
@@ -332,9 +338,14 @@ fn local_branches(
     Ok(out)
 }
 
-fn link_of(text: &str, words: &HashSet<String>, issues: &[&Item]) -> Option<IssueLink> {
-    link_issue(text, words, issues).map(|(issue, how)| IssueLink {
-        number: issue.number,
+fn link_of(
+    refs: &Regex,
+    text: &str,
+    words: &HashSet<String>,
+    issues: &[&Item],
+) -> Option<IssueLink> {
+    link_issue(refs, text, words, issues).map(|(issue, how)| IssueLink {
+        key: issue.key.clone(),
         url: issue.url.clone(),
         how,
     })
@@ -346,9 +357,10 @@ fn assemble(
     prs: Vec<ForkPr>,
     issues: &[&Item],
     upstream_mine: &[UpstreamPr],
-    clones: &[PathBuf],
-    upstream_ref: &str,
+    local: &LocalClone,
 ) -> Result<Vec<Unshipped>> {
+    let repo = local.repo;
+    let refs = ref_re(repo);
     let up_titles: HashSet<String> = upstream_mine.iter().map(|p| norm_title(&p.title)).collect();
     let up_refs: HashSet<&str> = upstream_mine.iter().map(|p| p.head_ref.as_str()).collect();
     let up_oids: HashSet<&String> = upstream_mine.iter().flat_map(|p| &p.commits).collect();
@@ -365,10 +377,10 @@ fn assemble(
         let words = tokens(&format!("{} {}", pr.title, pr.branch));
         let text = format!("{}\n{}", pr.body, pr.title);
         items.push(Unshipped {
-            key: snapshot::item_key(&pr.url)?,
-            issue: link_of(&text, &words, issues),
+            repo,
+            issue: link_of(&refs, &text, &words, issues),
             origin: Origin::ForkPr {
-                number: pr.number,
+                item: snapshot::github_item(&pr.url)?,
                 url: pr.url,
                 additions: pr.additions,
                 deletions: pr.deletions,
@@ -380,38 +392,40 @@ fn assemble(
         });
     }
 
-    let emails = my_emails(clones)?;
-    for clone in clones {
-        for branch in local_branches(clone, &emails, upstream_ref)? {
-            if up_refs.contains(branch.branch.as_str())
-                || fork_refs.contains(&branch.branch)
-                || branch.oids.iter().any(|oid| up_oids.contains(oid))
-            {
-                continue;
-            }
-            let words = tokens(&format!("{} {}", branch.branch, branch.subjects.join(" ")));
-            let text = format!("{}\n{}", branch.subjects.join("\n"), branch.title);
-            items.push(Unshipped {
-                key: CardKey::branch(&branch.branch),
-                issue: link_of(&text, &words, issues),
-                origin: Origin::Branch,
-                title: branch.title,
-                branch: branch.branch,
-                commits: branch.commits,
-                last: branch.last,
-            });
+    let me = my_email(&local.path)?;
+    for branch in local_branches(local, &me)? {
+        if up_refs.contains(branch.branch.as_str())
+            || fork_refs.contains(&branch.branch)
+            || branch.oids.iter().any(|oid| up_oids.contains(oid))
+        {
+            continue;
         }
+        let words = tokens(&format!("{} {}", branch.branch, branch.subjects.join(" ")));
+        let text = format!("{}\n{}", branch.subjects.join("\n"), branch.title);
+        items.push(Unshipped {
+            repo,
+            issue: link_of(&refs, &text, &words, issues),
+            origin: Origin::Branch,
+            title: branch.title,
+            branch: branch.branch,
+            commits: branch.commits,
+            last: branch.last,
+        });
     }
     Ok(items)
 }
 
-pub fn run(issues: &[&Item], upstream_mine: &[UpstreamPr], me: &str) -> Result<Vec<Unshipped>> {
+pub fn run(
+    project: &Project,
+    issues: &[&Item],
+    upstream_mine: &[UpstreamPr],
+    me: &str,
+) -> Result<Vec<Unshipped>> {
     assemble(
-        fork_prs(config::FORK, me)?,
+        fork_prs(project.fork, me)?,
         issues,
         upstream_mine,
-        &config::clones(),
-        config::UPSTREAM_REF,
+        &project.local(),
     )
 }
 
@@ -427,12 +441,21 @@ mod tests {
     use super::*;
     use crate::testkit::{issue, key};
     use std::fs;
+    use std::path::PathBuf;
     use std::process::Command;
     use tempfile::TempDir;
 
     const MINE: &str = "me@example.com";
     const OTHER: &str = "other@example.com";
     const UPSTREAM: &str = "upstream/master";
+    const FLORESTA: Repo = Repo {
+        owner: "getfloresta",
+        name: "Floresta",
+    };
+    const CDK: Repo = Repo {
+        owner: "cashubtc",
+        name: "cdk",
+    };
 
     fn run_git(path: &Path, args: &[&str], email: &str) {
         let out = Command::new("git")
@@ -520,14 +543,19 @@ mod tests {
         repos
     }
 
-    fn emails() -> BTreeSet<String> {
-        BTreeSet::from([MINE.to_owned()])
+    fn clone_at(path: &Path) -> LocalClone {
+        LocalClone {
+            repo: FLORESTA,
+            path: path.to_owned(),
+            upstream_ref: UPSTREAM.to_owned(),
+            base: "master",
+        }
     }
 
     #[test]
     fn local_branches_are_only_commits_you_wrote_that_upstream_lacks() {
         let repos = repos();
-        let found = local_branches(&repos.clone, &emails(), UPSTREAM).unwrap();
+        let found = local_branches(&clone_at(&repos.clone), MINE).unwrap();
         let names: Vec<&str> = found.iter().map(|b| b.branch.as_str()).collect();
         assert!(names.contains(&"dedup-config-parse"), "{names:?}");
         let dedup = found
@@ -558,25 +586,45 @@ mod tests {
     #[test]
     fn a_clone_that_cannot_be_read_is_a_failure_not_an_empty_list() {
         let missing = TempDir::new().unwrap().path().join("gone");
-        assert!(local_branches(&missing, &emails(), UPSTREAM).is_err());
-        assert!(my_emails(std::slice::from_ref(&missing)).is_err());
+        assert!(local_branches(&clone_at(&missing), MINE).is_err());
+        assert!(my_email(&missing).is_err());
 
         let repos = repos();
+        let no_such_ref = LocalClone {
+            upstream_ref: "upstream/no-such-ref".to_owned(),
+            ..clone_at(&repos.clone)
+        };
         assert!(
-            local_branches(&repos.clone, &emails(), "upstream/no-such-ref").is_err(),
+            local_branches(&no_such_ref, MINE).is_err(),
             "a ref git cannot resolve is not a branch with nothing new on it"
         );
 
         run_git(&repos.clone, &["config", "user.email", ""], MINE);
         assert!(
-            my_emails(std::slice::from_ref(&repos.clone)).is_err(),
+            my_email(&repos.clone).is_err(),
             "no email is no way to tell your commits from anyone's"
         );
     }
 
+    /// A clone can have a branch named after another project's base, and it is work there.
+    #[test]
+    fn only_the_projects_own_base_is_never_work() {
+        let repos = repos();
+        branch(&repos, "develop", &["d1"], MINE, None);
+        let listed = |base| {
+            let local = LocalClone {
+                base,
+                ..clone_at(&repos.clone)
+            };
+            let found = local_branches(&local, MINE).unwrap();
+            found.iter().any(|b| b.branch == "develop")
+        };
+        assert!(!listed("develop"));
+        assert!(listed("master"));
+    }
+
     fn fork_pr(number: u64, title: &str, branch: &str, head: &str) -> ForkPr {
         ForkPr {
-            number,
             title: title.to_owned(),
             body: String::new(),
             url: format!("https://github.com/lorenzolfm/Floresta/pull/{number}"),
@@ -624,29 +672,22 @@ mod tests {
         ];
         let issues = linkable_issues();
         let issues: Vec<&Item> = issues.iter().collect();
-        let items = assemble(
-            prs,
-            &issues,
-            &upstream,
-            std::slice::from_ref(&repos.clone),
-            UPSTREAM,
-        )
-        .unwrap();
-        let keys: Vec<&CardKey> = items.iter().map(|u| &u.key).collect();
+        let items = assemble(prs, &issues, &upstream, &clone_at(&repos.clone)).unwrap();
+        let keys: Vec<CardKey> = items.iter().map(Unshipped::key).collect();
         assert!(
-            !keys.contains(&&key("lorenzolfm/floresta#8")),
+            !keys.contains(&key("lorenzolfm/floresta#8")),
             "already upstream under its title: {keys:?}"
         );
         assert!(
-            keys.contains(&&key("lorenzolfm/floresta#6")),
+            keys.contains(&key("lorenzolfm/floresta#6")),
             "nobody upstream has seen it: {keys:?}"
         );
         assert!(
-            !keys.contains(&&CardKey::branch("shipped-as-pr")),
+            !keys.contains(&CardKey::branch("floresta/shipped-as-pr")),
             "upstream merged it as a PR: {keys:?}"
         );
         assert!(
-            keys.contains(&&CardKey::branch("dedup-config-parse")),
+            keys.contains(&CardKey::branch("floresta/dedup-config-parse")),
             "an unpushed branch stays: {keys:?}"
         );
     }
@@ -655,8 +696,10 @@ mod tests {
     fn linking_work_to_the_issue_it_fixes() {
         let issues = linkable_issues();
         let issues: Vec<&Item> = issues.iter().collect();
+        let refs = ref_re(FLORESTA);
         let link = |text: &str, words: &str| {
-            link_issue(text, &tokens(words), &issues).map(|(issue, how)| (issue.number, how))
+            link_issue(&refs, text, &tokens(words), &issues)
+                .map(|(issue, how)| (issue.number(), how))
         };
         assert_eq!(
             link(
@@ -686,6 +729,49 @@ mod tests {
             Some((6, LinkHow::Refs)),
             "naming the repo makes even a small number upstream's"
         );
+    }
+
+    #[test]
+    fn a_reference_counts_only_for_the_repo_it_names() {
+        let issues = linkable_issues();
+        let issues: Vec<&Item> = issues.iter().collect();
+        let refs = ref_re(CDK);
+        let link = |text: &str| {
+            link_issue(&refs, text, &HashSet::new(), &issues).map(|(issue, _)| issue.number())
+        };
+        assert_eq!(link("see cashubtc/cdk#6"), Some(6));
+        assert_eq!(
+            link("https://github.com/cashubtc/cdk/issues/167"),
+            Some(167)
+        );
+        assert_eq!(
+            link("fixes #167"),
+            Some(167),
+            "a bare number is this repo's"
+        );
+        assert_eq!(link("see getfloresta/floresta#167"), None);
+        assert_eq!(
+            link("https://github.com/getfloresta/Floresta/issues/167"),
+            None
+        );
+    }
+
+    /// Two clones can both have a `fix-tests`, and dragging one to Passed is not about
+    /// the other.
+    #[test]
+    fn a_branch_is_keyed_by_its_repo_too() {
+        let repos = repos();
+        branch(&repos, "fix-tests", &["a"], MINE, Some("fix the tests"));
+        let keys = |repo| {
+            let local = LocalClone {
+                repo,
+                ..clone_at(&repos.clone)
+            };
+            let items = assemble(vec![], &[], &[], &local).unwrap();
+            items.iter().map(Unshipped::key).collect::<Vec<_>>()
+        };
+        assert!(keys(FLORESTA).contains(&CardKey::branch("floresta/fix-tests")));
+        assert!(keys(CDK).contains(&CardKey::branch("cdk/fix-tests")));
     }
 
     #[test]
