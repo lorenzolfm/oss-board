@@ -260,7 +260,8 @@ struct WireGist {
 }
 
 /// `key -> gist`. Cached per fingerprint; only changed items reach the model. An entry
-/// of another shape costs that one gist.
+/// of another shape costs that one gist, and one for a card it was not sent is dropped: it
+/// can only have come from the text it was sent.
 pub fn gists(
     obs: &[Obligation<'_>],
     me: &Viewer,
@@ -279,6 +280,7 @@ pub fn gists(
         .collect();
     if !todo.is_empty() {
         let excerpts: Vec<_> = todo.iter().map(|ob| excerpt(ob, me, now)).collect();
+        let asked: HashSet<&CardKey> = todo.iter().map(|ob| &ob.item.key).collect();
         let prompt = prompts::GIST.replace("%s", &dumps(&excerpts)?);
         let answer = ask(&prompt).and_then(|answer| serde_json::from_value(answer).ok());
         let entries = answer.map_or(Vec::new(), |answer: GistAnswer| answer.gists);
@@ -287,7 +289,10 @@ pub fn gists(
                 continue;
             };
             let gist = clip(&gist, 120);
-            if let Some(fp) = want.get(&key).filter(|_| !gist.is_empty()) {
+            if let Some(fp) = want
+                .get(&key)
+                .filter(|_| asked.contains(&key) && !gist.is_empty())
+            {
                 let fp = fp.clone();
                 cache.insert(key, CachedGist { fp, gist, asks });
             }
@@ -835,6 +840,46 @@ mod tests {
         let obs = collect(&next, &viewer, now(), &empty);
         let got = gists(&obs, &viewer, now(), &path, |_| answer(true)).unwrap();
         assert!(got[&item_key].asks, "the cached verdict decided it");
+    }
+
+    /// A comment on one card can name another, and that card must keep what was read from it.
+    #[test]
+    fn an_answer_speaks_only_for_the_cards_it_was_sent() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let empty = HashMap::new();
+        let sent = || pr(1).requested(ME, &day(5).to_string());
+        let other = || pr(2).requested(ME, &day(5).to_string());
+        let first = snap(vec![sent(), other()], vec![]);
+        let obs = collect(&first, &viewer, now(), &empty);
+        let (sent_key, other_key) = (obs[0].item.key.clone(), obs[1].item.key.clone());
+        gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [
+                {"key": sent_key.to_string(), "gist": "sent", "asks": false},
+                {"key": other_key.to_string(), "gist": "other", "asks": false},
+            ]}))
+        })
+        .unwrap();
+
+        let moved = sent().comments(vec![c("bob", 1, &format!("@{ME} and now?"))]);
+        let next = snap(vec![moved, other()], vec![]);
+        let obs = collect(&next, &viewer, now(), &empty);
+        let got = gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [
+                {"key": sent_key.to_string(), "gist": "sent again", "asks": false},
+                {"key": other_key.to_string(), "gist": "told to say this", "asks": true},
+            ]}))
+        })
+        .unwrap();
+        assert_eq!(got[&sent_key].text, "sent again");
+        assert_eq!(
+            got[&other_key],
+            Gist {
+                text: "other".to_owned(),
+                asks: false
+            }
+        );
     }
 
     /// Whether a verdict cached on a PR is asked for again once `after` replaces `before`.
