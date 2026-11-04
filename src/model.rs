@@ -32,12 +32,12 @@ use sha2::{Digest, Sha256};
 use crate::board::CardKey;
 use crate::footprint::Footprint;
 use crate::obligations::{
-    Obligation, ThreadTurn, Viewer, fingerprint, last_per_kind, pings, waiting_comments,
+    Obligation, ThreadTurn, Viewer, comments_read, fingerprint, last_per_kind,
 };
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
-use crate::snapshot::{Ci, Comment, ReviewState, Thread};
+use crate::snapshot::{Ci, ReviewState, Thread};
 use crate::text::clip;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
@@ -204,21 +204,7 @@ fn threads_read<'a>(ob: &Obligation<'a>, me: &Viewer) -> Vec<&'a Thread> {
 
 fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excerpt<'a> {
     let item = ob.item;
-    let waiting = waiting_comments(item, me, now);
-    // The comment that started the wait and those a mention stands on are what the verdict
-    // turns on. On a busy item they would fall out of a plain "last three".
-    let pinged = pings(item, &waiting, me);
-    let recent: Vec<&Comment> = waiting
-        .iter()
-        .enumerate()
-        .filter(|(at, _)| {
-            *at == 0
-                || pinged.first() == Some(at)
-                || pinged.last() == Some(at)
-                || at + 2 >= waiting.len()
-        })
-        .map(|(_, comment)| *comment)
-        .collect();
+    let recent = comments_read(item, me, now);
     let pr = item.pr().map(|pr| PrExcerpt {
         size: format!(
             "+{}/-{} in {} files",
@@ -587,7 +573,7 @@ mod tests {
 
     use super::*;
     use crate::obligations::collect;
-    use crate::snapshot::{Interdiff, Item};
+    use crate::snapshot::{Comment, Interdiff, Item};
     use crate::testkit::{ME, bot, c, day, issue, me, now, opportunity, pr, review, snap, thread};
     use chrono::TimeDelta;
     use serde_json::json;

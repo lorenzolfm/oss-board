@@ -336,19 +336,26 @@ fn answered_up_to(item: &Item, me: &Viewer) -> Option<Timestamp> {
 /// The comments still waiting on you, oldest first: what the conversation rule reads, before
 /// it decides which of them make a reason. So this keeps a "never mind" that pings nobody,
 /// and a review's body, which is where a reviewer says what they want done.
-pub fn waiting_comments<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
+fn waiting_comments<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
     let answered = answered_up_to(item, me);
     let waiting = |comment: &&Comment| Said::from(*comment).is_waiting(answered, me, now);
     item.comments.iter().filter(waiting).collect()
 }
 
-/// Where in `waiting` someone addressed you, oldest first. A mention stands on the first of
-/// these, which dates and names it, and the newest, which moves it.
-pub fn pings(item: &Item, waiting: &[&Comment], me: &Viewer) -> Vec<usize> {
+/// What the verdict reads of those: the comment that started the wait, the first ping, which
+/// dates and names a mention, the newest, which moves it, and the last two. On a busy item they
+/// would fall out of a plain "last three".
+pub fn comments_read<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
+    let waiting = waiting_comments(item, me, now);
     let mine: Vec<Said<'_>> = stream(item).filter(|s| me.is(s.author)).collect();
-    (0..waiting.len())
-        .filter(|&at| is_ping(&waiting[at].body, me, &mine))
-        .collect()
+    let pinged = |comment: &&Comment| is_ping(&comment.body, me, &mine);
+    let first_ping = waiting.iter().position(pinged);
+    let newest_ping = waiting.iter().rposition(pinged);
+    let is_read = |at: usize| {
+        at == 0 || Some(at) == first_ping || Some(at) == newest_ping || at + 2 >= waiting.len()
+    };
+    let read = waiting.iter().enumerate().filter(|(at, _)| is_read(*at));
+    read.map(|(_, comment)| *comment).collect()
 }
 
 fn is_ping(body: &str, me: &Viewer, mine: &[Said<'_>]) -> bool {
