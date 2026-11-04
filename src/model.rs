@@ -388,11 +388,14 @@ fn rank_fingerprint(opps: &[Opportunity<'_>]) -> String {
     hex[..16].to_owned()
 }
 
+/// One that will not read costs a model pass, as `load_cache` says. That covers a cache
+/// from before picks had keys.
 #[derive(Default, Deserialize, Serialize)]
 struct RankCache {
     sig: String,
     at: f64,
-    picks: Vec<Value>,
+    /// Only what could be used, so a fresh cache always holds an answer.
+    picks: Vec<WirePick>,
 }
 
 #[derive(Deserialize)]
@@ -402,11 +405,27 @@ struct RankAnswer {
 
 /// One pick as the judge wrote it. Each is parsed on its own, so one that is malformed
 /// costs only itself.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct WirePick {
     key: CardKey,
     #[serde(default, deserialize_with = "text_or_nothing")]
     why: Option<String>,
+}
+
+/// What can be used of the judge's answer: parsed, one of the candidates, once each.
+fn usable(
+    answer: Vec<Value>,
+    by_key: &HashMap<&CardKey, &Opportunity<'_>>,
+    cap: usize,
+) -> Vec<WirePick> {
+    let mut seen = HashSet::new();
+    answer
+        .into_iter()
+        .filter_map(|pick| serde_json::from_value::<WirePick>(pick).ok())
+        .filter(|pick| by_key.contains_key(&pick.key))
+        .filter(|pick| seen.insert(pick.key.clone()))
+        .take(cap)
+        .collect()
 }
 
 /// A field of the wrong type costs that field, not the pick.
@@ -485,8 +504,10 @@ pub fn rank<'o, 'a>(
             .replace("%(footprint)s", &format!("[{}]", areas.join(", ")))
             .replace("%(payload)s", &dumps(&candidates)?);
         let answer = ask(&prompt).and_then(|answer| serde_json::from_value(answer).ok());
-        picks = answer.map_or(Vec::new(), |answer: RankAnswer| answer.picks);
-        // An empty verdict is retried, not kept.
+        picks = answer.map_or(Vec::new(), |answer: RankAnswer| {
+            usable(answer.picks, &by_key, cap)
+        });
+        // An answer with nothing usable in it is retried, not kept.
         if !picks.is_empty() {
             save(
                 cache_path,
@@ -498,26 +519,17 @@ pub fn rank<'o, 'a>(
             )?;
         }
     }
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-    for pick in picks {
-        let Ok(pick) = serde_json::from_value::<WirePick>(pick) else {
-            continue;
-        };
-        let Some(opp) = by_key.get(&pick.key).copied() else {
-            continue; // invented
-        };
-        if !seen.insert(pick.key) {
-            continue; // a duplicate
-        }
-        let verdict = Verdict {
-            why: clipped(pick.why, 80),
-        };
-        out.push((opp, verdict));
-        if out.len() >= cap {
-            break;
-        }
-    }
+    let out: Vec<_> = picks
+        .into_iter()
+        .filter_map(|pick| {
+            let opp = by_key.get(&pick.key).copied()?;
+            let verdict = Verdict {
+                why: clipped(pick.why, 80),
+            };
+            Some((opp, verdict))
+        })
+        .take(cap)
+        .collect();
     if out.is_empty() {
         // No usable answer -- or the judge kept nothing, which is distrusted the same
         // way the old board distrusted it.
@@ -647,6 +659,70 @@ mod tests {
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(json!({"picks": []})));
         assert!(!ranked.is_judged());
         assert_eq!(numbers(&ranked), [1, 2, 3]);
+    }
+
+    /// The name a card shows is not a key. Kept, this answer would hold the lane at ranking
+    /// order until the TTL, saying the model did not answer while nothing asked it.
+    #[test]
+    fn an_answer_with_nothing_usable_in_it_is_asked_again_not_kept() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "r.json");
+        let items = items();
+        let opps = opportunities(&items);
+        let calls = Cell::new(0);
+        let ask = |_: &str| {
+            calls.set(calls.get() + 1);
+            Some(json!({"picks": [
+                {"key": "floresta#2"},
+                {"key": "getfloresta/Floresta#99"},
+            ]}))
+        };
+        for run in 1..=2 {
+            let ranked = rank(&opps, &Footprint::default(), 8, &path, 12.0, ask).unwrap();
+            assert!(!ranked.is_judged());
+            assert_eq!(calls.get(), run);
+        }
+    }
+
+    #[test]
+    fn only_what_could_be_used_of_an_answer_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "r.json");
+        let items = items();
+        let opps = opportunities(&items);
+        let answer = json!({"picks": [
+            {"key": "floresta#3"},
+            {"key": "getfloresta/Floresta#2", "why": "w"},
+        ]});
+        rank_with(&opps, &path, Some(answer));
+        let ranked = rank(&opps, &Footprint::default(), 8, &path, 12.0, |_| {
+            panic!("a fresh ranking must not ask")
+        })
+        .unwrap();
+        assert_eq!(numbers(&ranked), [2]);
+        assert_eq!(ranked.picks()[0].1.unwrap().why.as_deref(), Some("w"));
+    }
+
+    /// The `rank.json` of every run before picks had keys.
+    #[test]
+    fn a_rank_cache_from_before_keys_costs_one_model_pass() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "r.json");
+        let items = items();
+        let opps = opportunities(&items);
+        let at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let cached = json!({
+            "sig": rank_fingerprint(&opps),
+            "at": at,
+            "picks": [{"number": 2, "why": "w"}],
+        });
+        fs::write(&path, cached.to_string()).unwrap();
+        let answer = json!({"picks": [{"key": "getfloresta/Floresta#3"}]});
+        let ranked = rank_with(&opps, &path, Some(answer));
+        assert_eq!(numbers(&ranked), [3]);
     }
 
     #[test]
