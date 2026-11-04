@@ -4,11 +4,14 @@
 //!   1. Read the board FIRST -- mutes, tombstones and claims are user state and must
 //!      be honoured before anything is decided.
 //!   2. Gather deterministically: one snapshot of the repo, then obligations,
-//!      unshipped work and opportunities as pure functions of it.
+//!      unshipped work and opportunities as pure functions of it. A source that fails
+//!      leaves what it fed as it was, and the run says so.
 //!   3. Ask the model for gists and an opportunity ranking. Either can fail; the
 //!      board and the DM are still written, from computed reasons and ranking order,
 //!      and say so.
-//!   4. Write the board deterministically, then DM if a slot is due.
+//!   4. Write the board deterministically, on top of the file as it is by then. Only
+//!      then write briefings, which can take minutes and must not hold the board up.
+//!   5. DM if a slot is due.
 
 mod board;
 mod brief;
@@ -31,23 +34,23 @@ mod text;
 mod timestamp;
 mod unshipped;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fs::{self, File, TryLockError};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Days, FixedOffset, Local, SecondsFormat, TimeDelta, Utc};
-use clap::{Parser, Subcommand};
-use serde::Serialize;
-use serde_json::{Value, json};
+use clap::{Args, Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 
-use board::{AgentLane, Board, Claim};
+use board::{AgentLane, Board, Card, CardKey, Changes, Claim, ClaimLane, GitHubItem};
 use brief::{BriefKind, Target};
-use model::{Pick, Ranked};
+use footprint::Footprint;
+use model::Ranked;
 use obligations::{Obligation, Reason, ReasonKind, Viewer};
 use opportunities::Opportunity;
-use render::Dm;
+use render::{Degraded, Dm};
 use snapshot::{Item, Snapshot};
 use text::basename;
 use timestamp::Timestamp;
@@ -55,15 +58,29 @@ use unshipped::{Origin, Unshipped};
 
 #[derive(Parser)]
 #[command(version, about)]
-struct Args {
-    /// The kanban file [default: ~/Documents/Vault/Opensource/Tasks.md]
-    #[arg(long)]
-    board: Option<PathBuf>,
+struct Cli {
+    #[command(subcommand)]
+    tool: Tool,
+}
+
+#[derive(Subcommand)]
+enum Tool {
+    /// Refresh the board, and DM when a slot is due
+    Refresh(Refresh),
+    /// Survey the org board's columns
+    Survey,
+}
+
+#[derive(Args)]
+struct Refresh {
+    /// The kanban file
+    #[arg(long, default_value_os_t = config::default_board())]
+    board: PathBuf,
     /// Where caches and the last-run record live
-    #[arg(long, default_value = "state")]
+    #[arg(long)]
     state: PathBuf,
     /// Render to stdout, do not touch the vault or send anything
-    #[arg(long)]
+    #[arg(long, conflicts_with = "notify")]
     dry_run: bool,
     /// Skip gists and the judge
     #[arg(long)]
@@ -77,28 +94,24 @@ struct Args {
     /// Beat the heartbeat, and DM when a slot is due
     #[arg(long)]
     notify: bool,
-    /// DM regardless of the schedule (with --notify)
-    #[arg(long)]
+    /// DM regardless of the schedule
+    #[arg(long, requires = "notify")]
     dm_now: bool,
-    #[command(subcommand)]
-    command: Option<Tool>,
-}
-
-#[derive(Subcommand)]
-enum Tool {
-    /// Survey the org board's columns
-    Survey,
 }
 
 fn log(message: &str) {
     eprintln!("[{}] {message}", Local::now().format("%H:%M:%S"));
 }
 
-fn is_floresta(key: &str) -> bool {
-    let key = key.to_lowercase();
-    [config::REPO, config::FORK]
-        .iter()
-        .any(|repo| key.starts_with(&format!("{}#", repo.to_lowercase())))
+/// One run at a time: a manual one and the timer's would share every temporary file.
+/// `None` if another run holds it. The kernel releases it when this process ends.
+fn take_lock(state: &Path) -> Result<Option<File>> {
+    let file = File::create(state.join("lock"))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(TryLockError::WouldBlock) => Ok(None),
+        Err(TryLockError::Error(err)) => Err(err.into()),
+    }
 }
 
 // ---------------------------------------------------------------- schedule
@@ -112,8 +125,8 @@ fn is_floresta(key: &str) -> bool {
 fn due_slot(
     now: DateTime<FixedOffset>,
     slots: &[(u32, u32)],
-    last_sent: Option<&str>,
-) -> Result<Option<DateTime<FixedOffset>>> {
+    last_sent: Option<DateTime<FixedOffset>>,
+) -> Option<DateTime<FixedOffset>> {
     let mut latest = None;
     for &(hour, minute) in slots {
         for back in [0, 1] {
@@ -124,20 +137,17 @@ fn due_slot(
             latest = latest.max(slot);
         }
     }
-    let Some(slot) = latest else {
-        return Ok(None);
-    };
-    if now - slot > TimeDelta::hours(config::SLOT_GRACE_HOURS) {
-        return Ok(None);
-    }
-    if let Some(last_sent) = last_sent {
-        let last_sent = DateTime::parse_from_rfc3339(last_sent)
-            .with_context(|| format!("last_dm.json has a bad timestamp: {last_sent}"))?;
-        if last_sent >= slot {
-            return Ok(None);
-        }
-    }
-    Ok(Some(slot))
+    let slot = latest.filter(|slot| now - *slot <= TimeDelta::hours(config::SLOT_GRACE_HOURS))?;
+    last_sent.is_none_or(|sent| sent < slot).then_some(slot)
+}
+
+/// The record of the last DM. Any corruption reads as never sent, because a duplicate
+/// DM is the cheap failure.
+#[derive(Default, Deserialize, Serialize)]
+struct LastDm {
+    at: Option<DateTime<FixedOffset>>,
+    #[serde(default)]
+    seen: BTreeMap<CardKey, String>,
 }
 
 // ---------------------------------------------------------------- gathering
@@ -158,11 +168,11 @@ fn promote_unshipped<'a>(
     items: &[Unshipped],
     snap: &'a Snapshot,
     me: &Viewer,
-) -> HashSet<String> {
+) -> HashSet<CardKey> {
     let mut promoted = HashSet::new();
     for u in items {
         let number = u.issue.as_ref().map(|issue| issue.number);
-        let Some(issue) = snap.issues.iter().find(|i| Some(i.number) == number) else {
+        let Some((issue, _)) = snap.issues().find(|(i, _)| Some(i.number) == number) else {
             continue;
         };
         let mentioned = me.is_mentioned_in(&issue.body)
@@ -174,9 +184,9 @@ fn promote_unshipped<'a>(
             Origin::ForkPr { .. } => unshipped_name(u, ""),
             Origin::Branch => format!("branch {}", unshipped_name(u, "`")),
         };
-        let at = Timestamp::parse(&format!("{}T00:00:00Z", u.last));
+        let at = Timestamp::at_midnight(u.last);
         let text = format!("your {what} would fix this and never went upstream");
-        obligations::add_reason(obs, issue, Reason::new(ReasonKind::Unshipped, at, text));
+        obligations::add_reason(obs, issue, Reason::at(ReasonKind::Unshipped, at, text));
         promoted.insert(u.key.clone());
     }
     promoted
@@ -194,13 +204,10 @@ fn enrich_stale_acks(obs: &mut [Obligation<'_>], me: &Viewer) {
         let Some((acked, _)) = obligations::latest_ack(item, pr, me) else {
             continue;
         };
-        let Some(head) = pr.head.as_deref() else {
+        let Some(diff) = snapshot::ack_interdiff(config::REPO, &acked, &pr.head) else {
             continue;
         };
-        let Some(diff) = snapshot::ack_interdiff(config::REPO, &acked, head) else {
-            continue;
-        };
-        let suffix = if diff.rebase_only {
+        let suffix = if diff.is_rebase_only() {
             " · rebase only, re-ACK is quick".to_owned()
         } else {
             let files: Vec<&str> = diff.changed.iter().take(3).map(|f| basename(f)).collect();
@@ -219,39 +226,44 @@ fn enrich_stale_acks(obs: &mut [Obligation<'_>], me: &Viewer) {
     }
 }
 
-/// Briefing notes for newly claimed cards. After the lanes are set, so a briefing
-/// failure cannot cost the board write.
+/// What the briefing pass did: the links to add to cards, and which items it wrote a
+/// note for.
+#[derive(Default)]
+struct Briefings {
+    links: Vec<(CardKey, String)>,
+    briefed: Vec<String>,
+}
+
+/// Briefing notes for newly claimed cards. A note under its real name is complete, so
+/// one that exists only needs linking. A linked card with no note is one whose note
+/// you deleted, and it is left that way.
 fn write_briefings(
-    board: &mut Board,
     claimed: &[Claim],
     snap: &Snapshot,
     me: &str,
     vault_dir: &Path,
     limit: usize,
     today: &str,
-) -> Vec<String> {
-    let items: HashMap<&str, &Item> = snap
-        .prs
-        .iter()
-        .chain(&snap.issues)
-        .map(|item| (item.key.as_str(), item))
-        .collect();
-    let mut out = Vec::new();
+) -> Briefings {
+    let items: HashMap<&CardKey, &Item> = snap.items.iter().map(|item| (&item.key, item)).collect();
+    let mut out = Briefings::default();
     for claim in claimed {
-        if out.len() >= limit {
-            break;
-        }
-        let Some(item) = items.get(claim.key.as_str()).copied() else {
+        let Some(item) = items.get(&claim.key).copied() else {
             continue; // closed, or not upstream
         };
-        if claim.lane == "Done" || (item.pr().is_some() && item.author == me) {
+        if claim.lane == ClaimLane::Done || (item.pr().is_some() && item.author == me) {
             continue; // finished, or you wrote it
         }
-        let Some((repo, _)) = claim.key.rsplit_once('#') else {
+        let path = brief::note_path(vault_dir, config::REPO, item.number);
+        let link = brief::wikilink(&path);
+        if claim.line.contains(&link) {
             continue;
-        };
-        let path = brief::note_path(vault_dir, repo, item.number);
-        if path.exists() || claim.line.contains(&brief::wikilink(&path)) {
+        }
+        if path.exists() {
+            out.links.push((claim.key.clone(), link));
+            continue;
+        }
+        if out.briefed.len() >= limit {
             continue;
         }
         let kind = if item.pr().is_some() {
@@ -261,7 +273,7 @@ fn write_briefings(
         };
         log(&format!("briefing {} ({})...", claim.key, kind.as_str()));
         let target = Target {
-            repo,
+            repo: config::REPO,
             number: item.number,
             url: &item.url,
             kind,
@@ -270,10 +282,10 @@ fn write_briefings(
         };
         match brief::write_briefing(vault_dir, &target) {
             Err(why) => log(&format!("  skipped ({why})")),
-            Ok((written, why)) => {
-                log(&format!("  {why}: {}", written.display()));
-                board.link_note(&claim.key, &brief::wikilink(&written));
-                out.push(format!("#{}", item.number));
+            Ok(written) => {
+                log(&format!("  written: {}", written.display()));
+                out.links.push((claim.key.clone(), link));
+                out.briefed.push(format!("#{}", item.number));
             }
         }
     }
@@ -298,30 +310,28 @@ struct LastRun<'a> {
     counts: Counts,
 }
 
-fn run(args: &Args) -> Result<()> {
+fn run(args: &Refresh) -> Result<()> {
     fs::create_dir_all(&args.state)?;
+    let Some(_lock) = take_lock(&args.state)? else {
+        log("another run holds the lock, so this one leaves the work to it");
+        return Ok(());
+    };
     let state_path = |name: &str| args.state.join(name);
-    let board_path = args.board.clone().unwrap_or_else(config::default_board);
     let now = Utc::now();
     let local = now.with_timezone(&Local).fixed_offset();
-    let vault_dir = board_path.parent().unwrap_or(Path::new(".")).to_owned();
-    let mut warnings: Vec<String> = Vec::new();
-    let mut degraded: Vec<&str> = Vec::new();
+    let vault_dir = args.board.parent().unwrap_or(Path::new(".")).to_owned();
+    let mut degraded: BTreeSet<Degraded> = BTreeSet::new();
+    // The kinds of reason this run cannot say anything about.
+    let mut unread_kinds: Vec<ReasonKind> = Vec::new();
 
     // 1. user state first
-    let mut board = Board::open(&board_path)?;
-    let dropped = board.migrate(is_floresta);
-    if dropped > 0 {
-        log(&format!(
-            "board: migrated from the multi-repo layout, {dropped} non-Floresta cards dropped"
-        ));
-    }
+    let board = Board::open(&args.board)?;
     let tombstones = board.tombstones();
     let mutes = board.mutes();
     let claimed = board.claimed();
     log(&format!(
         "board: {} · {} passed ({} muted) · {} claimed",
-        if board.existed { "existing" } else { "new" },
+        if board.existed() { "existing" } else { "new" },
         tombstones.len(),
         mutes.len(),
         claimed.len()
@@ -336,33 +346,40 @@ fn run(args: &Args) -> Result<()> {
     let snap = snapshot::fetch(config::REPO)?;
     log(&format!(
         "  {} open PRs, {} open issues",
-        snap.prs.len(),
-        snap.issues.len()
+        snap.prs().count(),
+        snap.issues().count()
     ));
     let my_prs: Vec<u64> = snap
-        .prs
-        .iter()
-        .filter(|item| item.author == login)
-        .map(|item| item.number)
+        .prs()
+        .filter(|(item, _)| item.author == login)
+        .map(|(item, _)| item.number)
         .collect();
     let merge = snapshot::merge_state(config::REPO, &my_prs);
-    let mut obs = obligations::collect(&snap, &me, now, &merge);
+    if !merge.unread.is_empty() {
+        log(&format!("  merge state unread for {:?}", merge.unread));
+        degraded.insert(Degraded::Merge);
+        unread_kinds.extend([ReasonKind::Conflict, ReasonKind::CiFailed]);
+    }
+    let mut obs = obligations::collect(&snap, &me, now, &merge.states);
     enrich_stale_acks(&mut obs, &me);
 
     // Neither of these may cost the board. A failed source leaves its lane as it
     // was: stale cards are recoverable, deleted ones are not.
+    let open_issues: Vec<&Item> = snap.issues().map(|(item, _)| item).collect();
     let unshipped_result = snapshot::mine(config::REPO, &login)
         .map_err(anyhow::Error::from)
-        .and_then(|mine| unshipped::run(&snap.issues, &mine, &login));
-    let (items, unshipped_ok) = match unshipped_result {
-        Ok(items) => (items, true),
+        .and_then(|mine| unshipped::run(&open_issues, &mine, &login));
+    let read_unshipped = match unshipped_result {
+        Ok(items) => Some(items),
         Err(err) => {
             log(&format!("  unshipped failed ({err:#})"));
-            degraded.push("unshipped");
-            (Vec::new(), false)
+            degraded.insert(Degraded::Unshipped);
+            unread_kinds.push(ReasonKind::Unshipped);
+            None
         }
     };
-    let promoted = promote_unshipped(&mut obs, &items, &snap, &me);
+    let items = read_unshipped.as_deref().unwrap_or_default();
+    let promoted = promote_unshipped(&mut obs, items, &snap, &me);
     // Work you have already done for an issue that is waiting on you is worth saying
     // on that card, even when it isn't yours enough to promote.
     for u in items.iter().filter(|u| !promoted.contains(&u.key)) {
@@ -374,7 +391,7 @@ fn run(args: &Args) -> Result<()> {
             ob.notes.push(format!("⚡ your {what} may fix this"));
         }
     }
-    let is_claimed = |key: &str| claimed.iter().any(|claim| claim.key == key);
+    let is_claimed = |key: &CardKey| claimed.iter().any(|claim| claim.key == *key);
     let shelf: Vec<&Unshipped> = items
         .iter()
         .filter(|u| {
@@ -384,7 +401,7 @@ fn run(args: &Args) -> Result<()> {
 
     let visible: Vec<Obligation<'_>> = obs
         .iter()
-        .filter(|ob| !obligations::is_muted(ob, mutes.get(&ob.key)))
+        .filter(|ob| !obligations::is_muted(ob, mutes.get(&ob.item.key)))
         .cloned()
         .collect();
     let n_muted = obs.len() - visible.len();
@@ -405,7 +422,14 @@ fn run(args: &Args) -> Result<()> {
         .map(|u| format!("{}..{}", config::UPSTREAM_REF, u.branch))
         .collect();
     let clones = config::clones();
-    let fp = footprint::compute(&unshipped::my_emails(&clones)?, &clones, &branch_refs)?;
+    // Ranking context, never a filter, so it is not worth the board either.
+    let footprint_result = unshipped::my_emails(&clones)
+        .and_then(|emails| footprint::compute(&emails, &clones, &branch_refs));
+    let fp = footprint_result.unwrap_or_else(|err| {
+        log(&format!("  footprint unread ({err:#})"));
+        degraded.insert(Degraded::Footprint);
+        Footprint::default()
+    });
 
     let mut column = HashSet::new();
     if config::PROJECT.enabled {
@@ -413,16 +437,13 @@ fn run(args: &Args) -> Result<()> {
             Ok(numbers) => column = numbers,
             Err(err) => {
                 log(&format!("  project board unreadable ({err})"));
-                warnings.push(
-                    "project board unreadable — does the token have read:project?".to_owned(),
-                );
-                degraded.push("project");
+                degraded.insert(Degraded::Project);
             }
         }
     }
-    let skip: HashSet<String> = obs
+    let skip: HashSet<CardKey> = obs
         .iter()
-        .map(|ob| ob.key.clone())
+        .map(|ob| ob.item.key.clone())
         .chain(claimed.iter().map(|claim| claim.key.clone()))
         .collect();
     let mut opps: Vec<Opportunity<'_>> =
@@ -433,25 +454,21 @@ fn run(args: &Args) -> Result<()> {
         .map(|o| o.item.number)
         .collect();
     let opp_merge = snapshot::merge_state(config::REPO, &pr_numbers);
+    if !opp_merge.unread.is_empty() {
+        log(&format!("  merge state unread for {:?}", opp_merge.unread));
+        degraded.insert(Degraded::Merge);
+    }
     for o in &mut opps {
-        o.merge = opp_merge.get(&o.item.number).cloned();
+        o.merge = opp_merge.states.get(&o.item.number).copied();
     }
     opportunities::fallback_rank(&mut opps, &fp);
     log(&format!("  {} opportunity candidates", opps.len()));
 
     // 3. model. Gists are decoration; the ranking falls back to fallback_rank.
-    let (gists, Ranked { picks, judged }) = if args.no_model {
-        let picks = opps
-            .iter()
-            .take(config::OPPORTUNITY_CAP)
-            .map(Pick::mechanical)
-            .collect();
+    let (gists, ranked) = if args.no_model {
         (
             BTreeMap::new(),
-            Ranked {
-                picks,
-                judged: false,
-            },
+            Ranked::mechanical(&opps, config::OPPORTUNITY_CAP),
         )
     } else {
         let gists = model::gists(&visible, &me, &state_path("gists.json"), model::claude)?;
@@ -468,113 +485,144 @@ fn run(args: &Args) -> Result<()> {
     log(&format!(
         "  {} gists · ranking {}",
         gists.len(),
-        if judged { "judged" } else { "mechanical" }
+        if ranked.is_judged() {
+            "judged"
+        } else {
+            "mechanical"
+        }
     ));
 
     // 4. write. An obligation you have dragged into Todo/Doing is yours already: it
     //    stays on that card, as an annotation, instead of appearing twice.
-    let active: HashMap<String, &'static str> = claimed
+    let active: HashMap<CardKey, ClaimLane> = claimed
         .iter()
-        .filter(|claim| matches!(claim.lane, "Todo" | "Doing"))
+        .filter(|claim| claim.lane.is_active())
         .map(|claim| (claim.key.clone(), claim.lane))
         .collect();
-    board.set_agent_lane(
-        AgentLane::NeedsMe,
-        visible
-            .iter()
-            .filter(|ob| !active.contains_key(&ob.key))
-            .map(|ob| render::ob_card(ob, gists.get(&ob.key).map(String::as_str)))
-            .collect(),
-    );
-    board.set_agent_lane(
+    let mut needs_me: Vec<Card> = visible
+        .iter()
+        .filter(|ob| !active.contains_key(&ob.item.key))
+        .map(|ob| render::ob_card(ob, gists.get(&ob.item.key).map(String::as_str)))
+        .collect();
+    let computed: HashSet<&CardKey> = visible.iter().map(|ob| &ob.item.key).collect();
+    needs_me.extend(board.carried(&unread_kinds, &computed));
+    let mut changes = Changes::default();
+    changes.lanes.push((AgentLane::NeedsMe, needs_me));
+    changes.lanes.push((
         AgentLane::Opportunities,
-        picks
+        ranked
+            .picks()
             .iter()
-            .map(|pick| render::opp_card(pick.opp, &pick.why))
+            .map(|(opp, verdict)| render::opp_card(opp, verdict.and_then(|v| v.why.as_deref())))
             .collect(),
-    );
-    if unshipped_ok {
-        board.set_agent_lane(
+    ));
+    if read_unshipped.is_some() {
+        changes.lanes.push((
             AgentLane::Unshipped,
             shelf.iter().map(|u| render::unshipped_card(u)).collect(),
-        );
+        ));
     } else {
         log("  Unshipped left untouched: its source failed");
     }
 
-    let github_keys: Vec<String> = claimed
+    let on_github: Vec<GitHubItem> = claimed
         .iter()
-        .filter(|claim| board::is_github_key(&claim.key))
-        .map(|claim| claim.key.clone())
+        .filter_map(|claim| claim.key.github().cloned())
         .collect();
-    let status = claims::fetch(&github_keys, &login);
+    let status = claims::fetch(&on_github, &login);
+    if on_github.iter().any(|item| !status.contains_key(item)) {
+        log("  some claimed cards could not be read");
+        degraded.insert(Degraded::Claims);
+    }
     let mut claim_alerts: Vec<String> = Vec::new();
     for claim in &claimed {
+        let held = match claim.key.github() {
+            // Not read, which says nothing, so the card keeps what it says.
+            Some(item) if !status.contains_key(item) => continue,
+            Some(item) => status.get(item),
+            None => None,
+        };
         let mut notes = Vec::new();
-        if let Some(ob) = visible.iter().find(|ob| ob.key == claim.key) {
+        if let Some(ob) = visible.iter().find(|ob| ob.item.key == claim.key) {
             notes.push(render::reasons_text(ob));
         }
-        let held = status.get(&claim.key);
         notes.extend(held.iter().flat_map(|s| s.notes.iter().cloned()));
-        board.annotate(&claim.key, &notes.join(" · "));
-        if let Some(held) = held.filter(|s| s.urgent)
-            && let Some((_, number)) = claim.key.rsplit_once('#')
-        {
-            claim_alerts.push(format!("#{number} — {}", held.notes.join(" · ")));
+        changes.notes.push((claim.key.clone(), notes.join(" · ")));
+        if let (Some(held), Some(item)) = (held.filter(|s| s.urgent), claim.key.github()) {
+            claim_alerts.push(format!("#{} — {}", item.number(), held.notes.join(" · ")));
         }
+    }
+
+    if args.dry_run {
+        println!("{}", board.preview(changes)?);
+    } else {
+        if board.commit(changes)? {
+            log("the board changed during this run; what you did is kept");
+        }
+        log(&format!("wrote {}", args.board.display()));
     }
 
     let today = local.date_naive().to_string();
     let briefed = if args.no_briefings || args.dry_run {
         Vec::new()
     } else {
-        write_briefings(
-            &mut board,
+        let done = write_briefings(
             &claimed,
             &snap,
             &login,
             &vault_dir,
             args.max_briefings,
             &today,
-        )
+        );
+        if !done.links.is_empty() {
+            board.commit(Changes {
+                links: done.links,
+                ..Changes::default()
+            })?;
+        }
+        done.briefed
     };
 
-    if args.dry_run {
-        println!("{}", board.render());
-    } else {
-        board.save()?;
-        log(&format!("wrote {}", board_path.display()));
-    }
-
     // 5. DM
-    let last_dm = model::load(&state_path("last_dm.json"));
-    let mut marks: BTreeMap<String, String> = visible
+    let last_dm = match model::read_state::<LastDm>(&state_path("last_dm.json")) {
+        Ok(found) => found.unwrap_or_default(),
+        Err(err) => {
+            log(&format!("  last_dm.json unreadable ({err})"));
+            degraded.insert(Degraded::LastDm);
+            LastDm::default()
+        }
+    };
+    let mut marks: BTreeMap<CardKey, String> = visible
         .iter()
-        .map(|ob| (ob.key.clone(), obligations::fingerprint(ob).0))
+        .map(|ob| {
+            let mark = obligations::fingerprint(ob).last_text();
+            (ob.item.key.clone(), mark)
+        })
         .collect();
-    for pick in &picks {
-        let item = pick.opp.item;
+    for (opp, _) in ranked.picks() {
+        let item = opp.item;
         let mark = item
             .head()
             .map_or_else(|| item.created.to_string(), str::to_owned);
-        marks.insert(pick.opp.key.clone(), mark);
+        marks.insert(item.key.clone(), mark);
     }
-    let new_keys: HashSet<String> = marks
+    let new_keys: HashSet<CardKey> = marks
         .iter()
-        .filter(|(key, mark)| last_dm["seen"][key.as_str()].as_str() != Some(mark.as_str()))
+        .filter(|(key, mark)| last_dm.seen.get(key) != Some(mark))
         .map(|(key, _)| key.clone())
         .collect();
     let n_gists = gists.len();
+    let n_picks = ranked.picks().len();
+    let judged = ranked.is_judged();
     let text = Dm {
         today: &local.format("%a %d %b %H:%M").to_string(),
         obs: &visible,
         gists,
         claimed_lane: active,
-        picks: &picks,
-        judged,
+        ranked,
         unshipped: shelf.len(),
         new_keys,
-        warnings: &warnings,
+        degraded: degraded.clone(),
         claim_alerts: &claim_alerts,
         muted: n_muted,
         briefed: &briefed,
@@ -582,8 +630,7 @@ fn run(args: &Args) -> Result<()> {
     }
     .render();
     fs::write(state_path("summary.txt"), &text)?;
-    let last_sent = last_dm["at"].as_str().filter(|at| !at.is_empty());
-    let slot = due_slot(local, &config::DM_SLOTS, last_sent)?;
+    let slot = due_slot(local, &config::DM_SLOTS, last_dm.at);
     if args.dry_run {
         println!("{text}");
     } else if args.notify && (slot.is_some() || args.dm_now) {
@@ -596,24 +643,25 @@ fn run(args: &Args) -> Result<()> {
             ));
         }
         if results.iter().any(|delivery| delivery.ok) {
-            let at = local.to_rfc3339_opts(SecondsFormat::Micros, false);
-            let record: Value = json!({"at": at, "seen": marks});
+            let record = LastDm {
+                at: Some(local),
+                seen: marks,
+            };
             model::save(&state_path("last_dm.json"), &record)?;
         }
     } else if args.notify {
-        log(&format!(
-            "DM not due; last sent {}",
-            last_dm["at"].as_str().unwrap_or("never")
-        ));
+        let sent = last_dm.at.map_or("never".to_owned(), |at| at.to_rfc3339());
+        log(&format!("DM not due; last sent {sent}"));
     }
 
+    let degraded: Vec<&str> = degraded.iter().map(|source| source.as_str()).collect();
     let record = LastRun {
         generated: now.to_rfc3339_opts(SecondsFormat::Micros, false),
         degraded: &degraded,
         counts: Counts {
             obligations: visible.len(),
             muted: n_muted,
-            opportunities: picks.len(),
+            opportunities: n_picks,
             candidates: opps.len(),
             unshipped: shelf.len(),
             judged,
@@ -633,11 +681,7 @@ fn run(args: &Args) -> Result<()> {
         } else {
             format!(" · degraded: {}", degraded.join(","))
         };
-        let message = format!(
-            "{} need you · {} opp{degraded_note}",
-            visible.len(),
-            picks.len()
-        );
+        let message = format!("{} need you · {n_picks} opp{degraded_note}", visible.len(),);
         let push_url = std::env::var("UPTIME_KUMA_PUSH_URL").ok();
         let (ok, detail) = notify::heartbeat(push_url.as_deref(), "up", &message);
         log(&format!(
@@ -649,16 +693,16 @@ fn run(args: &Args) -> Result<()> {
 }
 
 fn main() -> ExitCode {
-    let args = Args::parse();
-    let result = match args.command {
-        Some(Tool::Survey) => project::survey().map_err(anyhow::Error::from),
-        None => run(&args),
+    let cli = Cli::parse();
+    let (result, notify) = match &cli.tool {
+        Tool::Survey => (project::survey().map_err(anyhow::Error::from), false),
+        Tool::Refresh(args) => (run(args), args.notify),
     };
     let Err(err) = result else {
         return ExitCode::SUCCESS;
     };
     log(&format!("FAILED: {err:#}"));
-    if args.notify {
+    if notify {
         let push_url = std::env::var("UPTIME_KUMA_PUSH_URL").ok();
         notify::heartbeat(push_url.as_deref(), "down", &format!("{err:#}"));
     }
@@ -729,27 +773,23 @@ mod tests {
         ];
         let clock = |(day, hour, minute): Clock| at(day, hour, minute);
         for (name, now, last, want) in cases {
-            let last = last.map(|last| clock(last).to_rfc3339());
-            let got = due_slot(clock(now), &SLOTS, last.as_deref()).unwrap();
+            let got = due_slot(clock(now), &SLOTS, last.map(clock));
             assert_eq!(got, want.map(clock), "{name}");
         }
     }
 
+    /// The previous version of this program, and every run since, wrote these.
     #[test]
-    fn a_last_sent_with_microseconds_and_an_offset_is_understood() {
-        let got = due_slot(
-            at(15, 9, 7),
-            &SLOTS,
-            Some("2026-10-15T08:07:14.123456-03:00"),
+    fn a_last_dm_from_an_earlier_run_is_understood() {
+        let record: LastDm = serde_json::from_str(
+            r#"{"at": "2026-10-15T08:07:14.123456-03:00",
+                "seen": {"getfloresta/Floresta#7": "2026-10-08T17:14:49Z"}}"#,
         )
         .unwrap();
-        assert_eq!(got, None);
-    }
-
-    #[test]
-    fn the_floresta_filter_covers_upstream_and_the_fork_in_any_case() {
-        assert!(is_floresta("getfloresta/Floresta#1"));
-        assert!(is_floresta("lorenzolfm/Floresta#4"));
-        assert!(!is_floresta("bitcoin/bitcoin#1"));
+        assert_eq!(due_slot(at(15, 9, 7), &SLOTS, record.at), None);
+        assert_eq!(
+            record.seen[&"getfloresta/floresta#7".parse().unwrap()],
+            "2026-10-08T17:14:49Z"
+        );
     }
 }

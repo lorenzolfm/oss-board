@@ -5,18 +5,16 @@
 //! opportunity. Each item carries a list of reasons; each reason has
 //!
 //!   kind  also what a mute remembers
-//!   at    when the other side started waiting (ordering), or `None` for a pure
-//!         state like a merge conflict that has no start time we can see
-//!   last  the newest event behind it (re-arming a mute)
+//!   when  how long it has been waiting (ordering), and what re-arms a mute on it:
+//!         a newer event, or for a state of the PR like a merge conflict, a new head
 //!   text  the phone-sized explanation
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
 
-use crate::board::Mute;
 use crate::snapshot::{
     CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review, ReviewState,
     Snapshot,
@@ -35,69 +33,133 @@ static APPROVAL_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("a constant pattern compiles")
 });
 
+/// Declared in the order of their names, which is the order a fingerprint lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReasonKind {
-    ReviewRequested,
-    Mention,
-    Reply,
-    Thread,
-    ChangesRequested,
-    UnresolvedThread,
-    Conflict,
-    CiFailed,
-    StaleAck,
     Assigned,
+    ChangesRequested,
+    CiFailed,
+    Conflict,
+    Mention,
     PendingReview,
+    Reply,
+    ReviewRequested,
+    StaleAck,
+    Thread,
+    UnresolvedThread,
     Unshipped,
 }
 
 impl ReasonKind {
+    const ALL: [Self; 12] = [
+        Self::Assigned,
+        Self::ChangesRequested,
+        Self::CiFailed,
+        Self::Conflict,
+        Self::Mention,
+        Self::PendingReview,
+        Self::Reply,
+        Self::ReviewRequested,
+        Self::StaleAck,
+        Self::Thread,
+        Self::UnresolvedThread,
+        Self::Unshipped,
+    ];
+
+    /// A kind no longer known is simply not remembered, so its card comes back.
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == text)
+    }
+
     /// The name written into a card's fingerprint and the gist cache.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ReviewRequested => "review_requested",
-            Self::Mention => "mention",
-            Self::Reply => "reply",
-            Self::Thread => "thread",
-            Self::ChangesRequested => "changes_requested",
-            Self::UnresolvedThread => "unresolved_thread",
-            Self::Conflict => "conflict",
-            Self::CiFailed => "ci_failed",
-            Self::StaleAck => "stale_ack",
             Self::Assigned => "assigned",
+            Self::ChangesRequested => "changes_requested",
+            Self::CiFailed => "ci_failed",
+            Self::Conflict => "conflict",
+            Self::Mention => "mention",
             Self::PendingReview => "pending_review",
+            Self::Reply => "reply",
+            Self::ReviewRequested => "review_requested",
+            Self::StaleAck => "stale_ack",
+            Self::Thread => "thread",
+            Self::UnresolvedThread => "unresolved_thread",
             Self::Unshipped => "unshipped",
         }
     }
 }
 
+/// How a reason is dated, which is also what re-arms a mute on it.
+#[derive(Clone, Debug)]
+pub enum When {
+    /// Someone has waited since `first`, and `last` is the newest event behind that.
+    /// A newer event is a new trigger.
+    Events { first: Timestamp, last: Timestamp },
+    /// True of this head, `since` a time where one can be seen. A merge conflict has
+    /// none. A new head is a new trigger whatever its commit date says: a commit made
+    /// last week and pushed today is still a push.
+    Head {
+        oid: String,
+        since: Option<Timestamp>,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct Reason {
     pub kind: ReasonKind,
-    pub at: Option<Timestamp>,
-    pub last: Option<Timestamp>,
+    pub when: When,
     pub text: String,
 }
 
 impl Reason {
-    pub fn new(kind: ReasonKind, at: Option<Timestamp>, text: String) -> Self {
+    pub fn at(kind: ReasonKind, at: Timestamp, text: String) -> Self {
+        Self::between(kind, at, at, text)
+    }
+
+    fn between(kind: ReasonKind, first: Timestamp, last: Timestamp, text: String) -> Self {
         Self {
             kind,
-            at,
-            last: at,
+            when: When::Events { first, last },
             text,
         }
     }
 
-    fn until(mut self, last: Timestamp) -> Self {
-        self.last = Some(last);
-        self
+    fn on_head(kind: ReasonKind, pr: &PrDetail, since: Option<Timestamp>, text: String) -> Self {
+        Self {
+            kind,
+            when: When::Head {
+                oid: pr.head.clone(),
+                since,
+            },
+            text,
+        }
+    }
+
+    fn since(&self) -> Option<Timestamp> {
+        match &self.when {
+            When::Events { first, .. } => Some(*first),
+            When::Head { since, .. } => *since,
+        }
+    }
+
+    fn last(&self) -> Option<Timestamp> {
+        match &self.when {
+            When::Events { last, .. } => Some(*last),
+            When::Head { since, .. } => *since,
+        }
+    }
+
+    fn head(&self) -> Option<&str> {
+        match &self.when {
+            When::Events { .. } => None,
+            When::Head { oid, .. } => Some(oid),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Obligation<'a> {
-    pub key: String,
     pub item: &'a Item,
     pub reasons: Vec<Reason>,
     /// Context that informs, but is not part of what a mute remembers.
@@ -108,7 +170,6 @@ pub struct Obligation<'a> {
 impl<'a> Obligation<'a> {
     fn new(item: &'a Item, reasons: Vec<Reason>) -> Self {
         Self {
-            key: item.key.clone(),
             item,
             reasons,
             notes: Vec::new(),
@@ -121,7 +182,7 @@ impl<'a> Obligation<'a> {
     fn sort_key(&self) -> Timestamp {
         self.reasons
             .iter()
-            .filter_map(|reason| reason.at)
+            .filter_map(Reason::since)
             .min()
             .unwrap_or(self.item.updated)
     }
@@ -275,7 +336,12 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
             "mentioned you"
         };
         let text = format!("{} {verb} {} ago", first.author, first.at.ago(now));
-        out.push(Reason::new(ReasonKind::Mention, Some(first.at), text).until(newest.at));
+        out.push(Reason::between(
+            ReasonKind::Mention,
+            first.at,
+            newest.at,
+            text,
+        ));
     }
 
     if me.is(&item.author) || assigned_to_me {
@@ -298,7 +364,12 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
                 newest.author,
                 newest.at.ago(now)
             );
-            out.push(Reason::new(ReasonKind::Reply, Some(first.at), text).until(newest.at));
+            out.push(Reason::between(
+                ReasonKind::Reply,
+                first.at,
+                newest.at,
+                text,
+            ));
         }
     }
     out
@@ -336,7 +407,7 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
         return Vec::new();
     };
     let n = waiting.len();
-    let place = if n == 1 && !path.is_empty() {
+    let place = if n == 1 {
         format!(" ({})", basename(path))
     } else {
         String::new()
@@ -347,11 +418,11 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
         plural(n),
         first.at.ago(now)
     );
-    let reason = Reason::new(ReasonKind::Thread, Some(first.at), text);
-    match waiting.iter().map(|(_, newest, _)| newest.at).max() {
-        Some(last) => vec![reason.until(last)],
-        None => vec![reason],
-    }
+    let last = waiting
+        .iter()
+        .map(|(_, newest, _)| newest.at)
+        .fold(first.at, Timestamp::max);
+    vec![Reason::between(ReasonKind::Thread, first.at, last, text)]
 }
 
 /// Rule 1. Informal asks ("@you can you review") arrive via `conversation`.
@@ -365,7 +436,7 @@ fn review_request(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -
         .copied()
         .unwrap_or(item.created);
     let text = format!("review requested {} ago", at.ago(now));
-    vec![Reason::new(ReasonKind::ReviewRequested, Some(at), text)]
+    vec![Reason::at(ReasonKind::ReviewRequested, at, text)]
 }
 
 /// Rule 3: your PR, when there is something for you to do on it.
@@ -394,7 +465,12 @@ fn own_pr(
             plural(n),
             if n == 1 { "s" } else { "" }
         );
-        out.push(Reason::new(ReasonKind::UnresolvedThread, Some(*oldest), text).until(*newest));
+        out.push(Reason::between(
+            ReasonKind::UnresolvedThread,
+            *oldest,
+            *newest,
+            text,
+        ));
     }
 
     // Each reviewer's newest verdict, in the order they first gave one.
@@ -424,20 +500,22 @@ fn own_pr(
             oldest.author,
             oldest.at.ago(now)
         );
-        out.push(Reason::new(ReasonKind::ChangesRequested, Some(oldest.at), text).until(newest));
+        out.push(Reason::between(
+            ReasonKind::ChangesRequested,
+            oldest.at,
+            newest,
+            text,
+        ));
     }
 
     if let Some(merge) = merge {
-        if merge.mergeable.as_deref() == Some("CONFLICTING") {
+        if merge.is_conflicting() {
             let text = "conflicts with master, needs a rebase".to_owned();
-            out.push(Reason::new(ReasonKind::Conflict, None, text));
+            out.push(Reason::on_head(ReasonKind::Conflict, pr, None, text));
         }
-        if matches!(merge.ci.as_deref(), Some("FAILURE" | "ERROR")) {
-            out.push(Reason::new(
-                ReasonKind::CiFailed,
-                None,
-                "CI is red".to_owned(),
-            ));
+        if merge.is_red() {
+            let text = "CI is red".to_owned();
+            out.push(Reason::on_head(ReasonKind::CiFailed, pr, None, text));
         }
     }
     out
@@ -465,20 +543,25 @@ fn stale_ack(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec
     if me.is(&item.author) {
         return Vec::new();
     }
-    let (Some((acked, at)), Some(head)) = (latest_ack(item, pr, me), pr.head.as_deref()) else {
+    let Some((acked, at)) = latest_ack(item, pr, me) else {
         return Vec::new();
     };
-    if head.to_lowercase().starts_with(&acked) {
+    if pr.head.to_lowercase().starts_with(&acked) {
         return Vec::new();
     }
     let short = prefix(&acked, 7);
     if let Some(pushed) = pr.head_at.filter(|pushed| *pushed > at) {
         let text = format!("pushed {} ago, past your ACK {short}", pushed.ago(now));
-        return vec![Reason::new(ReasonKind::StaleAck, Some(pushed), text)];
+        return vec![Reason::on_head(
+            ReasonKind::StaleAck,
+            pr,
+            Some(pushed),
+            text,
+        )];
     }
     // A head older than the ACK means the ACK named some other commit.
     let text = format!("your ACK {short} is not the PR head");
-    vec![Reason::new(ReasonKind::StaleAck, Some(at), text)]
+    vec![Reason::at(ReasonKind::StaleAck, at, text)]
 }
 
 /// Rule 5: assigned to you and nothing links a fix yet.
@@ -501,15 +584,11 @@ fn assigned(item: &Item, issue: &IssueDetail, me: &Viewer, now: DateTime<Utc>) -
         format!("quiet {}", quiet.ago(now)),
     ];
     if let Some(milestone) = &item.milestone
-        && let Some(due) = milestone.due_on.as_deref().filter(|due| !due.is_empty())
+        && let Some(due) = milestone.due_on
     {
-        bits.push(format!("{} due {}", milestone.title, prefix(due, 10)));
+        bits.push(format!("{} due {}", milestone.title, due.date()));
     }
-    vec![Reason::new(
-        ReasonKind::Assigned,
-        Some(at),
-        bits.join(" · "),
-    )]
+    vec![Reason::at(ReasonKind::Assigned, at, bits.join(" · "))]
 }
 
 /// Rule 6: a review you started and never submitted. Only its author can see a
@@ -528,7 +607,7 @@ fn pending_review(pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason>
         "you started a review {} ago and never submitted it",
         at.ago(now)
     );
-    vec![Reason::new(ReasonKind::PendingReview, Some(at), text)]
+    vec![Reason::at(ReasonKind::PendingReview, at, text)]
 }
 
 // ---------------------------------------------------------------- assembly
@@ -542,7 +621,7 @@ pub fn collect<'a>(
     merge: &HashMap<u64, MergeState>,
 ) -> Vec<Obligation<'a>> {
     let mut out = Vec::new();
-    for item in snap.prs.iter().chain(&snap.issues) {
+    for item in &snap.items {
         let reasons = match &item.detail {
             Detail::Pr(pr) => {
                 let mut reasons = review_request(item, pr, me, now);
@@ -579,31 +658,71 @@ pub fn add_reason<'a>(obs: &mut Vec<Obligation<'a>>, item: &'a Item, reason: Rea
 
 // ---------------------------------------------------------------- mutes
 
-/// What a mute remembers: the newest event behind the card, and which kinds of
-/// reason it had. Kept in the card itself so dragging it to Passed carries it along.
-pub fn fingerprint(ob: &Obligation<'_>) -> (String, Vec<&'static str>) {
-    let last = ob
-        .reasons
-        .iter()
-        .filter_map(|reason| reason.last)
-        .max()
-        .map_or(String::new(), |last| last.to_string());
-    let kinds: BTreeSet<&'static str> = ob.reasons.iter().map(|r| r.kind.as_str()).collect();
-    (last, kinds.into_iter().collect())
+/// What a mute remembers, kept in the card itself so dragging it to Passed carries it
+/// along: the newest event behind the card, which kinds of reason it had, and the head
+/// any of them belong to.
+#[derive(Clone, Debug)]
+pub struct Fingerprint {
+    pub last: Option<Timestamp>,
+    pub kinds: BTreeSet<ReasonKind>,
+    pub head: Option<String>,
+}
+
+impl Fingerprint {
+    pub fn last_text(&self) -> String {
+        self.last.map_or(String::new(), |last| last.to_string())
+    }
+
+    pub fn kinds_text(&self) -> String {
+        let kinds: Vec<&str> = self.kinds.iter().map(|kind| kind.as_str()).collect();
+        kinds.join(",")
+    }
+}
+
+pub fn fingerprint(ob: &Obligation<'_>) -> Fingerprint {
+    Fingerprint {
+        last: ob.reasons.iter().filter_map(Reason::last).max(),
+        kinds: ob.reasons.iter().map(|reason| reason.kind).collect(),
+        head: ob.reasons.iter().find_map(Reason::head).map(str::to_owned),
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Seen {
+    last: Option<Timestamp>,
+    heads: BTreeSet<String>,
+}
+
+/// What every muted card for an item adds up to: for each kind of reason you muted,
+/// the newest event you saw it with and the heads you saw it on. A fingerprint whose
+/// time does not parse (a hand-edited card) counts as older than everything.
+#[derive(Clone, Debug, Default)]
+pub struct Mute(BTreeMap<ReasonKind, Seen>);
+
+impl Mute {
+    pub fn remember(&mut self, kind: ReasonKind, last: Option<Timestamp>, head: Option<&str>) {
+        let seen = self.0.entry(kind).or_default();
+        seen.last = seen.last.max(last);
+        seen.heads.extend(head.map(str::to_owned));
+    }
+
+    fn covers(&self, reason: &Reason) -> bool {
+        let Some(seen) = self.0.get(&reason.kind) else {
+            return false;
+        };
+        match &reason.when {
+            When::Events { last, .. } => Some(*last) <= seen.last,
+            When::Head { oid, .. } => seen.heads.contains(oid),
+        }
+    }
 }
 
 /// A mute holds until a NEW trigger: a reason kind that wasn't there when you muted
-/// it, or a timed event newer than the newest one you saw. General activity on the
-/// item never re-arms it -- only what would have made it an obligation in the first
-/// place.
+/// it, a timed event newer than the newest one you saw, or a new head for a state of
+/// the PR. General activity on the item never re-arms it -- only what would have made
+/// it an obligation in the first place.
 pub fn is_muted(ob: &Obligation<'_>, mute: Option<&Mute>) -> bool {
-    let Some(mute) = mute else {
-        return false;
-    };
-    ob.reasons.iter().all(|reason| {
-        mute.kinds.contains(reason.kind.as_str())
-            && !reason.last.is_some_and(|last| Some(last) > mute.last)
-    })
+    mute.is_some_and(|mute| ob.reasons.iter().all(|reason| mute.covers(reason)))
 }
 
 #[cfg(test)]
@@ -617,20 +736,32 @@ mod tests {
     //! conversation).
 
     use super::*;
+    use crate::snapshot::{Ci, Mergeability};
     use crate::testkit::{ME, bot, c, day, issue, me, now, pr, review, snap, thread};
 
-    fn merge_of(
-        number: u64,
-        mergeable: Option<&str>,
-        ci: Option<&str>,
-    ) -> HashMap<u64, MergeState> {
-        HashMap::from([(
-            number,
-            MergeState {
-                mergeable: mergeable.map(str::to_owned),
-                ci: ci.map(str::to_owned),
-            },
-        )])
+    fn merge_of(number: u64, mergeable: Mergeability, ci: Option<Ci>) -> HashMap<u64, MergeState> {
+        HashMap::from([(number, MergeState { mergeable, ci })])
+    }
+
+    #[test]
+    fn a_fingerprint_lists_kinds_by_name_so_a_gist_cache_still_matches() {
+        let viewer = me();
+        let snapshot = snap(
+            vec![pr(1).requested(ME, "2026-10-08T17:14:49Z").comments(vec![c(
+                "bob",
+                3,
+                &at_me("@me ping"),
+            )])],
+            vec![],
+        );
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert_eq!(
+            fingerprint(&obs[0]).kinds_text(),
+            "mention,review_requested"
+        );
+        for kind in ReasonKind::ALL {
+            assert_eq!(ReasonKind::parse(kind.as_str()), Some(kind));
+        }
     }
 
     fn kinds_with(item: Item, merge: &HashMap<u64, MergeState>) -> Vec<&'static str> {
@@ -840,11 +971,25 @@ mod tests {
 
     #[test]
     fn conflicts_and_red_ci_come_from_merge_state() {
-        let merge = merge_of(28, Some("CONFLICTING"), Some("FAILURE"));
+        let merge = merge_of(28, Mergeability::Conflicting, Some(Ci::Failure));
         assert_eq!(
             kinds_with(pr(28).author(ME).draft(), &merge),
             ["ci_failed", "conflict"]
         );
+    }
+
+    #[test]
+    fn a_pr_with_nothing_wrong_or_still_being_computed_asks_nothing() {
+        for merge in [
+            merge_of(29, Mergeability::Mergeable, None),
+            merge_of(29, Mergeability::Unknown, Some(Ci::Success)),
+            merge_of(29, Mergeability::Mergeable, Some(Ci::Pending)),
+        ] {
+            assert!(
+                kinds_with(pr(29).author(ME), &merge).is_empty(),
+                "{merge:?}"
+            );
+        }
     }
 
     #[test]
@@ -945,7 +1090,7 @@ mod tests {
             ],
             vec![issue(53).comments(vec![c("bob", 20, &at_me("@me"))])],
         );
-        let merge = merge_of(52, Some("CONFLICTING"), None);
+        let merge = merge_of(52, Mergeability::Conflicting, None);
         let order: Vec<u64> = collect(&snapshot, &viewer, now(), &merge)
             .iter()
             .map(|ob| ob.item.number)
@@ -954,11 +1099,12 @@ mod tests {
     }
 
     fn mute_of(ob: &Obligation<'_>) -> Mute {
-        let (last, kinds) = fingerprint(ob);
-        Mute {
-            last: Timestamp::parse(&last),
-            kinds: kinds.into_iter().map(str::to_owned).collect(),
+        let fp = fingerprint(ob);
+        let mut mute = Mute::default();
+        for kind in fp.kinds {
+            mute.remember(kind, fp.last, fp.head.as_deref());
         }
+        mute
     }
 
     #[test]
@@ -998,14 +1144,52 @@ mod tests {
         );
     }
 
+    /// A push answers whatever the state was. The commit date of what was pushed says
+    /// nothing about that: this one predates what you muted.
     #[test]
-    fn a_muted_conflict_stays_muted_while_it_persists() {
+    fn a_muted_state_of_your_pr_holds_on_its_head_and_a_push_rearms_it() {
         let viewer = me();
-        let merge = merge_of(61, Some("CONFLICTING"), None);
-        let snapshot = snap(vec![pr(61).author(ME).head_at(day(2))], vec![]);
-        let obs = collect(&snapshot, &viewer, now(), &merge);
+        for merge in [
+            merge_of(61, Mergeability::Conflicting, None),
+            merge_of(61, Mergeability::Mergeable, Some(Ci::Failure)),
+        ] {
+            let before = pr(61)
+                .author(ME)
+                .with_head(&"a".repeat(40))
+                .head_at(day(5))
+                .threads(vec![thread(vec![c("bob", 2, "a nit")])]);
+            let snapshot = snap(vec![before.clone()], vec![]);
+            let obs = collect(&snapshot, &viewer, now(), &merge);
+            let mute = mute_of(&obs[0]);
+            assert!(is_muted(&obs[0], Some(&mute)), "same head: {merge:?}");
+
+            let pushed = before.with_head(&"b".repeat(40)).head_at(day(4));
+            let snapshot = snap(vec![pushed], vec![]);
+            let obs = collect(&snapshot, &viewer, now(), &merge);
+            assert!(!is_muted(&obs[0], Some(&mute)), "new head: {merge:?}");
+        }
+    }
+
+    #[test]
+    fn a_muted_stale_ack_rearms_on_the_next_push() {
+        let viewer = me();
+        let acked = |head: &str, pushed| {
+            pr(63)
+                .with_head(&head.repeat(40))
+                .head_at(pushed)
+                .comments(vec![c(ME, 9, "ACK 1234567")])
+        };
+        let snapshot = snap(vec![acked("a", day(3))], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let mute = mute_of(&obs[0]);
         assert!(is_muted(&obs[0], Some(&mute)));
+
+        let snapshot = snap(vec![acked("b", day(4))], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert!(
+            !is_muted(&obs[0], Some(&mute)),
+            "an older commit, pushed later"
+        );
     }
 
     #[test]
@@ -1013,10 +1197,12 @@ mod tests {
         let viewer = me();
         let snapshot = snap(vec![pr(62).requested(ME, &day(3).to_string())], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let mute = Mute {
-            last: Timestamp::parse("not a time"),
-            kinds: BTreeSet::from(["review_requested".to_owned()]),
-        };
+        let mut mute = Mute::default();
+        mute.remember(
+            ReasonKind::ReviewRequested,
+            Timestamp::parse("not a time"),
+            None,
+        );
         assert!(!is_muted(&obs[0], Some(&mute)));
     }
 }

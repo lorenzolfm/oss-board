@@ -62,16 +62,25 @@ promoted to an obligation on that issue.
 
 - **Passed means two things, told apart by the card.** An obligation card
   carries a hidden fingerprint (`<!--t:...-->`); dragged to Passed, it is
-  **muted until a new trigger** -- a newer mention, reply, re-request or push
-  past your ACK, or a reason of a kind it didn't have. General activity never
-  re-arms it. Anything else dragged to Passed is gone for good.
+  **muted until a new trigger** -- a newer mention, reply or re-request, a push
+  on a PR you muted for a conflict, red CI or a stale ACK, or a reason of a kind
+  it didn't have. General activity never re-arms it. Anything else dragged to
+  Passed is gone for good.
 - **Dragging a card into Todo/Doing claims it.** A claimed obligation leaves
   `Needs me` and lives on your card as an annotation (the DM still lists it,
   marked "in your Doing"). Claiming someone else's PR writes a **review
   brief** -- reading order, review so far, unresolved threads, what moved
   since you last looked; claiming an issue writes the fix-oriented brief.
 - Card identity is the GitHub URL, or a `<!--k:...-->` key for cards with no
-  URL of their own, so you can reword a card freely.
+  URL of their own, so you can reword a card freely. Text from GitHub or the
+  model can't become a marker or a new line, whatever it says.
+- **The board is written on top of the file as it is by then**, so a card you
+  drag during a run is kept. The file has no schema and `rename` has no
+  condition, so an edit in the instant between that read and the write can still
+  be lost; the log says when the file moved during a run.
+- **A file that isn't a whole board is refused.** It needs the front matter and
+  the settings block Obsidian writes last. The run fails and the heartbeat goes
+  down, and the file is left as it was. Anything else in a board passes through.
 
 ## The DM
 
@@ -81,6 +90,11 @@ estimate and a first step; then a count line. 🆕 marks anything new or changed
 since the last DM. A long day is split into several messages, never truncated.
 If the judge is unavailable the opportunities are in mechanical order and the
 message says so.
+
+A source that can't be read is not a clear board. `Unshipped` and any card held
+by an unread source stay as they were, a claimed card keeps its note, and the
+DM, the heartbeat and `state/last_run.json` all name the source. The DM won't say
+"nothing is blocked on you" if what it failed to read could have said otherwise.
 
 The timer is hourly; the DM goes out on the first run at or after each slot, so
 a slot missed while the desktop was off is sent late -- unless it is more than
@@ -103,7 +117,7 @@ src/project.rs         the org board's Needs Review column (+ a survey tool)
 src/model.rs           gists and the judge, both cached in state/
 src/prompts.rs         what the model is told, byte for byte
 src/render.rs          cards and the DM text
-src/board.rs           kanban parse/merge/write, migration -- owns the state contract
+src/board.rs           kanban parse/merge/write -- owns the state contract
 src/claims.rs          upstream status of claimed cards
 src/brief.rs           issue and review briefs for claimed cards
 src/notify.rs          Telegram (chunked) + uptime-kuma heartbeat
@@ -115,16 +129,18 @@ state/                 gists.json, rank.json, last_dm.json, last_run.json, summa
 
 ## Running by hand
 
-From the repo root, since `--state` defaults to `./state`:
-
 ```sh
-cargo run -- --dry-run --no-model      # board + DM to stdout, no vault writes, no model
-cargo run -- --dry-run                 # ...with gists and the judge
-cargo run                              # update the board
-cargo run -- --notify --dm-now         # ...and DM now regardless of the slot
-cargo run -- survey                    # survey the org board's columns
-cargo test                             # or: nix flake check
+cargo run -- refresh --state state --dry-run --no-model  # board + DM to stdout, no vault writes, no model
+cargo run -- refresh --state state --dry-run             # ...with gists and the judge
+cargo run -- refresh --state state                       # update the board
+cargo run -- refresh --state state --notify --dm-now     # ...and DM now regardless of the slot
+cargo run -- survey                                      # survey the org board's columns
+cargo test                                               # or: nix flake check
 ```
+
+`--dry-run` and `--notify` exclude each other, and `--dm-now` needs `--notify`. Only
+one run at a time holds `--state`; a run that finds another in progress leaves the
+work to it.
 
 A dry run still refreshes `state/summary.txt` and `state/last_run.json`, and the
 model caches when the model runs, so point `--state` elsewhere to leave them alone.
@@ -159,9 +175,10 @@ reuse cached gists and rankings unless something they look at moved.
   post anything" is guidance, and the token is what enforces it. `brief.rs`
   refuses to run without `GH_TOKEN` rather than fall back to your own keyring
   auth, which carries `repo`.
-- **Migration was a one-off.** The first run on the old board dropped its agent
-  lanes and every non-Floresta card (you chose overwrite over archive). A board
-  without the old lanes is never migrated again, so a card you add later stays.
+- **Responses are parsed once, against GitHub's schema.** A field the schema
+  promises is required, so a response of another shape is a failed read rather
+  than an empty list. `labels` and `files` are the only lists allowed to be
+  missing, because they only decorate a card.
 
 ## Setup
 

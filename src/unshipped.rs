@@ -15,19 +15,19 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use chrono::NaiveDate;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::config;
-use crate::gh;
-use crate::proc::{self, Failure};
-use crate::snapshot::{Item, UpstreamPr};
-use crate::text::prefix;
+use crate::board::CardKey;
+use crate::config::{self, Repo};
+use crate::proc;
+use crate::snapshot::{self, Item, UpstreamPr};
+use crate::timestamp::Timestamp;
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -79,36 +79,29 @@ pub enum Origin {
 
 #[derive(Clone, Debug)]
 pub struct Unshipped {
-    pub key: String,
+    pub key: CardKey,
     pub origin: Origin,
     pub title: String,
     pub branch: String,
     pub commits: usize,
-    pub last: String,
+    pub last: NaiveDate,
     pub issue: Option<IssueLink>,
 }
 
-/// Empty on a timeout or a non-zero exit. Only a git that cannot start at all is an
-/// error, so the lane reports its source as failed rather than as empty.
 fn git(path: &Path, args: &[&str]) -> Result<String> {
-    let result = proc::run(
-        Command::new("git").arg("-C").arg(path).args(args),
-        GIT_TIMEOUT,
-    );
-    match result {
-        Ok(out) if out.success => Ok(out.stdout),
-        Ok(_) | Err(Failure::TimedOut(_)) => Ok(String::new()),
-        Err(failure @ Failure::Spawn(_)) => bail!("git: {failure}"),
-    }
+    proc::git(path, args, GIT_TIMEOUT)
 }
 
+/// The emails your commits are recognised by. Without one every commit would read as
+/// someone else's, and the lane as nothing to ship, so no email is a failed read.
 pub fn my_emails(clones: &[PathBuf]) -> Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
     for clone in clones {
         let email = git(clone, &["config", "user.email"])?.trim().to_lowercase();
-        if !email.is_empty() {
-            out.insert(email);
+        if email.is_empty() {
+            bail!("user.email is empty in {}", clone.display());
         }
+        out.insert(email);
     }
     Ok(out)
 }
@@ -164,7 +157,7 @@ fn tokens(text: &str) -> HashSet<String> {
 fn link_issue<'a>(
     text: &str,
     words: &HashSet<String>,
-    issues: &'a [Item],
+    issues: &[&'a Item],
 ) -> Option<(&'a Item, LinkHow)> {
     for found in REF_RE.captures_iter(text) {
         let Ok(number) = found[1].parse::<u64>() else {
@@ -174,12 +167,12 @@ fn link_issue<'a>(
         if (number >= 100 || named)
             && let Some(issue) = issues.iter().find(|issue| issue.number == number)
         {
-            return Some((issue, LinkHow::Refs));
+            return Some((*issue, LinkHow::Refs));
         }
     }
     let mut best = None;
     let mut score = 0;
-    for issue in issues {
+    for issue in issues.iter().copied() {
         let shared = tokens(&issue.title).intersection(words).count();
         if shared > score {
             best = Some(issue);
@@ -203,7 +196,7 @@ pub struct ForkPr {
     pub url: String,
     pub branch: String,
     pub head: String,
-    pub last: String,
+    pub last: NaiveDate,
     pub additions: u64,
     pub deletions: u64,
     pub commits: usize,
@@ -211,13 +204,13 @@ pub struct ForkPr {
 
 #[derive(Deserialize)]
 struct ForkAuthor {
-    login: Option<String>,
+    login: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ForkCommits {
-    total_count: Option<usize>,
+    total_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -225,53 +218,45 @@ struct ForkCommits {
 struct ForkNode {
     number: u64,
     title: String,
-    body: Option<String>,
+    body: String,
     url: String,
-    updated_at: String,
+    updated_at: Timestamp,
     additions: u64,
     deletions: u64,
     head_ref_name: String,
     head_ref_oid: String,
     author: Option<ForkAuthor>,
-    commits: Option<ForkCommits>,
+    commits: ForkCommits,
 }
 
-#[derive(Deserialize)]
-struct ForkConn {
-    nodes: Option<Vec<ForkNode>>,
-}
+const FORK_FIELDS: &str = "
+  number title body url updatedAt additions deletions
+  headRefName headRefOid author { login }
+  commits(first: 1) { totalCount }
+";
 
-fn fork_prs(fork: &str, me: &str) -> Result<Vec<ForkPr>> {
-    let Some((owner, name)) = fork.split_once('/') else {
-        bail!("not owner/name: {fork}");
-    };
-    let mut data = gh::graphql(&format!(
-        r#"query {{ repository(owner: "{owner}", name: "{name}") {{
-      pullRequests(states: OPEN, first: 50) {{ nodes {{
-        number title body url createdAt updatedAt additions deletions
-        headRefName headRefOid author {{ login }}
-        commits(first: 100) {{ totalCount nodes {{ commit {{ oid }} }} }} }} }} }} }}"#
-    ))?;
-    let conn: ForkConn = gh::decode(data["repository"]["pullRequests"].take())?;
-    Ok(conn
-        .nodes
-        .unwrap_or_default()
+fn fork_prs(fork: Repo, me: &str) -> Result<Vec<ForkPr>> {
+    let nodes: Vec<ForkNode> = snapshot::page_through(fork, "pullRequests", FORK_FIELDS, 50)?;
+    // Newest first as read. The lane lists the oldest first.
+    Ok(nodes
         .into_iter()
+        .rev()
         .filter(|node| {
-            let author = node.author.as_ref().and_then(|a| a.login.as_deref());
-            author.unwrap_or("").eq_ignore_ascii_case(me)
+            node.author
+                .as_ref()
+                .is_some_and(|author| author.login.eq_ignore_ascii_case(me))
         })
         .map(|node| ForkPr {
             number: node.number,
             title: node.title,
-            body: node.body.unwrap_or_default(),
+            body: node.body,
             url: node.url,
             branch: node.head_ref_name,
             head: node.head_ref_oid,
-            last: prefix(&node.updated_at, 10).to_owned(),
+            last: node.updated_at.date(),
             additions: node.additions,
             deletions: node.deletions,
-            commits: node.commits.and_then(|c| c.total_count).unwrap_or(0),
+            commits: node.commits.total_count,
         })
         .collect())
 }
@@ -281,7 +266,7 @@ struct LocalBranch {
     title: String,
     subjects: Vec<String>,
     commits: usize,
-    last: String,
+    last: NaiveDate,
     oids: HashSet<String>,
 }
 
@@ -292,9 +277,6 @@ fn local_branches(
     upstream_ref: &str,
 ) -> Result<Vec<LocalBranch>> {
     let mut out = Vec::new();
-    if !clone.join(".git").is_dir() {
-        return Ok(out);
-    }
     let refs = git(
         clone,
         &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
@@ -320,7 +302,7 @@ fn local_branches(
         let mut args = vec!["log", "--no-walk", "--format=%H%x09%ae%x09%cs%x09%s"];
         args.extend(&fresh);
         let log = git(clone, &args)?;
-        let mut mine: Vec<(&str, &str, &str)> = Vec::new();
+        let mut mine: Vec<(&str, NaiveDate, &str)> = Vec::new();
         for line in log.lines() {
             let mut fields = line.split('\t');
             let oid = fields.next().unwrap_or("");
@@ -328,6 +310,9 @@ fn local_branches(
             let day = fields.next().unwrap_or("");
             let subject = fields.next().unwrap_or("");
             if emails.contains(&email.to_lowercase()) {
+                let day = day
+                    .parse()
+                    .with_context(|| format!("git log gave {oid} the date {day:?}"))?;
                 mine.push((oid, day, subject));
             }
         }
@@ -340,14 +325,14 @@ fn local_branches(
             title: title.to_owned(),
             subjects: mine.iter().map(|(_, _, s)| (*s).to_owned()).collect(),
             commits: mine.len(),
-            last: last.to_owned(),
+            last,
             oids: mine.iter().map(|(oid, _, _)| (*oid).to_owned()).collect(),
         });
     }
     Ok(out)
 }
 
-fn link_of(text: &str, words: &HashSet<String>, issues: &[Item]) -> Option<IssueLink> {
+fn link_of(text: &str, words: &HashSet<String>, issues: &[&Item]) -> Option<IssueLink> {
     link_issue(text, words, issues).map(|(issue, how)| IssueLink {
         number: issue.number,
         url: issue.url.clone(),
@@ -359,7 +344,7 @@ fn link_of(text: &str, words: &HashSet<String>, issues: &[Item]) -> Option<Issue
 /// `snapshot::mine`: every PR you opened upstream.
 fn assemble(
     prs: Vec<ForkPr>,
-    issues: &[Item],
+    issues: &[&Item],
     upstream_mine: &[UpstreamPr],
     clones: &[PathBuf],
     upstream_ref: &str,
@@ -380,7 +365,7 @@ fn assemble(
         let words = tokens(&format!("{} {}", pr.title, pr.branch));
         let text = format!("{}\n{}", pr.body, pr.title);
         items.push(Unshipped {
-            key: crate::snapshot::item_key(&pr.url),
+            key: snapshot::item_key(&pr.url)?,
             issue: link_of(&text, &words, issues),
             origin: Origin::ForkPr {
                 number: pr.number,
@@ -407,7 +392,7 @@ fn assemble(
             let words = tokens(&format!("{} {}", branch.branch, branch.subjects.join(" ")));
             let text = format!("{}\n{}", branch.subjects.join("\n"), branch.title);
             items.push(Unshipped {
-                key: format!("branch:{}", branch.branch),
+                key: CardKey::branch(&branch.branch),
                 issue: link_of(&text, &words, issues),
                 origin: Origin::Branch,
                 title: branch.title,
@@ -420,7 +405,7 @@ fn assemble(
     Ok(items)
 }
 
-pub fn run(issues: &[Item], upstream_mine: &[UpstreamPr], me: &str) -> Result<Vec<Unshipped>> {
+pub fn run(issues: &[&Item], upstream_mine: &[UpstreamPr], me: &str) -> Result<Vec<Unshipped>> {
     assemble(
         fork_prs(config::FORK, me)?,
         issues,
@@ -440,8 +425,9 @@ mod tests {
     //! changed.
 
     use super::*;
-    use crate::testkit::issue;
+    use crate::testkit::{issue, key};
     use std::fs;
+    use std::process::Command;
     use tempfile::TempDir;
 
     const MINE: &str = "me@example.com";
@@ -567,6 +553,27 @@ mod tests {
         );
     }
 
+    /// A lane computed from a clone that could not be read would look like one with
+    /// nothing left to ship.
+    #[test]
+    fn a_clone_that_cannot_be_read_is_a_failure_not_an_empty_list() {
+        let missing = TempDir::new().unwrap().path().join("gone");
+        assert!(local_branches(&missing, &emails(), UPSTREAM).is_err());
+        assert!(my_emails(std::slice::from_ref(&missing)).is_err());
+
+        let repos = repos();
+        assert!(
+            local_branches(&repos.clone, &emails(), "upstream/no-such-ref").is_err(),
+            "a ref git cannot resolve is not a branch with nothing new on it"
+        );
+
+        run_git(&repos.clone, &["config", "user.email", ""], MINE);
+        assert!(
+            my_emails(std::slice::from_ref(&repos.clone)).is_err(),
+            "no email is no way to tell your commits from anyone's"
+        );
+    }
+
     fn fork_pr(number: u64, title: &str, branch: &str, head: &str) -> ForkPr {
         ForkPr {
             number,
@@ -575,7 +582,7 @@ mod tests {
             url: format!("https://github.com/lorenzolfm/Floresta/pull/{number}"),
             branch: branch.to_owned(),
             head: head.repeat(40),
-            last: "2026-09-12".to_owned(),
+            last: NaiveDate::from_ymd_opt(2026, 9, 12).unwrap(),
             additions: 1,
             deletions: 0,
             commits: 2,
@@ -615,29 +622,31 @@ mod tests {
             upstream_pr(shipped_title, "fix/time-based-ibd-progress-log"),
             upstream_pr("x", "shipped-as-pr"),
         ];
+        let issues = linkable_issues();
+        let issues: Vec<&Item> = issues.iter().collect();
         let items = assemble(
             prs,
-            &linkable_issues(),
+            &issues,
             &upstream,
             std::slice::from_ref(&repos.clone),
             UPSTREAM,
         )
         .unwrap();
-        let keys: Vec<&str> = items.iter().map(|u| u.key.as_str()).collect();
+        let keys: Vec<&CardKey> = items.iter().map(|u| &u.key).collect();
         assert!(
-            !keys.contains(&"lorenzolfm/Floresta#8"),
+            !keys.contains(&&key("lorenzolfm/floresta#8")),
             "already upstream under its title: {keys:?}"
         );
         assert!(
-            keys.contains(&"lorenzolfm/Floresta#6"),
+            keys.contains(&&key("lorenzolfm/floresta#6")),
             "nobody upstream has seen it: {keys:?}"
         );
         assert!(
-            !keys.contains(&"branch:shipped-as-pr"),
+            !keys.contains(&&CardKey::branch("shipped-as-pr")),
             "upstream merged it as a PR: {keys:?}"
         );
         assert!(
-            keys.contains(&"branch:dedup-config-parse"),
+            keys.contains(&&CardKey::branch("dedup-config-parse")),
             "an unpushed branch stays: {keys:?}"
         );
     }
@@ -645,6 +654,7 @@ mod tests {
     #[test]
     fn linking_work_to_the_issue_it_fixes() {
         let issues = linkable_issues();
+        let issues: Vec<&Item> = issues.iter().collect();
         let link = |text: &str, words: &str| {
             link_issue(text, &tokens(words), &issues).map(|(issue, how)| (issue.number, how))
         };

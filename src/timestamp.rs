@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, Utc};
 use serde::{Deserialize, Deserializer, de};
 
 const DAY_MICROS: i64 = 86_400_000_000;
@@ -17,19 +17,28 @@ impl Timestamp {
         Some(Self(parsed.with_timezone(&Utc)))
     }
 
+    pub fn at_midnight(date: NaiveDate) -> Self {
+        Self(date.and_time(NaiveTime::MIN).and_utc())
+    }
+
+    pub fn date(self) -> NaiveDate {
+        self.0.date_naive()
+    }
+
+    /// `now` is taken before the snapshot, so a comment arriving during the run is
+    /// newer than it. That comment is brand new, not negative.
     fn micros_ago(self, now: DateTime<Utc>) -> i64 {
-        (now - self.0).num_microseconds().unwrap_or(i64::MAX)
+        (now - self.0).num_microseconds().unwrap_or(i64::MAX).max(0)
     }
 
     /// Phone-sized age: whole days, or whole hours (at least 1) under a day.
     pub fn ago(self, now: DateTime<Utc>) -> String {
         let micros = self.micros_ago(now);
-        let days = micros.div_euclid(DAY_MICROS);
+        let days = micros / DAY_MICROS;
         if days >= 1 {
             return format!("{days}d");
         }
-        let hours = micros.rem_euclid(DAY_MICROS) / 3_600_000_000;
-        format!("{}h", hours.max(1))
+        format!("{}h", (micros / 3_600_000_000).max(1))
     }
 
     pub fn days_ago(self, now: DateTime<Utc>) -> f64 {
@@ -69,9 +78,16 @@ mod tests {
             ("2026-10-13T12:00:00Z", "1d"),
             ("2026-10-13T12:00:01Z", "23h"),
             ("2026-10-14T11:59:30Z", "1h"),
+            ("2026-10-14T12:00:30Z", "1h"),
         ] {
             assert_eq!(Timestamp::parse(at).unwrap().ago(now()), want, "{at}");
         }
+    }
+
+    #[test]
+    fn an_event_during_the_run_is_not_negative_days_old() {
+        let during = Timestamp::parse("2026-10-14T12:00:30Z").unwrap();
+        assert_eq!(during.days_ago(now()), 0.0);
     }
 
     #[test]

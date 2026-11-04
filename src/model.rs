@@ -11,23 +11,26 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use serde_json::ser::PrettyFormatter;
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::board::CardKey;
 use crate::footprint::Footprint;
-use crate::obligations::{Obligation, Viewer};
+use crate::obligations::{Obligation, Viewer, fingerprint};
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
-use crate::snapshot::{Interdiff, ReviewState};
-use crate::text::{clip, is_truthy};
+use crate::snapshot::{Ci, ReviewState};
+use crate::text::clip;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -68,12 +71,20 @@ pub fn claude(prompt: &str) -> Option<Value> {
     }
 }
 
-/// A state file, or an empty object if it is missing or corrupt.
-pub fn load(path: &Path) -> Value {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_else(|| json!({}))
+/// A state file. `None` if it does not exist yet; an error if it will not read.
+pub fn read_state<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, String> {
+    match fs::read_to_string(path) {
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.to_string()),
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|err| err.to_string()),
+    }
+}
+
+/// A cache. One that will not read costs a model pass and nothing else.
+fn load_cache<T: DeserializeOwned + Default>(path: &Path) -> T {
+    read_state(path).ok().flatten().unwrap_or_default()
 }
 
 fn dumps(value: &impl Serialize) -> Result<String> {
@@ -92,30 +103,14 @@ pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-/// A model-supplied field as text, whatever JSON type it arrived as.
-fn text_of(value: Option<&Value>) -> String {
-    match value {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Bool(true)) => "True".to_owned(),
-        Some(other) if is_truthy(other) => other.to_string(),
-        _ => String::new(),
-    }
-}
-
 // ---------------------------------------------------------------- gists
 
 fn gist_fingerprint(ob: &Obligation<'_>) -> String {
-    let last = ob
-        .reasons
-        .iter()
-        .filter_map(|reason| reason.last)
-        .max()
-        .map_or(String::new(), |last| last.to_string());
-    let mut kinds: Vec<&str> = ob.reasons.iter().map(|r| r.kind.as_str()).collect();
-    kinds.sort_unstable();
+    let fp = fingerprint(ob);
     format!(
-        "{last}|{}|{}",
-        kinds.join(","),
+        "{}|{}|{}",
+        fp.last_text(),
+        fp.kinds_text(),
         ob.item.head().unwrap_or("")
     )
 }
@@ -141,7 +136,7 @@ struct PrExcerpt<'a> {
 
 #[derive(Serialize)]
 struct Excerpt<'a> {
-    key: &'a str,
+    key: &'a CardKey,
     kind: &'static str,
     title: &'a str,
     reasons: Vec<&'a str>,
@@ -150,7 +145,13 @@ struct Excerpt<'a> {
     #[serde(flatten)]
     pr: Option<PrExcerpt<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    since_your_ack: Option<&'a Interdiff>,
+    since_your_ack: Option<AckDiff<'a>>,
+}
+
+#[derive(Serialize)]
+struct AckDiff<'a> {
+    rebase_only: bool,
+    changed: &'a [String],
 }
 
 fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
@@ -202,7 +203,7 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
             .collect(),
     });
     Excerpt {
-        key: &ob.key,
+        key: &item.key,
         kind: item.kind(),
         title: &item.title,
         reasons: ob.reasons.iter().map(|r| r.text.as_str()).collect(),
@@ -215,7 +216,10 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
             })
             .collect(),
         pr,
-        since_your_ack: ob.interdiff.as_ref(),
+        since_your_ack: ob.interdiff.as_ref().map(|diff| AckDiff {
+            rebase_only: diff.is_rebase_only(),
+            changed: &diff.changed,
+        }),
     }
 }
 
@@ -225,47 +229,55 @@ struct CachedGist {
     gist: String,
 }
 
-/// `key -> gist`. Cached per fingerprint; only changed items reach the model.
+#[derive(Deserialize)]
+struct GistAnswer {
+    gists: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct WireGist {
+    key: CardKey,
+    gist: String,
+}
+
+/// `key -> gist`. Cached per fingerprint; only changed items reach the model. An entry
+/// of another shape costs that one gist, which is decoration anyway.
 pub fn gists(
     obs: &[Obligation<'_>],
     me: &Viewer,
     cache_path: &Path,
     mut ask: impl FnMut(&str) -> Option<Value>,
-) -> Result<BTreeMap<String, String>> {
-    let mut cache: BTreeMap<String, CachedGist> =
-        serde_json::from_value(load(cache_path)).unwrap_or_default();
-    let want: HashMap<&str, String> = obs
+) -> Result<BTreeMap<CardKey, String>> {
+    let mut cache: BTreeMap<CardKey, CachedGist> = load_cache(cache_path);
+    let want: HashMap<&CardKey, String> = obs
         .iter()
-        .map(|ob| (ob.key.as_str(), gist_fingerprint(ob)))
+        .map(|ob| (&ob.item.key, gist_fingerprint(ob)))
         .collect();
     let todo: Vec<_> = obs
         .iter()
-        .filter(|ob| cache.get(&ob.key).map(|cached| &cached.fp) != want.get(ob.key.as_str()))
+        .filter(|ob| cache.get(&ob.item.key).map(|cached| &cached.fp) != want.get(&ob.item.key))
         .collect();
     if !todo.is_empty() {
         let excerpts: Vec<_> = todo.iter().map(|ob| excerpt(ob, me)).collect();
         let prompt = prompts::GIST.replace("%s", &dumps(&excerpts)?);
-        let answer = ask(&prompt).unwrap_or(Value::Null);
-        for entry in answer["gists"].as_array().into_iter().flatten() {
-            let (Some(key), Some(gist)) = (entry["key"].as_str(), entry.get("gist")) else {
+        let answer = ask(&prompt).and_then(|answer| serde_json::from_value(answer).ok());
+        let entries = answer.map_or(Vec::new(), |answer: GistAnswer| answer.gists);
+        for entry in entries {
+            let Ok(WireGist { key, gist }) = serde_json::from_value(entry) else {
                 continue;
             };
-            if let Some(fp) = want.get(key)
-                && is_truthy(gist)
-            {
-                let cached = CachedGist {
-                    fp: fp.clone(),
-                    gist: clip(&text_of(Some(gist)), 200),
-                };
-                cache.insert(key.to_owned(), cached);
+            let gist = clip(&gist, 200);
+            if let Some(fp) = want.get(&key).filter(|_| !gist.is_empty()) {
+                let fp = fp.clone();
+                cache.insert(key, CachedGist { fp, gist });
             }
         }
     }
-    cache.retain(|key, _| want.contains_key(key.as_str())); // forget what cleared
+    cache.retain(|key, _| want.contains_key(key)); // forget what cleared
     save(cache_path, &cache)?;
     Ok(cache
         .into_iter()
-        .filter(|(key, cached)| want.get(key.as_str()) == Some(&cached.fp))
+        .filter(|(key, cached)| want.get(key) == Some(&cached.fp))
         .map(|(key, cached)| (key, cached.gist))
         .collect())
 }
@@ -303,6 +315,7 @@ struct Candidate<'a> {
 
 fn candidate<'a>(o: &'a Opportunity<'_>) -> Candidate<'a> {
     let item = o.item;
+    let merge = o.merge;
     Candidate {
         number: item.number,
         kind: item.kind(),
@@ -315,13 +328,14 @@ fn candidate<'a>(o: &'a Opportunity<'_>) -> Candidate<'a> {
         comments: item.comments.len(),
         areas: &o.areas,
         description: clip(&item.body, 300),
-        since_you: Some(o.note.as_str()).filter(|note| !note.is_empty()),
+        since_you: o.note.as_deref(),
         pr: item.pr().map(|pr| CandidatePr {
             size: format!("+{}/-{}", pr.additions, pr.deletions),
             files: pr.changed_files,
             draft: pr.draft,
-            ci: o.ci(),
-            mergeable: o.mergeable(),
+            // "NONE" tells the judge there are no checks; null, that nobody looked.
+            ci: merge.map(|merge| merge.ci.map_or("NONE", Ci::wire)),
+            mergeable: merge.map(|merge| merge.mergeable.wire()),
             reviews: pr
                 .reviews
                 .iter()
@@ -338,7 +352,7 @@ fn candidate<'a>(o: &'a Opportunity<'_>) -> Candidate<'a> {
 fn rank_fingerprint(opps: &[Opportunity<'_>]) -> String {
     let mut signature: Vec<String> = opps
         .iter()
-        .map(|o| format!("{}@{}", o.key, o.item.head().unwrap_or("")))
+        .map(|o| format!("{}@{}", o.item.key, o.item.head().unwrap_or("")))
         .collect();
     signature.sort_unstable();
     let digest = Sha256::digest(signature.join("\n").as_bytes());
@@ -346,44 +360,100 @@ fn rank_fingerprint(opps: &[Opportunity<'_>]) -> String {
     hex[..16].to_owned()
 }
 
-/// The candidate number a pick points at, however the judge wrote it.
-fn pick_number(pick: &Value) -> Option<u64> {
-    let number = match pick.get("number")? {
-        Value::Number(n) => n
-            .as_i64()
-            .or_else(|| n.as_f64().map(|f| f.trunc() as i64))?,
-        Value::String(text) => text.trim().parse().ok()?,
-        Value::Bool(flag) => i64::from(*flag),
-        _ => return None,
-    };
-    u64::try_from(number).ok()
+#[derive(Default, Deserialize, Serialize)]
+struct RankCache {
+    sig: String,
+    at: f64,
+    picks: Vec<Value>,
 }
 
-pub struct Pick<'o, 'a> {
-    pub opp: &'o Opportunity<'a>,
-    pub why: String,
-    pub pitch: String,
-    pub est: String,
+#[derive(Deserialize)]
+struct RankAnswer {
+    picks: Vec<Value>,
 }
 
-impl<'o, 'a> Pick<'o, 'a> {
-    /// A pick with nothing from the judge: ranking order, shown as such.
-    pub fn mechanical(opp: &'o Opportunity<'a>) -> Self {
-        Self {
-            opp,
-            why: String::new(),
-            pitch: String::new(),
-            est: String::new(),
+/// One pick as the judge wrote it. Each is parsed on its own, so one that is malformed
+/// costs only itself.
+#[derive(Deserialize)]
+struct WirePick {
+    #[serde(deserialize_with = "number_or_numeric_text")]
+    number: u64,
+    #[serde(default, deserialize_with = "text_or_nothing")]
+    why: Option<String>,
+    #[serde(default, deserialize_with = "text_or_nothing")]
+    pitch: Option<String>,
+    #[serde(default, deserialize_with = "text_or_nothing")]
+    est: Option<String>,
+}
+
+/// The judge writes `"number": "1"` as readily as `"number": 1`. Anything else points
+/// at nothing.
+fn number_or_numeric_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Number {
+        Number(u64),
+        Text(String),
+    }
+    match Number::deserialize(deserializer)? {
+        Number::Number(number) => Ok(number),
+        Number::Text(text) => text.trim().parse().map_err(serde::de::Error::custom),
+    }
+}
+
+/// A field of the wrong type costs that field, not the pick.
+fn text_or_nothing<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
+    Ok(Value::deserialize(deserializer)?
+        .as_str()
+        .map(str::to_owned))
+}
+
+fn clipped(field: Option<String>, n: usize) -> Option<String> {
+    field
+        .map(|text| clip(&text, n))
+        .filter(|text| !text.is_empty())
+}
+
+/// What the judge said about a pick.
+#[derive(Debug)]
+pub struct Verdict {
+    pub why: Option<String>,
+    pub pitch: Option<String>,
+    pub est: Option<String>,
+}
+
+/// The opportunities to show, best first.
+#[derive(Debug)]
+pub enum Ranked<'o, 'a> {
+    Judged(Vec<(&'o Opportunity<'a>, Verdict)>),
+    /// Ranking order with nothing from the judge, and shown as such.
+    Mechanical(Vec<&'o Opportunity<'a>>),
+}
+
+impl Default for Ranked<'_, '_> {
+    fn default() -> Self {
+        Self::Mechanical(Vec::new())
+    }
+}
+
+impl<'o, 'a> Ranked<'o, 'a> {
+    pub fn mechanical(opps: &'o [Opportunity<'a>], cap: usize) -> Self {
+        Self::Mechanical(opps.iter().take(cap).collect())
+    }
+
+    pub fn is_judged(&self) -> bool {
+        matches!(self, Self::Judged(_))
+    }
+
+    pub fn picks(&self) -> Vec<(&'o Opportunity<'a>, Option<&Verdict>)> {
+        match self {
+            Self::Judged(picks) => picks.iter().map(|(opp, v)| (*opp, Some(v))).collect(),
+            Self::Mechanical(opps) => opps.iter().map(|opp| (*opp, None)).collect(),
         }
     }
 }
 
-pub struct Ranked<'o, 'a> {
-    pub picks: Vec<Pick<'o, 'a>>,
-    pub judged: bool,
-}
-
-/// Falls back to the order given, untouched, with `judged` false.
+/// Falls back to the order given, untouched, and says so.
 pub fn rank<'o, 'a>(
     opps: &'o [Opportunity<'a>],
     fp: &Footprint,
@@ -395,18 +465,13 @@ pub fn rank<'o, 'a>(
     let by_number: HashMap<u64, &'o Opportunity<'a>> =
         opps.iter().map(|o| (o.item.number, o)).collect();
     let sig = rank_fingerprint(opps);
-    let cache = load(cache_path);
+    let cache: RankCache = load_cache(cache_path);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0.0, |elapsed| elapsed.as_secs_f64());
-    let fresh = cache["sig"].as_str() == Some(sig.as_str())
-        && now - cache["at"].as_f64().unwrap_or(0.0) < ttl_hours * 3600.0;
-    let mut picks = if fresh {
-        cache["picks"].as_array().cloned()
-    } else {
-        None
-    };
-    if picks.is_none() && !opps.is_empty() {
+    let fresh = cache.sig == sig && now - cache.at < ttl_hours * 3600.0;
+    let mut picks = if fresh { cache.picks } else { Vec::new() };
+    if picks.is_empty() && !opps.is_empty() {
         let candidates: Vec<_> = opps.iter().map(candidate).collect();
         let areas: Vec<String> = fp
             .areas()
@@ -419,47 +484,48 @@ pub fn rank<'o, 'a>(
             .replace("%(cap)d", &cap.to_string())
             .replace("%(footprint)s", &format!("[{}]", areas.join(", ")))
             .replace("%(payload)s", &dumps(&candidates)?);
-        let answer = ask(&prompt).unwrap_or(Value::Null);
-        picks = answer["picks"].as_array().cloned();
+        let answer = ask(&prompt).and_then(|answer| serde_json::from_value(answer).ok());
+        picks = answer.map_or(Vec::new(), |answer: RankAnswer| answer.picks);
         // An empty verdict is retried, not kept.
-        if let Some(list) = picks.as_ref().filter(|list| !list.is_empty()) {
-            save(cache_path, &json!({"sig": sig, "at": now, "picks": list}))?;
+        if !picks.is_empty() {
+            save(
+                cache_path,
+                &RankCache {
+                    sig,
+                    at: now,
+                    picks: picks.clone(),
+                },
+            )?;
         }
     }
-    let mut out: Vec<Pick<'o, 'a>> = Vec::new();
+    let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for pick in picks.iter().flatten() {
-        let Some(number) = pick_number(pick) else {
+    for pick in picks {
+        let Ok(pick) = serde_json::from_value::<WirePick>(pick) else {
             continue;
         };
-        let Some(opp) = by_number.get(&number).copied() else {
+        let Some(opp) = by_number.get(&pick.number).copied() else {
             continue; // invented
         };
-        if !seen.insert(number) {
+        if !seen.insert(pick.number) {
             continue; // a duplicate
         }
-        out.push(Pick {
-            opp,
-            why: clip(&text_of(pick.get("why")), 80),
-            pitch: clip(&text_of(pick.get("pitch")), 240),
-            est: clip(&text_of(pick.get("est")), 8),
-        });
+        let verdict = Verdict {
+            why: clipped(pick.why, 80),
+            pitch: clipped(pick.pitch, 240),
+            est: clipped(pick.est, 8),
+        };
+        out.push((opp, verdict));
         if out.len() >= cap {
             break;
         }
     }
-    if !out.is_empty() {
-        return Ok(Ranked {
-            picks: out,
-            judged: true,
-        });
+    if out.is_empty() {
+        // No usable answer -- or the judge kept nothing, which is distrusted the same
+        // way the old board distrusted it.
+        return Ok(Ranked::mechanical(opps, cap));
     }
-    // No usable answer -- or the judge kept nothing, which is distrusted the same
-    // way the old board distrusted it.
-    Ok(Ranked {
-        picks: opps.iter().take(cap).map(Pick::mechanical).collect(),
-        judged: false,
-    })
+    Ok(Ranked::Judged(out))
 }
 
 #[cfg(test)]
@@ -469,27 +535,16 @@ mod tests {
 
     use super::*;
     use crate::obligations::collect;
-    use crate::opportunities::Source;
     use crate::render::Dm;
     use crate::snapshot::Item;
-    use crate::testkit::{ME, c, day, me, now, pr, snap};
+    use crate::testkit::{ME, c, day, key, me, now, opportunity, pr, snap};
+    use serde_json::json;
     use std::cell::Cell;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
     fn opportunities(items: &[Item]) -> Vec<Opportunity<'_>> {
-        items
-            .iter()
-            .map(|item| Opportunity {
-                key: item.key.clone(),
-                item,
-                sources: vec![Source::Unreviewed],
-                note: String::new(),
-                age_days: 2.0,
-                areas: vec![],
-                merge: None,
-            })
-            .collect()
+        items.iter().map(opportunity).collect()
     }
 
     fn items() -> Vec<Item> {
@@ -501,7 +556,11 @@ mod tests {
     }
 
     fn numbers(ranked: &Ranked<'_, '_>) -> Vec<u64> {
-        ranked.picks.iter().map(|p| p.opp.item.number).collect()
+        ranked
+            .picks()
+            .iter()
+            .map(|(opp, _)| opp.item.number)
+            .collect()
     }
 
     fn rank_with<'o, 'a>(
@@ -528,8 +587,32 @@ mod tests {
             {"number": "1", "why": "x"},
         ]});
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(answer));
-        assert!(ranked.judged);
+        assert!(ranked.is_judged());
         assert_eq!(numbers(&ranked), [3, 1], "invented and duplicate dropped");
+    }
+
+    #[test]
+    fn a_pick_that_points_at_nothing_is_dropped_and_a_bad_field_costs_only_itself() {
+        let dir = TempDir::new().unwrap();
+        let items = items();
+        let opps = opportunities(&items);
+        let answer = json!({"picks": [
+            {"number": true, "why": "a boolean is not number 1"},
+            {"number": 1.5},
+            {"number": -1},
+            {"number": [1]},
+            {"number": null},
+            "not an object",
+            {"number": 2, "why": true, "pitch": 7, "est": ""},
+        ]});
+        let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(answer));
+        assert_eq!(numbers(&ranked), [2]);
+        let picks = ranked.picks();
+        let verdict = picks[0].1.unwrap();
+        assert_eq!(
+            (&verdict.why, &verdict.pitch, &verdict.est),
+            (&None, &None, &None)
+        );
     }
 
     #[test]
@@ -538,7 +621,7 @@ mod tests {
         let items = items();
         let opps = opportunities(&items);
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(json!({"picks": []})));
-        assert!(!ranked.judged);
+        assert!(!ranked.is_judged());
         assert_eq!(numbers(&ranked), [1, 2, 3]);
     }
 
@@ -550,8 +633,7 @@ mod tests {
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), None);
         let message = Dm {
             today: "d",
-            picks: &ranked.picks,
-            judged: ranked.judged,
+            ranked,
             cap: 3,
             ..Dm::default()
         }
@@ -589,18 +671,18 @@ mod tests {
         let base = pr(100).requested(ME, &day(1).to_string());
         let snapshot = snap(vec![base.clone()], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &empty);
-        let key = obs[0].key.clone();
+        let item_key = obs[0].item.key.clone();
 
         let calls = Cell::new(0);
         let ask = |_: &str| {
             calls.set(calls.get() + 1);
-            Some(json!({"gists": [{"key": key, "gist": "asks for a yes/no"}]}))
+            Some(json!({"gists": [{"key": item_key.to_string(), "gist": "asks for a yes/no"}]}))
         };
         let first = gists(&obs, &viewer, &path, ask).unwrap();
         let second = gists(&obs, &viewer, &path, ask).unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(first, second);
-        assert_eq!(first[&key], "asks for a yes/no");
+        assert_eq!(first[&item_key], "asks for a yes/no");
 
         let newer = snap(
             vec![
@@ -641,8 +723,7 @@ mod tests {
         let snapshot = snap(vec![pr(100).requested(ME, "2026-10-08T17:14:49Z")], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let cached = format!(
-            "{{\n \"{}\": {{\n  \"fp\": \"2026-10-08T17:14:49Z|review_requested|{}\",\n  \"gist\": \"caf\\u00e9\"\n }}\n}}",
-            obs[0].key,
+            "{{\n \"getfloresta/Floresta#100\": {{\n  \"fp\": \"2026-10-08T17:14:49Z|review_requested|{}\",\n  \"gist\": \"caf\\u00e9\"\n }}\n}}",
             "f".repeat(40),
         );
         fs::write(&path, cached).unwrap();
@@ -650,6 +731,37 @@ mod tests {
             panic!("a cached gist must not ask")
         })
         .unwrap();
-        assert_eq!(got[&obs[0].key], "café");
+        assert_eq!(got[&key("getfloresta/floresta#100")], "café");
+
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "r.json");
+        let items = items();
+        let opps = opportunities(&items);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let cached = json!({
+            "sig": rank_fingerprint(&opps),
+            "at": now,
+            "picks": [{"est": "1h", "number": 2, "pitch": "p", "why": "w"}],
+        });
+        fs::write(&path, cached.to_string()).unwrap();
+        let ranked = rank(&opps, &Footprint::default(), 8, &path, 12.0, |_| {
+            panic!("a fresh ranking must not ask")
+        })
+        .unwrap();
+        assert_eq!(numbers(&ranked), [2]);
+    }
+
+    #[test]
+    fn a_corrupt_cache_costs_a_model_pass_and_nothing_else() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "r.json");
+        fs::write(&path, "{{{ not json").unwrap();
+        let items = items();
+        let opps = opportunities(&items);
+        let ranked = rank_with(&opps, &path, Some(json!({"picks": [{"number": 1}]})));
+        assert_eq!(numbers(&ranked), [1]);
     }
 }

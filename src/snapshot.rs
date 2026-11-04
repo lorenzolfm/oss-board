@@ -14,13 +14,20 @@
 //! The newest 60 comments and reviews, 100 threads and 30 comments per thread are
 //! read. A mention older than that on a busier thread is missed, which is why the
 //! caps are generous.
+//!
+//! The wire structs follow GitHub's schema: a field the schema promises is required,
+//! so a response without it fails the read. A list the rules decide from must be
+//! there even where the schema lets it be null, because no list is not an empty one.
+//! `labels` and `files` only decorate a card, so those two may be missing.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
 
-use crate::board::key_of;
-use crate::gh::{self, GhError};
+use crate::board::CardKey;
+use crate::config::Repo;
+use crate::gh::{self, Conn, GhError, Login, Page};
 use crate::timestamp::Timestamp;
 
 /// reviewThreads x comments make PR pages heavy.
@@ -77,6 +84,14 @@ pub enum ReviewState {
     Other,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommentKind {
     Comment,
@@ -114,7 +129,7 @@ pub struct Thread {
 #[serde(rename_all = "camelCase")]
 pub struct Milestone {
     pub title: String,
-    pub due_on: Option<String>,
+    pub due_on: Option<Timestamp>,
 }
 
 #[derive(Clone, Debug)]
@@ -123,9 +138,9 @@ pub struct PrDetail {
     pub additions: u64,
     pub deletions: u64,
     pub changed_files: u64,
-    pub head: Option<String>,
+    pub head: String,
     pub head_at: Option<Timestamp>,
-    pub review_decision: Option<String>,
+    pub review_decision: Option<ReviewDecision>,
     pub requested: Vec<String>,
     pub requested_at: HashMap<String, Timestamp>,
     pub reviews: Vec<Review>,
@@ -147,7 +162,7 @@ pub enum Detail {
 
 #[derive(Clone, Debug)]
 pub struct Item {
-    pub key: String,
+    pub key: CardKey,
     pub number: u64,
     pub title: String,
     pub url: String,
@@ -180,19 +195,114 @@ impl Item {
     }
 
     pub fn head(&self) -> Option<&str> {
-        self.pr().and_then(|pr| pr.head.as_deref())
+        self.pr().map(|pr| pr.head.as_str())
     }
 }
 
+/// Every open item, PRs first. One list, so nothing can be filed under the wrong kind.
 pub struct Snapshot {
-    pub prs: Vec<Item>,
-    pub issues: Vec<Item>,
+    pub items: Vec<Item>,
 }
 
-#[derive(Clone, Debug, Default)]
+impl Snapshot {
+    pub fn prs(&self) -> impl Iterator<Item = (&Item, &PrDetail)> {
+        self.items.iter().filter_map(|item| match &item.detail {
+            Detail::Pr(pr) => Some((item, pr)),
+            Detail::Issue(_) => None,
+        })
+    }
+
+    pub fn issues(&self) -> impl Iterator<Item = (&Item, &IssueDetail)> {
+        self.items.iter().filter_map(|item| match &item.detail {
+            Detail::Pr(_) => None,
+            Detail::Issue(issue) => Some((item, issue)),
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Mergeability {
+    Mergeable,
+    Conflicting,
+    #[serde(other)]
+    Unknown,
+}
+
+impl Mergeability {
+    /// As GitHub spells it, which is what the judge is shown.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Mergeable => "MERGEABLE",
+            Self::Conflicting => "CONFLICTING",
+            Self::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Ci {
+    Success,
+    Failure,
+    Error,
+    Pending,
+    Expected,
+}
+
+impl Ci {
+    /// As GitHub spells it, which is what the judge is shown.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Success => "SUCCESS",
+            Self::Failure => "FAILURE",
+            Self::Error => "ERROR",
+            Self::Pending => "PENDING",
+            Self::Expected => "EXPECTED",
+        }
+    }
+}
+
+/// A PR's merge state, read. Not having read it is a missing `MergeState`, never one
+/// of these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MergeState {
-    pub mergeable: Option<String>,
-    pub ci: Option<String>,
+    pub mergeable: Mergeability,
+    /// `None`: no checks are configured.
+    pub ci: Option<Ci>,
+}
+
+impl MergeState {
+    pub fn is_conflicting(self) -> bool {
+        self.mergeable == Mergeability::Conflicting
+    }
+
+    pub fn is_red(self) -> bool {
+        matches!(self.ci, Some(Ci::Failure | Ci::Error))
+    }
+
+    #[cfg(test)]
+    pub fn conflicting() -> Self {
+        Self {
+            mergeable: Mergeability::Conflicting,
+            ci: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn red() -> Self {
+        Self {
+            mergeable: Mergeability::Mergeable,
+            ci: Some(Ci::Failure),
+        }
+    }
+}
+
+/// What `merge_state` could and could not find out.
+#[derive(Debug, Default)]
+pub struct MergeRead {
+    pub states: HashMap<u64, MergeState>,
+    pub unread: Vec<u64>,
 }
 
 /// One of your upstream PRs, in any state: what unshipped work is checked against.
@@ -204,10 +314,15 @@ pub struct UpstreamPr {
 
 /// What changed between the commit you ACKed and the head, wherever in master
 /// each sits.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Interdiff {
-    pub rebase_only: bool,
     pub changed: Vec<String>,
+}
+
+impl Interdiff {
+    pub fn is_rebase_only(&self) -> bool {
+        self.changed.is_empty()
+    }
 }
 
 /// A review's body is part of the conversation exactly like a comment; an empty
@@ -227,46 +342,43 @@ pub fn fold_reviews(comments: &mut Vec<Comment>, reviews: &[Review]) {
     comments.sort_by_key(|comment| comment.at);
 }
 
-pub fn item_key(url: &str) -> String {
-    key_of(url).unwrap_or_else(|| url.to_owned())
+/// The key of an item, from the URL GitHub gave for it.
+pub fn item_key(url: &str) -> Result<CardKey, GhError> {
+    CardKey::of_url(url).ok_or_else(|| GhError(format!("not an issue or PR url: {url}")))
 }
 
 // ---------------------------------------------------------------- the wire
 
+/// `repository { <alias>: ... }`: a connection, or a batch of aliased lookups.
 #[derive(Deserialize)]
-struct Conn<T> {
-    nodes: Option<Vec<Option<T>>>,
+struct Repository<T> {
+    repository: HashMap<String, T>,
 }
 
-fn nodes<T>(conn: Option<Conn<T>>) -> Vec<T> {
-    conn.and_then(|conn| conn.nodes)
-        .unwrap_or_default()
-        .into_iter()
-        .flatten()
-        .collect()
+fn nullable<T>(conn: Option<Conn<T>>) -> impl Iterator<Item = T> {
+    conn.into_iter().flat_map(Conn::into_nodes)
 }
 
 #[derive(Deserialize)]
 struct Actor {
     #[serde(rename = "__typename")]
-    typename: Option<String>,
-    login: Option<String>,
+    typename: String,
+    login: String,
 }
 
+/// A deleted account has no author at all.
 fn actor(author: Option<Actor>) -> (String, bool) {
-    let (typename, login) = author.map_or((None, None), |a| (a.typename, a.login));
-    let login = login.unwrap_or_else(|| "ghost".to_owned());
-    let bot = typename.as_deref() == Some("Bot") || login.ends_with("[bot]");
-    (login, bot)
+    match author {
+        None => ("ghost".to_owned(), false),
+        Some(author) => {
+            let bot = author.typename == "Bot" || author.login.ends_with("[bot]");
+            (author.login, bot)
+        }
+    }
 }
 
-#[derive(Deserialize)]
-struct Login {
-    login: Option<String>,
-}
-
-fn logins(conn: Option<Conn<Login>>) -> Vec<String> {
-    nodes(conn).into_iter().filter_map(|a| a.login).collect()
+fn logins(conn: Conn<Login>) -> Vec<String> {
+    conn.into_nodes().filter_map(|a| a.login).collect()
 }
 
 #[derive(Deserialize)]
@@ -274,11 +386,15 @@ struct Label {
     name: String,
 }
 
+fn label_names(conn: Option<Conn<Label>>) -> Vec<String> {
+    nullable(conn).map(|l| l.name).collect()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CommentNode {
     author: Option<Actor>,
-    body: Option<String>,
+    body: String,
     created_at: Timestamp,
 }
 
@@ -289,7 +405,7 @@ impl CommentNode {
             author,
             bot,
             at: self.created_at,
-            body: self.body.unwrap_or_default(),
+            body: self.body,
             kind,
         }
     }
@@ -300,7 +416,7 @@ impl CommentNode {
 struct ReviewNode {
     author: Option<Actor>,
     state: ReviewState,
-    body: Option<String>,
+    body: String,
     submitted_at: Option<Timestamp>,
     created_at: Timestamp,
 }
@@ -308,20 +424,20 @@ struct ReviewNode {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadNode {
-    is_resolved: Option<bool>,
-    path: Option<String>,
-    comments: Option<Conn<CommentNode>>,
+    is_resolved: bool,
+    path: String,
+    comments: Conn<CommentNode>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct HeadCommit {
-    committed_date: Option<Timestamp>,
+    committed_date: Timestamp,
 }
 
 #[derive(Deserialize)]
 struct CommitNode {
-    commit: Option<HeadCommit>,
+    commit: HeadCommit,
 }
 
 #[derive(Deserialize)]
@@ -333,7 +449,7 @@ struct ReviewRequestNode {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ReviewRequestedEvent {
-    created_at: Option<Timestamp>,
+    created_at: Timestamp,
     requested_reviewer: Option<Login>,
 }
 
@@ -348,81 +464,85 @@ struct PrNode {
     number: u64,
     title: String,
     url: String,
-    body: Option<String>,
-    is_draft: Option<bool>,
+    body: String,
+    is_draft: bool,
     created_at: Timestamp,
     updated_at: Timestamp,
-    additions: Option<u64>,
-    deletions: Option<u64>,
-    changed_files: Option<u64>,
-    head_ref_oid: Option<String>,
+    additions: u64,
+    deletions: u64,
+    changed_files: u64,
+    head_ref_oid: String,
     author: Option<Actor>,
     milestone: Option<Milestone>,
     labels: Option<Conn<Label>>,
-    assignees: Option<Conn<Login>>,
-    review_decision: Option<String>,
-    review_requests: Option<Conn<ReviewRequestNode>>,
-    commits: Option<Conn<CommitNode>>,
-    reviews: Option<Conn<ReviewNode>>,
-    comments: Option<Conn<CommentNode>>,
-    review_threads: Option<Conn<ThreadNode>>,
-    timeline_items: Option<Conn<ReviewRequestedEvent>>,
+    assignees: Conn<Login>,
+    review_decision: Option<ReviewDecision>,
+    review_requests: Conn<ReviewRequestNode>,
+    commits: Conn<CommitNode>,
+    reviews: Conn<ReviewNode>,
+    comments: Conn<CommentNode>,
+    review_threads: Conn<ThreadNode>,
+    timeline_items: Conn<ReviewRequestedEvent>,
     files: Option<Conn<FileNode>>,
 }
 
-impl From<PrNode> for Item {
-    fn from(n: PrNode) -> Self {
+impl TryFrom<PrNode> for Item {
+    type Error = GhError;
+
+    fn try_from(n: PrNode) -> Result<Self, GhError> {
         let (author, author_bot) = actor(n.author);
-        let reviews: Vec<Review> = nodes(n.reviews)
-            .into_iter()
+        let reviews: Vec<Review> = n
+            .reviews
+            .into_nodes()
             .map(|r| {
                 let (author, bot) = actor(r.author);
                 Review {
                     author,
                     bot,
                     state: r.state,
-                    body: r.body.unwrap_or_default(),
+                    body: r.body,
                     at: r.submitted_at.unwrap_or(r.created_at),
                 }
             })
             .collect();
-        let mut comments: Vec<Comment> = nodes(n.comments)
-            .into_iter()
+        let mut comments: Vec<Comment> = n
+            .comments
+            .into_nodes()
             .map(|c| c.into_comment(CommentKind::Comment))
             .collect();
         fold_reviews(&mut comments, &reviews);
-        let threads = nodes(n.review_threads)
-            .into_iter()
+        let threads = n
+            .review_threads
+            .into_nodes()
             .map(|t| Thread {
-                resolved: t.is_resolved.unwrap_or(false),
-                path: t.path.unwrap_or_default(),
-                comments: nodes(t.comments)
-                    .into_iter()
+                resolved: t.is_resolved,
+                path: t.path,
+                comments: t
+                    .comments
+                    .into_nodes()
                     .map(|c| c.into_comment(CommentKind::Thread))
                     .collect(),
             })
             .collect();
-        let requested: BTreeSet<String> = nodes(n.review_requests)
-            .into_iter()
+        let requested: BTreeSet<String> = n
+            .review_requests
+            .into_nodes()
             .filter_map(|r| r.requested_reviewer?.login)
-            .filter(|login| !login.is_empty())
             .collect();
         let mut requested_at: HashMap<String, Timestamp> = HashMap::new();
-        for event in nodes(n.timeline_items) {
-            if let (Some(who), Some(at)) = (
-                event.requested_reviewer.and_then(|r| r.login),
-                event.created_at,
-            ) {
-                let held = requested_at.entry(who).or_insert(at);
-                *held = (*held).max(at);
+        for event in n.timeline_items.into_nodes() {
+            if let Some(who) = event.requested_reviewer.and_then(|r| r.login) {
+                let held = requested_at.entry(who).or_insert(event.created_at);
+                *held = (*held).max(event.created_at);
             }
         }
-        let head_at = nodes(n.commits)
-            .into_iter()
+        let head_at = n
+            .commits
+            .into_nodes()
             .next()
-            .and_then(|node| node.commit?.committed_date);
-        Self {
-            key: item_key(&n.url),
+            .map(|node| node.commit.committed_date);
+        Ok(Self {
+            key: item_key(&n.url)?,
             number: n.number,
             title: n.title,
             url: n.url,
@@ -430,16 +550,16 @@ impl From<PrNode> for Item {
             author_bot,
             created: n.created_at,
             updated: n.updated_at,
-            body: n.body.unwrap_or_default(),
+            body: n.body,
             milestone: n.milestone,
-            labels: nodes(n.labels).into_iter().map(|l| l.name).collect(),
+            labels: label_names(n.labels),
             assignees: logins(n.assignees),
             comments,
             detail: Detail::Pr(PrDetail {
-                draft: n.is_draft.unwrap_or(false),
-                additions: n.additions.unwrap_or(0),
-                deletions: n.deletions.unwrap_or(0),
-                changed_files: n.changed_files.unwrap_or(0),
+                draft: n.is_draft,
+                additions: n.additions,
+                deletions: n.deletions,
+                changed_files: n.changed_files,
                 head: n.head_ref_oid,
                 head_at,
                 review_decision: n.review_decision,
@@ -447,16 +567,16 @@ impl From<PrNode> for Item {
                 requested_at,
                 reviews,
                 threads,
-                files: nodes(n.files).into_iter().map(|f| f.path).collect(),
+                files: nullable(n.files).map(|f| f.path).collect(),
             }),
-        }
+        })
     }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct AssignedEvent {
-    created_at: Option<Timestamp>,
+    created_at: Timestamp,
     assignee: Option<Login>,
 }
 
@@ -471,36 +591,38 @@ struct IssueNode {
     number: u64,
     title: String,
     url: String,
-    body: Option<String>,
+    body: String,
     created_at: Timestamp,
     updated_at: Timestamp,
     author: Option<Actor>,
     milestone: Option<Milestone>,
     labels: Option<Conn<Label>>,
-    assignees: Option<Conn<Login>>,
-    comments: Option<Conn<CommentNode>>,
-    closed_by_pull_requests_references: Option<Conn<LinkedPrNode>>,
-    timeline_items: Option<Conn<AssignedEvent>>,
+    assignees: Conn<Login>,
+    comments: Conn<CommentNode>,
+    closed_by_pull_requests_references: Conn<LinkedPrNode>,
+    timeline_items: Conn<AssignedEvent>,
 }
 
-impl From<IssueNode> for Item {
-    fn from(n: IssueNode) -> Self {
+impl TryFrom<IssueNode> for Item {
+    type Error = GhError;
+
+    fn try_from(n: IssueNode) -> Result<Self, GhError> {
         let (author, author_bot) = actor(n.author);
         let mut assigned_at: HashMap<String, Timestamp> = HashMap::new();
-        for event in nodes(n.timeline_items) {
-            if let (Some(who), Some(at)) = (event.assignee.and_then(|a| a.login), event.created_at)
-            {
-                let held = assigned_at.entry(who).or_insert(at);
-                *held = (*held).max(at);
+        for event in n.timeline_items.into_nodes() {
+            if let Some(who) = event.assignee.and_then(|a| a.login) {
+                let held = assigned_at.entry(who).or_insert(event.created_at);
+                *held = (*held).max(event.created_at);
             }
         }
-        let mut comments: Vec<Comment> = nodes(n.comments)
-            .into_iter()
+        let mut comments: Vec<Comment> = n
+            .comments
+            .into_nodes()
             .map(|c| c.into_comment(CommentKind::Comment))
             .collect();
         comments.sort_by_key(|comment| comment.at);
-        Self {
-            key: item_key(&n.url),
+        Ok(Self {
+            key: item_key(&n.url)?,
             number: n.number,
             title: n.title,
             url: n.url,
@@ -508,50 +630,31 @@ impl From<IssueNode> for Item {
             author_bot,
             created: n.created_at,
             updated: n.updated_at,
-            body: n.body.unwrap_or_default(),
+            body: n.body,
             milestone: n.milestone,
-            labels: nodes(n.labels).into_iter().map(|l| l.name).collect(),
+            labels: label_names(n.labels),
             assignees: logins(n.assignees),
             comments,
             detail: Detail::Issue(IssueDetail {
                 assigned_at,
-                linked_prs: nodes(n.closed_by_pull_requests_references)
-                    .into_iter()
+                linked_prs: n
+                    .closed_by_pull_requests_references
+                    .into_nodes()
                     .map(|p| p.number)
                     .collect(),
             }),
-        }
+        })
     }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PageInfo {
-    has_next_page: Option<bool>,
-    end_cursor: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Page<T> {
-    page_info: Option<PageInfo>,
-    nodes: Option<Vec<Option<T>>>,
-}
-
-fn split_repo(repo: &str) -> Result<(&str, &str), GhError> {
-    repo.split_once('/')
-        .ok_or_else(|| GhError(format!("not owner/name: {repo}")))
-}
-
-/// Every open node of a connection. A response without the connection fails the
-/// read: an empty list here would empty every lane.
-fn page_through<T: serde::de::DeserializeOwned>(
-    repo: &str,
+/// Every open node of a connection, read to its last page.
+pub fn page_through<T: DeserializeOwned>(
+    repo: Repo,
     conn: &str,
     fields: &str,
     size: u32,
 ) -> Result<Vec<T>, GhError> {
-    let (owner, name) = split_repo(repo)?;
+    let Repo { owner, name } = repo;
     let mut out = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
@@ -565,36 +668,70 @@ fn page_through<T: serde::de::DeserializeOwned>(
             nodes {{ {fields} }}
           }} }} }}"#
         );
-        let mut data = gh::graphql(&query)?;
-        let page: Page<T> = gh::decode(data["repository"][conn].take())?;
-        out.extend(page.nodes.unwrap_or_default().into_iter().flatten());
-        match page.page_info {
-            Some(PageInfo {
-                has_next_page: Some(true),
-                end_cursor,
-            }) => cursor = end_cursor,
-            _ => return Ok(out),
+        let mut data: Repository<Page<T>> = gh::query(&query)?;
+        let page = data
+            .repository
+            .remove(conn)
+            .ok_or_else(|| GhError(format!("no {conn} in the response")))?;
+        match page.drain_into(&mut out)? {
+            Some(next) => cursor = Some(next),
+            None => return Ok(out),
         }
     }
 }
 
 /// Every open item in `repo`.
-pub fn fetch(repo: &str) -> Result<Snapshot, GhError> {
+pub fn fetch(repo: Repo) -> Result<Snapshot, GhError> {
     let prs: Vec<PrNode> = page_through(repo, "pullRequests", PR_FIELDS, PR_PAGE)?;
     let issues: Vec<IssueNode> = page_through(repo, "issues", ISSUE_FIELDS, ISSUE_PAGE)?;
+    let prs = prs.into_iter().map(Item::try_from);
+    let issues = issues.into_iter().map(Item::try_from);
     Ok(Snapshot {
-        prs: prs.into_iter().map(Item::from).collect(),
-        issues: issues.into_iter().map(Item::from).collect(),
+        items: prs.chain(issues).collect::<Result<_, _>>()?,
     })
 }
 
-/// `mergeable` and the CI rollup for just these PRs. An unreadable chunk degrades
-/// those cards, never the run.
-pub fn merge_state(repo: &str, numbers: &[u64]) -> HashMap<u64, MergeState> {
-    let mut out = HashMap::new();
-    let Ok((owner, name)) = split_repo(repo) else {
-        return out;
-    };
+#[derive(Deserialize)]
+struct Rollup {
+    state: Ci,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RollupCommit {
+    status_check_rollup: Option<Rollup>,
+}
+
+#[derive(Deserialize)]
+struct RollupNode {
+    commit: RollupCommit,
+}
+
+#[derive(Deserialize)]
+struct MergeNode {
+    mergeable: Mergeability,
+    commits: Conn<RollupNode>,
+}
+
+impl From<MergeNode> for MergeState {
+    fn from(node: MergeNode) -> Self {
+        let rollup = node
+            .commits
+            .into_nodes()
+            .next()
+            .and_then(|commit| commit.commit.status_check_rollup);
+        Self {
+            mergeable: node.mergeable,
+            ci: rollup.map(|rollup| rollup.state),
+        }
+    }
+}
+
+/// `mergeable` and the CI rollup for just these PRs. What could not be read is listed
+/// as such, because it cannot be told from a PR with nothing wrong with it.
+pub fn merge_state(repo: Repo, numbers: &[u64]) -> MergeRead {
+    let Repo { owner, name } = repo;
+    let mut read = MergeRead::default();
     let numbers: Vec<u64> = numbers
         .iter()
         .copied()
@@ -614,22 +751,23 @@ pub fn merge_state(repo: &str, numbers: &[u64]) -> HashMap<u64, MergeState> {
             .collect();
         let query =
             format!("query {{ repository(owner: \"{owner}\", name: \"{name}\") {{{body}\n}} }}");
-        let Ok(data) = gh::graphql(&query) else {
-            continue;
+        let mut answered = match gh::query::<Repository<Option<MergeNode>>>(&query) {
+            Ok(data) => data.repository,
+            Err(err) => {
+                eprintln!("[snapshot] merge state unread: {err}");
+                HashMap::new()
+            }
         };
         for n in chunk {
-            let node = &data["repository"][format!("p{n}")];
-            let rollup = &node["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"];
-            out.insert(
-                *n,
-                MergeState {
-                    mergeable: node["mergeable"].as_str().map(str::to_owned),
-                    ci: Some(rollup.as_str().unwrap_or("NONE").to_owned()),
-                },
-            );
+            match answered.remove(&format!("p{n}")).flatten() {
+                Some(node) => {
+                    read.states.insert(*n, node.into());
+                }
+                None => read.unread.push(*n),
+            }
         }
     }
-    out
+    read
 }
 
 #[derive(Deserialize)]
@@ -652,12 +790,13 @@ struct OidNode {
 struct UpstreamNode {
     title: String,
     head_ref_name: String,
-    commits: Option<Conn<OidNode>>,
+    commits: Conn<OidNode>,
 }
 
 /// Every PR you ever opened upstream, any state. REST's issue list takes a creator
 /// filter and returns PRs too, so this is one request instead of paging 1000+ PRs.
-pub fn mine(repo: &str, me: &str) -> Result<Vec<UpstreamPr>, GhError> {
+pub fn mine(repo: Repo, me: &str) -> Result<Vec<UpstreamPr>, GhError> {
+    let Repo { owner, name } = repo;
     let raw = gh::rest(
         &format!("repos/{repo}/issues?creator={me}&state=all&per_page=100"),
         true,
@@ -672,7 +811,6 @@ pub fn mine(repo: &str, me: &str) -> Result<Vec<UpstreamPr>, GhError> {
                 .map_err(|err| GhError(format!("unexpected issue list line: {err}")))
         })
         .collect::<Result<_, _>>()?;
-    let (owner, name) = split_repo(repo)?;
     let mut out = Vec::new();
     for chunk in numbers.chunks(MINE_CHUNK) {
         let body: String = chunk
@@ -686,22 +824,14 @@ pub fn mine(repo: &str, me: &str) -> Result<Vec<UpstreamPr>, GhError> {
                 )
             })
             .collect();
-        let mut data = gh::graphql(&format!(
+        let data: Repository<Option<UpstreamNode>> = gh::query(&format!(
             "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{{body}\n}} }}"
         ))?;
-        for n in chunk {
-            let node = data["repository"][format!("p{n}")].take();
-            if node.is_null() {
-                continue;
-            }
-            let node: UpstreamNode = gh::decode(node)?;
+        for node in data.repository.into_values().flatten() {
             out.push(UpstreamPr {
                 title: node.title,
                 head_ref: node.head_ref_name,
-                commits: nodes(node.commits)
-                    .into_iter()
-                    .map(|c| c.commit.oid)
-                    .collect(),
+                commits: node.commits.into_nodes().map(|c| c.commit.oid).collect(),
             });
         }
     }
@@ -717,14 +847,13 @@ struct DiffFile {
 /// `file -> patch without hunk headers` for the PR as it stood at `sha`. Three-dot
 /// compare diffs from the merge base, which is the PR's own diff at that commit no
 /// matter how far master has moved since.
-fn pr_diff(repo: &str, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
+fn pr_diff(repo: Repo, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
     let raw = gh::rest(
         &format!("repos/{repo}/compare/master...{sha}"),
         false,
         Some(r#"[.files[] | {filename, patch: (.patch // "")}]"#),
     )?;
-    let raw = if raw.is_empty() { "[]" } else { raw.as_str() };
-    let files: Vec<DiffFile> = serde_json::from_str(raw)
+    let files: Vec<DiffFile> = serde_json::from_str(&raw)
         .map_err(|err| GhError(format!("unexpected compare response: {err}")))?;
     Ok(files
         .into_iter()
@@ -742,7 +871,7 @@ fn pr_diff(repo: &str, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
 
 /// `None` if either side cannot be compared (an ACKed commit GitHub has since
 /// dropped).
-pub fn ack_interdiff(repo: &str, acked: &str, head: &str) -> Option<Interdiff> {
+pub fn ack_interdiff(repo: Repo, acked: &str, head: &str) -> Option<Interdiff> {
     let before = pr_diff(repo, acked).ok()?;
     let after = pr_diff(repo, head).ok()?;
     let files: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
@@ -751,8 +880,5 @@ pub fn ack_interdiff(repo: &str, acked: &str, head: &str) -> Option<Interdiff> {
         .filter(|file| before.get(*file) != after.get(*file))
         .cloned()
         .collect();
-    Some(Interdiff {
-        rebase_only: changed.is_empty(),
-        changed,
-    })
+    Some(Interdiff { changed })
 }

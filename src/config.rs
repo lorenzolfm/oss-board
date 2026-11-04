@@ -1,9 +1,28 @@
 //! Everything that is a choice rather than a fact. One repo, so constants.
 
+use std::fmt;
 use std::path::PathBuf;
 
-pub const REPO: &str = "getfloresta/Floresta";
-pub const FORK: &str = "lorenzolfm/floresta";
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Repo {
+    pub owner: &'static str,
+    pub name: &'static str,
+}
+
+impl fmt::Display for Repo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.owner, self.name)
+    }
+}
+
+pub const REPO: Repo = Repo {
+    owner: "getfloresta",
+    name: "Floresta",
+};
+pub const FORK: Repo = Repo {
+    owner: "lorenzolfm",
+    name: "floresta",
+};
 
 /// `upstream/master` in the clones is as fresh as your last fetch: the unit can
 /// only read them.

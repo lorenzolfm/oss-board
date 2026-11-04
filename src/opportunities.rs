@@ -15,10 +15,11 @@ use std::collections::HashSet;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::board::CardKey;
 use crate::config;
 use crate::footprint::{self, Footprint};
 use crate::obligations::{Viewer, engaged_at};
-use crate::snapshot::{Detail, Item, MergeState, PrDetail, ReviewState, Snapshot};
+use crate::snapshot::{Item, MergeState, PrDetail, ReviewDecision, ReviewState, Snapshot};
 use crate::text::plural;
 use crate::timestamp::Timestamp;
 
@@ -43,29 +44,22 @@ impl Source {
 
 #[derive(Clone, Debug)]
 pub struct Opportunity<'a> {
-    pub key: String,
     pub item: &'a Item,
     pub sources: Vec<Source>,
-    pub note: String,
+    pub note: Option<String>,
     pub age_days: f64,
     pub areas: Vec<String>,
+    /// `None`: not read.
     pub merge: Option<MergeState>,
 }
 
 impl Opportunity<'_> {
-    pub fn mergeable(&self) -> Option<&str> {
-        self.merge.as_ref()?.mergeable.as_deref()
-    }
-
-    pub fn ci(&self) -> Option<&str> {
-        self.merge.as_ref()?.ci.as_deref()
-    }
-
     /// A PR that cannot merge as it stands: draft, conflicting, or red.
     fn is_blocked(&self) -> bool {
         self.item.pr().is_some_and(|pr| pr.draft)
-            || self.mergeable() == Some("CONFLICTING")
-            || matches!(self.ci(), Some("FAILURE" | "ERROR"))
+            || self
+                .merge
+                .is_some_and(|merge| merge.is_conflicting() || merge.is_red())
     }
 }
 
@@ -89,13 +83,12 @@ fn one_decimal(value: f64) -> f64 {
 fn opportunity<'a>(
     item: &'a Item,
     sources: Vec<Source>,
-    note: String,
+    note: Option<String>,
     now: DateTime<Utc>,
     fp: &Footprint,
 ) -> Opportunity<'a> {
     let files = item.pr().map_or(&[][..], |pr| pr.files.as_slice());
     Opportunity {
-        key: item.key.clone(),
         item,
         sources,
         note,
@@ -110,8 +103,8 @@ pub fn collect<'a>(
     snap: &'a Snapshot,
     me: &Viewer,
     now: DateTime<Utc>,
-    skip: &HashSet<String>,
-    tombstones: &HashSet<String>,
+    skip: &HashSet<CardKey>,
+    tombstones: &HashSet<CardKey>,
     fp: &Footprint,
     column: &HashSet<u64>,
 ) -> Vec<Opportunity<'a>> {
@@ -122,12 +115,9 @@ pub fn collect<'a>(
             || item.author_bot
     };
     let mut out = Vec::new();
-    for item in snap.prs.iter().filter(|item| !is_out(item)) {
-        let Detail::Pr(pr) = &item.detail else {
-            continue;
-        };
+    for (item, pr) in snap.prs().filter(|(item, _)| !is_out(item)) {
         let mut sources = Vec::new();
-        let mut note = String::new();
+        let mut note = None;
         if let Some(mine_at) = engaged_at(item, me) {
             let (pushed, n) = since_you(item, pr, me, mine_at);
             if pushed || n > 0 {
@@ -139,10 +129,10 @@ pub fn collect<'a>(
                 if n > 0 {
                     bits.push(format!("{n} comment{}", plural(n)));
                 }
-                note = format!("{} since you", bits.join(" + "));
+                note = Some(format!("{} since you", bits.join(" + ")));
             }
         } else if !pr.draft
-            && pr.review_decision.as_deref() != Some("CHANGES_REQUESTED")
+            && pr.review_decision != Some(ReviewDecision::ChangesRequested)
             && !pr.reviews.iter().any(|r| r.state == ReviewState::Approved)
         {
             sources.push(Source::Unreviewed);
@@ -154,10 +144,7 @@ pub fn collect<'a>(
             out.push(opportunity(item, sources, note, now, fp));
         }
     }
-    for item in snap.issues.iter().filter(|item| !is_out(item)) {
-        let Detail::Issue(issue) = &item.detail else {
-            continue;
-        };
+    for (item, issue) in snap.issues().filter(|(item, _)| !is_out(item)) {
         let mut sources = Vec::new();
         if item.created.days_ago(now) <= config::NEW_ISSUE_DAYS
             && item.assignees.is_empty()
@@ -169,7 +156,7 @@ pub fn collect<'a>(
             sources.push(Source::NeedsReview);
         }
         if !sources.is_empty() {
-            out.push(opportunity(item, sources, String::new(), now, fp));
+            out.push(opportunity(item, sources, None, now, fp));
         }
     }
     out

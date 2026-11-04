@@ -6,13 +6,12 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::config;
-use crate::proc::{self, Failure};
+use crate::proc;
 
 const GIT_LOG_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -49,7 +48,8 @@ fn area(path: &str) -> String {
     }
 }
 
-/// `extra` adds refs to upstream master, e.g. your unshipped branches.
+/// `extra` adds refs to upstream master, e.g. your unshipped branches. A history
+/// that cannot be read is an error, so the run can say the judge ranked without it.
 pub fn compute(
     emails: &BTreeSet<String>,
     clones: &[PathBuf],
@@ -63,23 +63,19 @@ pub fn compute(
     for clone in clones {
         for reference in &refs {
             for email in emails {
-                let result = proc::run(
-                    Command::new("git").arg("-C").arg(clone).args([
+                let log = proc::git(
+                    clone,
+                    &[
                         "log",
                         reference,
                         &format!("--author={email}"),
                         "--no-merges",
                         "--name-only",
                         "--format=%x00",
-                    ]),
+                    ],
                     GIT_LOG_TIMEOUT,
-                );
-                let out = match result {
-                    Ok(out) if out.success => out,
-                    Ok(_) | Err(Failure::TimedOut(_)) => continue,
-                    Err(failure @ Failure::Spawn(_)) => bail!("git: {failure}"),
-                };
-                for commit in out.stdout.split('\0') {
+                )?;
+                for commit in log.split('\0') {
                     let areas: BTreeSet<String> = commit
                         .split('\n')
                         .filter(|line| !line.trim().is_empty())

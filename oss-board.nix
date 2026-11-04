@@ -101,7 +101,7 @@ in
         set -euo pipefail
         export GH_TOKEN="$(cat ${config.sops.secrets."oss-board-github-token".path})"
         export UPTIME_KUMA_PUSH_URL="$(cat ${config.sops.secrets."uptime-kuma-push-oss-board".path})"
-        exec ${lib.getExe package} \
+        exec ${lib.getExe package} refresh \
           --board ${lib.escapeShellArg board} \
           --state ${lib.escapeShellArg "${projectDir}/state"} \
           --notify

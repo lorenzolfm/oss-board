@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, SecondsFormat, TimeDelta, TimeZone, Utc};
 
+use crate::board::CardKey;
 use crate::obligations::Viewer;
+use crate::opportunities::{Opportunity, Source};
 use crate::snapshot::{
     Comment, CommentKind, Detail, IssueDetail, Item, PrDetail, Review, ReviewState, Snapshot,
     Thread, fold_reviews, item_key,
@@ -17,6 +19,22 @@ const REPO_URL: &str = "https://github.com/getfloresta/Floresta";
 
 pub fn me() -> Viewer {
     Viewer::new(ME)
+}
+
+pub fn key(text: &str) -> CardKey {
+    text.parse().unwrap()
+}
+
+/// An unreviewed PR or new issue, as `opportunities::collect` hands it over.
+pub fn opportunity(item: &Item) -> Opportunity<'_> {
+    Opportunity {
+        item,
+        sources: vec![Source::Unreviewed],
+        note: None,
+        age_days: 2.0,
+        areas: vec![],
+        merge: None,
+    }
 }
 
 pub fn now() -> DateTime<Utc> {
@@ -73,7 +91,7 @@ impl Thread {
 
 fn item(number: u64, title: String, url: String, detail: Detail) -> Item {
     Item {
-        key: item_key(&url),
+        key: item_key(&url).unwrap(),
         number,
         title,
         url,
@@ -100,7 +118,7 @@ pub fn pr(number: u64) -> Item {
             additions: 10,
             deletions: 2,
             changed_files: 1,
-            head: Some("f".repeat(40)),
+            head: "f".repeat(40),
             head_at: Some(day(20)),
             review_decision: None,
             requested: vec![],
@@ -125,7 +143,9 @@ pub fn issue(number: u64) -> Item {
 }
 
 pub fn snap(prs: Vec<Item>, issues: Vec<Item>) -> Snapshot {
-    Snapshot { prs, issues }
+    Snapshot {
+        items: prs.into_iter().chain(issues).collect(),
+    }
 }
 
 /// Builders, each returning the item so a fixture reads as one expression.
@@ -163,7 +183,7 @@ impl Item {
     }
 
     pub fn with_head(mut self, head: &str) -> Self {
-        self.pr_mut().head = Some(head.to_owned());
+        self.pr_mut().head = head.to_owned();
         self
     }
 

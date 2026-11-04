@@ -4,10 +4,15 @@
 
 use std::fmt;
 use std::io::{self, Read};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use anyhow::{Result, anyhow, bail};
+
+use crate::text::prefix;
 
 const POLL: Duration = Duration::from_millis(10);
 
@@ -87,6 +92,23 @@ pub fn run(cmd: &mut Command, timeout: Duration) -> Result<Output, Failure> {
             Err(Failure::TimedOut(timeout))
         }
     }
+}
+
+/// What `git -C path args` printed. A timeout or a non-zero exit is a failed read:
+/// it must never look like a repository with nothing in it.
+pub fn git(path: &Path, args: &[&str], timeout: Duration) -> Result<String> {
+    let out = run(Command::new("git").arg("-C").arg(path).args(args), timeout)
+        .map_err(|failure| anyhow!("git {} in {}: {failure}", args.join(" "), path.display()))?;
+    if !out.success {
+        bail!(
+            "git {} in {}: exit {:?}: {}",
+            args.join(" "),
+            path.display(),
+            out.code,
+            prefix(out.stderr.trim(), 200)
+        );
+    }
+    Ok(out.stdout)
 }
 
 #[cfg(test)]

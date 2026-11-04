@@ -3,7 +3,7 @@
 //! failed source costs, what each subprocess is allowed to hold, and what reaches
 //! the outside world.
 
-use std::fs;
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
@@ -21,18 +21,29 @@ fi
 case "$*" in
   *"viewer { login }"*) echo '{"data":{"viewer":{"login":"me"}}}';;
   *"creator=me"*) ;;
-  *"first: 50"*) echo '{"data":{"repository":{"pullRequests":{"nodes":[]}}}}';;
+  *"first: 50"*) echo '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
   *"pullRequests(states: OPEN"*) cat "$FIXTURE_DIR/prs.json";;
-  *"issues(states: OPEN"*) echo '{"data":{"repository":{"issues":{"nodes":[]}}}}';;
-  *mergeable*) echo '{"data":{"repository":{}}}';;
-  *projectV2*) echo '{"data":{"organization":{"projectV2":{"items":{"nodes":[]}}}}}';;
-  *issueOrPullRequest*) echo '{"data":{}}';;
+  *"issues(states: OPEN"*) echo '{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
+  *mergeable*) cat "$FIXTURE_DIR/merge.json";;
+  *projectV2*) echo '{"data":{"organization":{"projectV2":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}';;
+  *issueOrPullRequest*) cat "$FIXTURE_DIR/claims.json";;
   *) echo "unexpected gh call: $*" >&2; exit 1;;
 esac
 "#;
 
+/// A repository with nothing unshipped on it, or one that fails the reads named.
+const FAKE_GIT: &str = r#"#!/bin/sh
+if [ -n "$GIT_FAIL_ON" ]; then
+  case "$*" in *"$GIT_FAIL_ON"*) echo boom >&2; exit 128;; esac
+fi
+case "$*" in
+  *"config user.email"*) echo me@example.com;;
+esac
+"#;
+
 /// Records which tokens it was handed, wraps its answers in prose as a real model
-/// does, and writes the note a briefing asks for.
+/// does, and writes the note a briefing asks for. Keeps the board it saw at that
+/// moment, for what a slow briefing can cost.
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 case "$2" in
   "Each item below"*)
@@ -44,21 +55,73 @@ case "$2" in
     echo '{"picks":[{"number":8,"why":"small and yours","pitch":"read it first","est":"1h"}]}';;
   "Write an Obsidian"*)
     echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset}" >> "$FIXTURE_DIR/claude.log"
+    cp "$FIXTURE_DIR/vault/Tasks.md" "$FIXTURE_DIR/board_at_brief.md"
     note=$(printf '%s\n' "$2" | sed -n '/exactly this path/{n;s/^ *//;p;}')
     printf '%0400d' 0 > "$note"
     echo DONE;;
 esac
 "#;
 
+/// Writes `TODO` where the note should go, then fails.
+const FAILING_AGENT: &str = r#"#!/bin/sh
+echo call >> "$FIXTURE_DIR/claude.log"
+note=$(printf '%s\n' "$2" | sed -n '/exactly this path/{n;s/^ *//;p;}')
+printf 'TODO' > "$note"
+exit 1
+"#;
+
+/// An open PR, as the bulk query returns one.
+fn pr_node(number: u64, title: &str, body: &str, head: &str, author: &str) -> String {
+    format!(
+        r#"{{"number":{number},"title":"{title}","url":"https://github.com/getfloresta/Floresta/pull/{number}",
+        "body":"{body}","isDraft":false,"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z",
+        "additions":1,"deletions":0,"changedFiles":1,"headRefOid":"{head}",
+        "author":{{"__typename":"User","login":"{author}"}},"milestone":null,"labels":{{"nodes":[]}},
+        "assignees":{{"nodes":[]}},"reviewDecision":null,"reviewRequests":{{"nodes":[]}},
+        "commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-01T00:00:00Z"}}}}]}},
+        "reviews":{{"nodes":[]}},"comments":{{"nodes":[]}},"reviewThreads":{{"nodes":[]}},
+        "timelineItems":{{"nodes":[]}},"files":{{"nodes":[]}}}}"#
+    )
+}
+
+fn prs_page(nodes: &[String]) -> String {
+    format!(
+        r#"{{"data":{{"repository":{{"pullRequests":{{"pageInfo":{{"hasNextPage":false,"endCursor":null}},
+        "nodes":[{}]}}}}}}}}"#,
+        nodes.join(",")
+    )
+}
+
 /// #7 mentions you, so it is an obligation. #8 is unreviewed, so an opportunity.
-const PRS: &str = r#"{"data":{"repository":{"pullRequests":{"nodes":[
-  {"number":7,"title":"waiting on you","url":"https://github.com/getfloresta/Floresta/pull/7",
-   "body":"cc @me please","createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z",
-   "headRefOid":"aaaaaaa","author":{"__typename":"User","login":"bob"}},
-  {"number":8,"title":"nobody reviewed this","url":"https://github.com/getfloresta/Floresta/pull/8",
-   "body":"","createdAt":"2026-01-03T00:00:00Z","updatedAt":"2026-01-04T00:00:00Z",
-   "headRefOid":"bbbbbbb","author":{"__typename":"User","login":"carol"}}
-]}}}}"#;
+fn prs() -> String {
+    prs_page(&[
+        pr_node(7, "waiting on you", "cc @me please", "aaaaaaa", "bob"),
+        pr_node(8, "nobody reviewed this", "", "bbbbbbb", "carol"),
+    ])
+}
+
+fn merge_node(mergeable: &str, ci: &str) -> String {
+    format!(
+        r#"{{"mergeable":"{mergeable}","commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{ci}}}}}]}}}}"#
+    )
+}
+
+/// Your own PR #9, conflicting and red.
+const MY_PR_HEAD: &str = "ccccccc";
+
+fn my_broken_pr() -> (String, String) {
+    (
+        prs_page(&[pr_node(9, "my red pr", "", MY_PR_HEAD, "me")]),
+        format!(
+            r#"{{"data":{{"repository":{{"p9":{}}}}}}}"#,
+            merge_node("CONFLICTING", r#"{"state":"FAILURE"}"#)
+        ),
+    )
+}
+
+/// The claim on #8 is open and nothing has happened to it.
+const CLAIMS: &str = r#"{"data":{"n0":{"issueOrPullRequest":{
+  "__typename":"PullRequest","state":"OPEN","mergedAt":null,"author":{"login":"carol"}}}}}"#;
 
 struct Fixture {
     dir: TempDir,
@@ -70,16 +133,19 @@ impl Fixture {
         let fixture = Self { dir };
         let bin = fixture.path("bin");
         fs::create_dir(&bin).unwrap();
-        for (name, script) in [
-            ("gh", FAKE_GH),
-            ("claude", FAKE_CLAUDE),
-            ("git", "#!/bin/sh\nexit 1\n"),
-        ] {
+        for (name, script) in [("gh", FAKE_GH), ("claude", FAKE_CLAUDE), ("git", FAKE_GIT)] {
             let path = bin.join(name);
             fs::write(&path, script).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
-        fs::write(fixture.path("prs.json"), PRS).unwrap();
+        fs::write(fixture.path("prs.json"), prs()).unwrap();
+        let clean = merge_node("MERGEABLE", "null");
+        fs::write(
+            fixture.path("merge.json"),
+            format!(r#"{{"data":{{"repository":{{"p7":{clean},"p8":{clean},"p9":{clean}}}}}}}"#),
+        )
+        .unwrap();
+        fs::write(fixture.path("claims.json"), CLAIMS).unwrap();
         fs::create_dir(fixture.path("vault")).unwrap();
         fixture
     }
@@ -100,6 +166,12 @@ impl Fixture {
         fs::read_to_string(self.path("state").join(name)).unwrap()
     }
 
+    fn degraded(&self) -> serde_json::Value {
+        let last_run: serde_json::Value =
+            serde_json::from_str(&self.read_state("last_run.json")).unwrap();
+        last_run["degraded"].clone()
+    }
+
     fn claude_log(&self) -> String {
         fs::read_to_string(self.path("claude.log")).unwrap_or_default()
     }
@@ -112,7 +184,8 @@ impl Fixture {
             std::env::var("PATH").unwrap_or_default()
         );
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oss-board"));
-        cmd.args(["--board", self.board().to_str().unwrap()])
+        cmd.arg("refresh")
+            .args(["--board", self.board().to_str().unwrap()])
             .args(["--state", self.path("state").to_str().unwrap()])
             .args(args)
             .env("PATH", path)
@@ -120,6 +193,8 @@ impl Fixture {
             .env("FIXTURE_DIR", self.dir.path())
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_FAIL_ON")
+            .env_remove("GIT_FAIL_ON")
             .env_remove("TELEGRAM_BOT_TOKEN")
             .env_remove("TELEGRAM_BOT_TOKEN_FILE")
             .env_remove("OPENCLAW_URL")
@@ -192,7 +267,8 @@ fn board_text(unshipped: &str, doing: &str) -> String {
     format!(
         "---\n\nkanban-plugin: board\n\n---\n\n## Needs me\n\n- [ ] stale card\n\n\
          ## Opportunities\n\n## Unshipped\n\n{unshipped}\n\n## Todo\n\n- [ ] my own words ^abc\n\n\
-         ## Doing\n\n{doing}\n\n## Done\n\n## Passed\n\n"
+         ## Doing\n\n{doing}\n\n## Done\n\n## Passed\n\n\n\n\
+         %% kanban:settings\n```\n{{\"kanban-plugin\":\"board\",\"list-collapse\":[]}}\n```\n%%\n"
     )
 }
 
@@ -229,7 +305,7 @@ fn a_run_rewrites_the_agent_lanes_and_leaves_yours() {
         serde_json::from_str(&fixture.read_state("last_run.json")).unwrap();
     assert_eq!(last_run["counts"]["obligations"], 1);
     assert_eq!(last_run["counts"]["judged"], true);
-    assert_eq!(last_run["degraded"], serde_json::json!([]));
+    assert_eq!(fixture.degraded(), serde_json::json!([]));
 
     let beat = beats.recv().unwrap();
     assert!(
@@ -293,11 +369,238 @@ fn a_failed_unshipped_source_keeps_its_lane_and_says_so_in_the_beat() {
         1,
         "the other lanes still refresh"
     );
-    let last_run: serde_json::Value =
-        serde_json::from_str(&fixture.read_state("last_run.json")).unwrap();
-    assert_eq!(last_run["degraded"], serde_json::json!(["unshipped"]));
+    assert_eq!(fixture.degraded(), serde_json::json!(["unshipped"]));
     let beat = beats.recv().unwrap();
     assert!(beat.contains("degraded"), "{beat}");
+}
+
+/// A failing `git` used to read as a clone with no branches on it, and a footprint
+/// that could not be read as one with no areas.
+#[test]
+fn a_failing_git_keeps_the_unshipped_lane_and_the_rest_still_runs() {
+    let wip = "- [ ] ⚡ `wip` <!--k:branch:wip-->";
+    for (fails, kept, want) in [
+        ("-C", true, serde_json::json!(["unshipped", "footprint"])),
+        ("for-each-ref", true, serde_json::json!(["unshipped"])),
+        (
+            "config user.email",
+            true,
+            serde_json::json!(["unshipped", "footprint"]),
+        ),
+        (" log ", false, serde_json::json!(["footprint"])),
+    ] {
+        let fixture = Fixture::new();
+        fs::write(fixture.board(), board_text(wip, "")).unwrap();
+        run(fixture
+            .command(&["--no-model", "--no-briefings"])
+            .env("GIT_FAIL_ON", fails));
+
+        let board = fixture.read_board();
+        assert_eq!(
+            !lane(&board, "Unshipped").is_empty(),
+            kept,
+            "{fails}: {board}"
+        );
+        assert_eq!(lane(&board, "Needs me").len(), 1, "{fails}: {board}");
+        assert_eq!(fixture.degraded(), want, "{fails}");
+        let dm = fixture.read_state("summary.txt");
+        assert_eq!(
+            dm.contains("Unshipped not refreshed"),
+            kept,
+            "{fails}: {dm}"
+        );
+    }
+}
+
+/// A PR list that is missing, or that cannot be followed to its end, would otherwise
+/// read as a repo with nothing open.
+#[test]
+fn an_unreadable_pr_list_fails_the_run_and_leaves_the_board() {
+    let bad_url = prs_page(&[pr_node(1, "t", "", "aaaaaaa", "bob")]).replace(
+        "https://github.com/getfloresta/Floresta/pull/1",
+        "not a url",
+    );
+    let conversation = |list: &str| {
+        prs_page(&[pr_node(1, "t", "", "aaaaaaa", "bob")]).replace(
+            r#""comments":{"nodes":[]}"#,
+            &format!(r#""comments":{list}"#),
+        )
+    };
+    let (no_nodes, null_nodes, null_list) = (
+        conversation("{}"),
+        conversation(r#"{"nodes":null}"#),
+        conversation("null"),
+    );
+    for prs in [
+        bad_url.as_str(),
+        no_nodes.as_str(),
+        null_nodes.as_str(),
+        null_list.as_str(),
+        r#"{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":null}}}}"#,
+        r#"{"data":{"repository":{"pullRequests":{"nodes":[]}}}}"#,
+        r#"{"data":{"repository":{"pullRequests":{}}}}"#,
+        r#"{"data":{"repository":{"pullRequests":null}}}"#,
+        r#"{"data":{"repository":{}}}"#,
+        r#"{"data":{"repository":null}}"#,
+        r#"{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[]}}}}"#,
+        r#"{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"number":1}]}}}}"#,
+    ] {
+        let fixture = Fixture::new();
+        let before = board_text("", "");
+        fs::write(fixture.board(), &before).unwrap();
+        fs::write(fixture.path("prs.json"), prs).unwrap();
+        let out = fixture
+            .command(&["--no-model", "--no-briefings"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{prs}");
+        assert_eq!(fixture.read_board(), before, "{prs}");
+    }
+}
+
+/// A failed read must not look like the all-clear: your PR is still broken.
+#[test]
+fn a_failed_merge_read_keeps_the_card_and_is_not_an_all_clear() {
+    let fixture = Fixture::new();
+    let (prs, merge) = my_broken_pr();
+    fs::write(fixture.path("prs.json"), prs).unwrap();
+    fs::write(fixture.path("merge.json"), merge).unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    let board = fixture.read_board();
+    let card = lane(&board, "Needs me")[0].to_owned();
+    assert!(card.contains("conflicts with master"), "{card}");
+    assert!(card.contains(MY_PR_HEAD), "the head it was seen on: {card}");
+
+    let (url, beats) = listener();
+    run(fixture
+        .command(&["--notify", "--no-model", "--no-briefings"])
+        .env("GH_FAIL_ON", "mergeable")
+        .env("UPTIME_KUMA_PUSH_URL", format!("{url}/push")));
+    let board = fixture.read_board();
+    assert_eq!(lane(&board, "Needs me"), [card.as_str()]);
+    assert_eq!(fixture.degraded(), serde_json::json!(["merge"]));
+    let beat = beats.recv().unwrap();
+    assert!(beat.contains("degraded"), "{beat}");
+    let dm = fixture.read_state("summary.txt");
+    assert!(!dm.contains('✅'), "{dm}");
+    assert!(dm.contains("merge state unread"), "{dm}");
+}
+
+/// You muted it red. A push is a new trigger, and it comes back only then.
+#[test]
+fn a_push_rearms_a_muted_red_pr() {
+    let fixture = Fixture::new();
+    let (prs, merge) = my_broken_pr();
+    fs::write(fixture.path("prs.json"), &prs).unwrap();
+    fs::write(fixture.path("merge.json"), merge).unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+
+    let board = fixture.read_board();
+    let card = lane(&board, "Needs me")[0].to_owned();
+    let dragged = board
+        .replace(&format!("{card}\n"), "")
+        .replace("## Passed\n", &format!("## Passed\n\n{card}\n"));
+    fs::write(fixture.board(), dragged).unwrap();
+
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    let board = fixture.read_board();
+    assert!(lane(&board, "Needs me").is_empty(), "still muted: {board}");
+
+    fs::write(fixture.path("prs.json"), prs.replace(MY_PR_HEAD, "ddddddd")).unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    let board = fixture.read_board();
+    assert_eq!(lane(&board, "Needs me").len(), 1, "re-armed: {board}");
+    assert_eq!(lane(&board, "Passed"), [card.as_str()], "your card stays");
+}
+
+/// A failed read says nothing about the card, so it must not erase what it says.
+#[test]
+fn a_failed_claims_read_keeps_the_warning_on_your_card() {
+    let fixture = Fixture::new();
+    let card = "- [ ] mine [#8](https://github.com/getfloresta/Floresta/issues/8) <!--a-->PR #20 opened by bob — stop<!--/a-->";
+    fs::write(fixture.board(), board_text("", card)).unwrap();
+    run(fixture
+        .command(&["--no-model", "--no-briefings"])
+        .env("GH_FAIL_ON", "issueOrPullRequest"));
+    assert_eq!(lane(&fixture.read_board(), "Doing"), [card]);
+    assert_eq!(fixture.degraded(), serde_json::json!(["claims"]));
+}
+
+/// The same run with the read succeeding: the stale warning goes.
+#[test]
+fn a_claims_read_replaces_what_the_card_said() {
+    let fixture = Fixture::new();
+    let card = "- [ ] mine [#8](https://github.com/getfloresta/Floresta/issues/8) <!--a-->PR #20 opened by bob — stop<!--/a-->";
+    fs::write(fixture.board(), board_text("", card)).unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    let board = fixture.read_board();
+    assert!(
+        !lane(&board, "Doing")[0].contains("opened by bob"),
+        "{board}"
+    );
+    assert_eq!(fixture.degraded(), serde_json::json!([]));
+}
+
+#[test]
+fn a_file_that_is_not_a_board_fails_the_run_and_is_left_alone() {
+    let fixture = Fixture::new();
+    let prose = "# Notes\n\nA paragraph I care about.\n";
+    fs::write(fixture.board(), prose).unwrap();
+    let (url, beats) = listener();
+    let out = fixture
+        .command(&["--notify", "--no-model", "--no-briefings"])
+        .env("UPTIME_KUMA_PUSH_URL", format!("{url}/push"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(fixture.read_board(), prose);
+    let beat = beats.recv().unwrap();
+    assert!(beat.starts_with("GET /push?status=down&msg="), "{beat}");
+}
+
+/// A manual run and the timer's would share every temporary file.
+#[test]
+fn a_run_finding_another_in_progress_leaves_everything_to_it() {
+    let fixture = Fixture::new();
+    let before = board_text("", "");
+    fs::write(fixture.board(), &before).unwrap();
+    fs::create_dir_all(fixture.path("state")).unwrap();
+    let held = File::create(fixture.path("state/lock")).unwrap();
+    held.lock().unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    assert_eq!(fixture.read_board(), before);
+    assert!(!fixture.path("state/last_run.json").exists());
+
+    held.unlock().unwrap();
+    run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+    assert_ne!(fixture.read_board(), before, "and is free to go after");
+}
+
+/// Each of these used to be accepted, and then did something other than it says.
+#[test]
+fn flags_that_cannot_mean_what_they_say_are_refused() {
+    let fixture = Fixture::new();
+    let (url, beats) = listener();
+    for flags in [
+        ["--dry-run", "--notify"].as_slice(),
+        ["--dm-now"].as_slice(),
+    ] {
+        let out = fixture
+            .command(flags)
+            .env("UPTIME_KUMA_PUSH_URL", format!("{url}/push"))
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{flags:?}");
+    }
+    let without_state = Command::new(env!("CARGO_BIN_EXE_oss-board"))
+        .args(["refresh", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_eq!(without_state.status.code(), Some(2));
+    assert!(
+        beats.try_recv().is_err(),
+        "nothing ran, so nothing was beaten"
+    );
 }
 
 #[test]
@@ -310,6 +613,28 @@ fn a_dry_run_prints_and_leaves_the_vault_alone() {
     assert!(stdout.contains("[#7]("), "{stdout}");
     assert!(stdout.contains("Floresta · "), "the DM too: {stdout}");
     assert_eq!(fixture.read_board(), before);
+}
+
+#[test]
+fn a_corrupt_last_dm_means_never_sent_and_says_so() {
+    for record in [
+        "{{{ not json",
+        r#"{"at": "yesterday", "seen": {}}"#,
+        r#"{"at": 7, "seen": {}}"#,
+        r#"{"at": null, "seen": {"planted": "x"}}"#,
+    ] {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.path("state")).unwrap();
+        fs::write(fixture.path("state/last_dm.json"), record).unwrap();
+        run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+        assert_eq!(
+            fixture.degraded(),
+            serde_json::json!(["last_dm"]),
+            "{record}"
+        );
+        let dm = fixture.read_state("summary.txt");
+        assert!(dm.contains("🆕"), "{record}: {dm}");
+    }
 }
 
 fn claimed_pr_board() -> String {
@@ -339,6 +664,95 @@ fn claiming_a_pr_writes_a_review_brief_with_the_read_only_token() {
         lane(&board, "Doing")[0].contains("[[Floresta-8]]"),
         "{board}"
     );
+    assert_eq!(fixture.degraded(), serde_json::json!([]));
+}
+
+/// Briefings can take twenty minutes, which is as long as the unit is allowed.
+#[test]
+fn the_board_is_written_before_any_briefing_starts() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), claimed_pr_board()).unwrap();
+    run(fixture
+        .command(&["--no-model"])
+        .env("GH_TOKEN", "read-only-token"));
+    let seen = fs::read_to_string(fixture.path("board_at_brief.md")).unwrap();
+    assert_eq!(lane(&seen, "Needs me").len(), 1, "{seen}");
+    assert!(lane(&seen, "Needs me")[0].contains("[#7]("), "{seen}");
+}
+
+/// Under its real name a note is complete, so what it needs is a link, not an agent.
+#[test]
+fn an_existing_note_is_linked_without_asking_the_agent_again() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), claimed_pr_board()).unwrap();
+    fs::write(fixture.path("vault/Floresta-8.md"), "written by hand").unwrap();
+    run(fixture
+        .command(&["--no-model"])
+        .env("GH_TOKEN", "read-only-token"));
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Doing")[0].contains("[[Floresta-8]]"),
+        "{board}"
+    );
+    assert_eq!(fixture.claude_log(), "");
+    assert_eq!(
+        fs::read_to_string(fixture.path("vault/Floresta-8.md")).unwrap(),
+        "written by hand"
+    );
+}
+
+/// A note you deleted stays deleted: the link on the card says it was once written.
+#[test]
+fn a_linked_card_whose_note_is_gone_is_not_briefed_again() {
+    let fixture = Fixture::new();
+    let linked = claimed_pr_board().replace("/pull/8)", "/pull/8) [[Floresta-8]]");
+    fs::write(fixture.board(), linked).unwrap();
+    run(fixture
+        .command(&["--no-model"])
+        .env("GH_TOKEN", "read-only-token"));
+    assert_eq!(fixture.claude_log(), "");
+    assert!(!fixture.path("vault/Floresta-8.md").exists());
+}
+
+/// What a failed agent left must not pass for a note, or the card is stuck with it.
+#[test]
+fn a_failed_briefing_leaves_nothing_and_is_tried_again() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), claimed_pr_board()).unwrap();
+    fs::write(fixture.path("bin/claude"), FAILING_AGENT).unwrap();
+    let briefing_run = || {
+        run(fixture
+            .command(&["--no-model"])
+            .env("GH_TOKEN", "read-only-token"));
+    };
+    briefing_run();
+    briefing_run();
+    assert_eq!(fixture.claude_log().lines().count(), 2, "tried both times");
+    let left: Vec<_> = fs::read_dir(fixture.path("vault"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(left, ["Tasks.md"], "no note and no draft");
+    let board = fixture.read_board();
+    assert!(!lane(&board, "Doing")[0].contains("[["), "{board}");
+}
+
+/// An agent that succeeds with next to nothing is failing in a way that looks answered.
+#[test]
+fn a_thin_note_is_discarded() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), claimed_pr_board()).unwrap();
+    fs::write(
+        fixture.path("bin/claude"),
+        FAILING_AGENT.replace("exit 1", "exit 0"),
+    )
+    .unwrap();
+    run(fixture
+        .command(&["--no-model"])
+        .env("GH_TOKEN", "read-only-token"));
+    assert!(!fixture.path("vault/Floresta-8.md").exists());
+    let board = fixture.read_board();
+    assert!(!lane(&board, "Doing")[0].contains("[["), "{board}");
 }
 
 #[test]
@@ -380,7 +794,7 @@ fn a_delivered_dm_is_remembered_so_the_next_one_marks_only_what_changed() {
     );
     let record: serde_json::Value =
         serde_json::from_str(&fixture.read_state("last_dm.json")).unwrap();
-    assert_eq!(record["seen"]["getfloresta/Floresta#8"], "bbbbbbb");
+    assert_eq!(record["seen"]["getfloresta/floresta#8"], "bbbbbbb");
 
     notify(&fixture);
     let second = messages.recv().unwrap();

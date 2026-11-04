@@ -1,13 +1,13 @@
 //! Cards for the board and the DM text. Formatting only -- every decision about
 //! what appears, and in what order, has been made before anything gets here.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::board::{key_marker, mute_marker};
-use crate::model::Pick;
+use crate::board::{Card, CardKey, ClaimLane};
+use crate::model::Ranked;
 use crate::obligations::{Obligation, ReasonKind, fingerprint};
 use crate::opportunities::{Opportunity, Source};
-use crate::snapshot::{Item, PrDetail};
+use crate::snapshot::{Ci, Item, MergeState, PrDetail};
 use crate::text::{plural, prefix};
 use crate::unshipped::{LinkHow, Origin, Unshipped};
 
@@ -33,6 +33,46 @@ const OPP_ICONS: [(Source, &str); 4] = [
     (Source::NewIssue, "📥"),
 ];
 
+/// A source this run could not read. What it would have said is unknown, so the DM,
+/// the heartbeat and `last_run.json` all say so rather than read as a clear board.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Degraded {
+    Unshipped,
+    Project,
+    Merge,
+    Claims,
+    Footprint,
+    LastDm,
+}
+
+impl Degraded {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unshipped => "unshipped",
+            Self::Project => "project",
+            Self::Merge => "merge",
+            Self::Claims => "claims",
+            Self::Footprint => "footprint",
+            Self::LastDm => "last_dm",
+        }
+    }
+
+    fn warning(self) -> &'static str {
+        match self {
+            Self::Unshipped => "Unshipped not refreshed: its source failed",
+            Self::Project => "project board unreadable — does the token have read:project?",
+            Self::Merge => "merge state unread: a conflict or red CI may be missing",
+            Self::Claims => "claimed cards not checked upstream: their notes are as they were",
+            Self::Footprint => "footprint unread: ranked without knowing your areas",
+            Self::LastDm => "last_dm.json unreadable: everything reads as new",
+        }
+    }
+
+    fn can_hide_an_obligation(self) -> bool {
+        matches!(self, Self::Unshipped | Self::Merge)
+    }
+}
+
 fn ob_icon(ob: &Obligation<'_>) -> &'static str {
     ICONS
         .iter()
@@ -47,12 +87,15 @@ fn opp_icon(o: &Opportunity<'_>) -> &'static str {
         .map_or("•", |(_, icon)| icon)
 }
 
-fn ci_word(state: Option<&str>) -> &'static str {
-    match state {
-        Some("SUCCESS") => "green",
-        Some("FAILURE" | "ERROR") => "red",
-        Some("PENDING" | "EXPECTED") => "running",
-        _ => "none",
+fn ci_word(merge: Option<MergeState>) -> &'static str {
+    let Some(merge) = merge else {
+        return "unknown";
+    };
+    match merge.ci {
+        None => "none",
+        Some(Ci::Success) => "green",
+        Some(Ci::Failure | Ci::Error) => "red",
+        Some(Ci::Pending | Ci::Expected) => "running",
     }
 }
 
@@ -73,7 +116,7 @@ pub fn reasons_text(ob: &Obligation<'_>) -> String {
 
 // ---------------------------------------------------------------- board
 
-pub fn ob_card(ob: &Obligation<'_>, gist: Option<&str>) -> String {
+pub fn ob_card(ob: &Obligation<'_>, gist: Option<&str>) -> Card {
     let item: &Item = ob.item;
     let sized = ob.has_kind(ReasonKind::ReviewRequested) || ob.has_kind(ReasonKind::StaleAck);
     let size_text = match item.pr() {
@@ -81,50 +124,45 @@ pub fn ob_card(ob: &Obligation<'_>, gist: Option<&str>) -> String {
         _ => String::new(),
     };
     let tail = gist.map_or(String::new(), |gist| format!(" *({gist})*"));
-    let (last, kinds) = fingerprint(ob);
-    format!(
-        "- [ ] {} [#{}]({}) {} · {}{size_text}{tail} {}",
+    let body = format!(
+        "{} [#{}]({}) {} · {}{size_text}{tail}",
         ob_icon(ob),
         item.number,
         item.url,
         prefix(&item.title, 80),
         reasons_text(ob),
-        mute_marker(&last, &kinds)
-    )
+    );
+    Card::with_fingerprint(&body, &fingerprint(ob))
 }
 
-pub fn opp_card(o: &Opportunity<'_>, why: &str) -> String {
+pub fn opp_card(o: &Opportunity<'_>, why: Option<&str>) -> Card {
     let item = o.item;
     let mut bits = Vec::new();
     if let Some(pr) = item.pr() {
         bits.push(size(pr));
-        bits.push(format!("CI {}", ci_word(o.ci())));
-        if o.mergeable() == Some("CONFLICTING") {
+        bits.push(format!("CI {}", ci_word(o.merge)));
+        if o.merge.is_some_and(MergeState::is_conflicting) {
             bits.push("conflicts".to_owned());
         }
     } else if let Some(label) = item.labels.first() {
         bits.push(label.clone());
     }
     bits.push(format!("{:.0}d", o.age_days));
-    if !o.note.is_empty() {
-        bits.push(o.note.clone());
+    if let Some(note) = &o.note {
+        bits.push(note.clone());
     }
-    let tail = if why.is_empty() {
-        String::new()
-    } else {
-        format!(" *({why})*")
-    };
-    format!(
-        "- [ ] {} [#{}]({}) {} · {}{tail}",
+    let tail = why.map_or(String::new(), |why| format!(" *({why})*"));
+    Card::plain(&format!(
+        "{} [#{}]({}) {} · {}{tail}",
         opp_icon(o),
         item.number,
         item.url,
         prefix(&item.title, 80),
         bits.join(" · ")
-    )
+    ))
 }
 
-pub fn unshipped_card(u: &Unshipped) -> String {
+pub fn unshipped_card(u: &Unshipped) -> Card {
     let head = match &u.origin {
         Origin::ForkPr {
             number,
@@ -154,7 +192,7 @@ pub fn unshipped_card(u: &Unshipped) -> String {
         };
         format!(" · {verb} [#{}]({})", issue.number, issue.url)
     });
-    format!("- [ ] ⚡ {head}{link} {}", key_marker(&u.key))
+    Card::with_key(&format!("⚡ {head}{link}"), &u.key)
 }
 
 // ---------------------------------------------------------------- DM
@@ -166,13 +204,12 @@ pub fn unshipped_card(u: &Unshipped) -> String {
 pub struct Dm<'a, 'o, 'p> {
     pub today: &'a str,
     pub obs: &'a [Obligation<'o>],
-    pub gists: BTreeMap<String, String>,
-    pub claimed_lane: HashMap<String, &'static str>,
-    pub picks: &'a [Pick<'p, 'o>],
-    pub judged: bool,
+    pub gists: BTreeMap<CardKey, String>,
+    pub claimed_lane: HashMap<CardKey, ClaimLane>,
+    pub ranked: Ranked<'p, 'o>,
     pub unshipped: usize,
-    pub new_keys: HashSet<String>,
-    pub warnings: &'a [String],
+    pub new_keys: HashSet<CardKey>,
+    pub degraded: BTreeSet<Degraded>,
     pub claim_alerts: &'a [String],
     pub muted: usize,
     pub briefed: &'a [String],
@@ -182,20 +219,31 @@ pub struct Dm<'a, 'o, 'p> {
 impl Dm<'_, '_, '_> {
     fn obligations(&self, lines: &mut Vec<String>) {
         if self.obs.is_empty() {
-            lines.push("✅ Nothing is blocked on you.".to_owned());
+            let unread = self
+                .degraded
+                .iter()
+                .any(|source| source.can_hide_an_obligation());
+            lines.push(
+                if unread {
+                    "⚠ Found nothing blocked on you, but could not read everything (see below)."
+                } else {
+                    "✅ Nothing is blocked on you."
+                }
+                .to_owned(),
+            );
             return;
         }
         lines.push(format!("🔴 Needs you · {}", self.obs.len()));
         for (index, ob) in self.obs.iter().enumerate() {
-            let new = if self.new_keys.contains(&ob.key) {
+            let new = if self.new_keys.contains(&ob.item.key) {
                 "🆕 "
             } else {
                 ""
             };
             let place = self
                 .claimed_lane
-                .get(&ob.key)
-                .map_or(String::new(), |lane| format!(" (in your {lane})"));
+                .get(&ob.item.key)
+                .map_or(String::new(), |lane| format!(" (in your {})", lane.name()));
             lines.push(format!(
                 "{}. {new}{} #{} {}{place}",
                 index + 1,
@@ -204,7 +252,7 @@ impl Dm<'_, '_, '_> {
                 prefix(&ob.item.title, 70),
             ));
             lines.push(format!("   {}", reasons_text(ob)));
-            if let Some(gist) = self.gists.get(&ob.key).filter(|gist| !gist.is_empty()) {
+            if let Some(gist) = self.gists.get(&ob.item.key).filter(|gist| !gist.is_empty()) {
                 lines.push(format!("   {gist}"));
             }
             lines.push(format!("   {}", ob.item.url));
@@ -212,20 +260,20 @@ impl Dm<'_, '_, '_> {
     }
 
     fn top_picks(&self, lines: &mut Vec<String>) {
-        let top = &self.picks[..self.picks.len().min(self.cap)];
+        let picks = self.ranked.picks();
+        let top = &picks[..picks.len().min(self.cap)];
         if top.is_empty() {
             return;
         }
-        let caveat = if self.judged {
+        let caveat = if self.ranked.is_judged() {
             ""
         } else {
             " (ranking order — judge unavailable)"
         };
         lines.push(format!("🎯 Worth a look{caveat}"));
-        for (index, pick) in top.iter().enumerate() {
-            let o = pick.opp;
+        for (index, (o, verdict)) in top.iter().enumerate() {
             let item = o.item;
-            let new = if self.new_keys.contains(&o.key) {
+            let new = if self.new_keys.contains(&item.key) {
                 "🆕 "
             } else {
                 ""
@@ -238,24 +286,18 @@ impl Dm<'_, '_, '_> {
                 prefix(&item.title, 70)
             ));
             let mut facts = match item.pr() {
-                Some(pr) => format!("{} · CI {}", size(pr), ci_word(o.ci())),
+                Some(pr) => format!("{} · CI {}", size(pr), ci_word(o.merge)),
                 None => format!("{:.0}d old", o.age_days),
             };
-            if !o.note.is_empty() {
-                facts.push_str(&format!(" · {}", o.note));
+            if let Some(note) = &o.note {
+                facts.push_str(&format!(" · {note}"));
             }
-            let est = if pick.est.is_empty() {
-                String::new()
-            } else {
-                format!("~{} · ", pick.est)
-            };
+            let est = verdict
+                .and_then(|v| v.est.as_deref())
+                .map_or(String::new(), |est| format!("~{est} · "));
             lines.push(format!("   {est}{facts}"));
-            let said = if pick.pitch.is_empty() {
-                &pick.why
-            } else {
-                &pick.pitch
-            };
-            if !said.is_empty() {
+            let said = verdict.and_then(|v| v.pitch.as_deref().or(v.why.as_deref()));
+            if let Some(said) = said {
                 lines.push(format!("   {said}"));
             }
             lines.push(format!("   {}", item.url));
@@ -264,7 +306,7 @@ impl Dm<'_, '_, '_> {
     }
 
     fn counts(&self) -> String {
-        let rest = self.picks.len().saturating_sub(self.cap);
+        let rest = self.ranked.picks().len().saturating_sub(self.cap);
         let mut counts = Vec::new();
         if rest > 0 {
             let ending = if rest == 1 { "y" } else { "ies" };
@@ -298,8 +340,8 @@ impl Dm<'_, '_, '_> {
         if !self.briefed.is_empty() {
             lines.push(format!("📝 briefed: {}", self.briefed.join(", ")));
         }
-        for warning in self.warnings {
-            lines.push(format!("⚠ {warning}"));
+        for source in &self.degraded {
+            lines.push(format!("⚠ {}", source.warning()));
         }
         lines.join("\n")
     }
@@ -312,8 +354,8 @@ mod tests {
     use super::*;
     use crate::notify::chunks;
     use crate::obligations::collect;
-    use crate::snapshot::Item;
-    use crate::testkit::{ME, day, me, now, pr, snap};
+    use crate::snapshot::{Item, Mergeability};
+    use crate::testkit::{ME, day, me, now, opportunity, pr, snap};
 
     fn waiting_prs() -> Vec<Item> {
         (0..25)
@@ -337,7 +379,7 @@ mod tests {
             ..Dm::default()
         }
         .render();
-        for item in &snapshot.prs {
+        for (item, _) in snapshot.prs() {
             assert!(
                 message.contains(&format!("#{} ", item.number)),
                 "#{}",
@@ -353,14 +395,26 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_day_says_so() {
-        let message = Dm {
-            today: "d",
-            cap: 3,
-            ..Dm::default()
+    fn an_empty_day_says_so_only_when_everything_was_read() {
+        let message = |degraded: &[Degraded]| {
+            Dm {
+                today: "d",
+                cap: 3,
+                degraded: degraded.iter().copied().collect(),
+                ..Dm::default()
+            }
+            .render()
+        };
+        assert!(message(&[]).contains("✅ Nothing is blocked on you"));
+        assert!(
+            message(&[Degraded::Project]).contains("✅ Nothing is blocked on you"),
+            "the project column cannot hide an obligation"
+        );
+        for source in [Degraded::Merge, Degraded::Unshipped] {
+            let said = message(&[source]);
+            assert!(!said.contains('✅'), "{said}");
+            assert!(said.contains(source.warning()), "{said}");
         }
-        .render();
-        assert!(message.contains("Nothing is blocked on you"), "{message}");
     }
 
     #[test]
@@ -371,7 +425,7 @@ mod tests {
         let message = Dm {
             today: "d",
             obs: &obs[..1],
-            claimed_lane: HashMap::from([(obs[0].key.clone(), "Doing")]),
+            claimed_lane: HashMap::from([(obs[0].item.key.clone(), ClaimLane::Doing)]),
             cap: 3,
             ..Dm::default()
         }
@@ -385,16 +439,37 @@ mod tests {
         let item = pr(7);
         for (age_days, want) in [(0.5, "0d"), (1.5, "2d"), (2.5, "2d"), (3.5, "4d")] {
             let opp = Opportunity {
-                key: item.key.clone(),
-                item: &item,
-                sources: vec![Source::Unreviewed],
-                note: String::new(),
                 age_days,
-                areas: vec![],
-                merge: None,
+                ..opportunity(&item)
             };
-            let card = opp_card(&opp, "");
-            assert!(card.ends_with(&format!(" · {want}")), "{age_days}: {card}");
+            let card = opp_card(&opp, None);
+            assert!(
+                card.as_str().ends_with(&format!(" · {want}")),
+                "{age_days}: {card:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_card_tells_no_checks_from_not_having_read_them() {
+        let item = pr(7);
+        for (merge, want) in [
+            (None, "CI unknown"),
+            (
+                Some(MergeState {
+                    mergeable: Mergeability::Mergeable,
+                    ci: None,
+                }),
+                "CI none",
+            ),
+            (Some(MergeState::red()), "CI red"),
+        ] {
+            let opp = Opportunity {
+                merge,
+                ..opportunity(&item)
+            };
+            let card = opp_card(&opp, None);
+            assert!(card.as_str().contains(want), "{want}: {card:?}");
         }
     }
 }
