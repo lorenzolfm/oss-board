@@ -30,11 +30,11 @@ use sha2::{Digest, Sha256};
 
 use crate::board::CardKey;
 use crate::footprint::Footprint;
-use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind, waiting_comments};
+use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind, pings, waiting_comments};
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
-use crate::snapshot::{Ci, ReviewState};
+use crate::snapshot::{Ci, Comment, ReviewState};
 use crate::text::clip;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
@@ -185,15 +185,20 @@ struct AckDiff<'a> {
 fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excerpt<'a> {
     let item = ob.item;
     let waiting = waiting_comments(item, me, now);
-    // The comment that started the wait is the one the gist is about; on a busy
-    // thread it would fall out of a plain "last three".
-    let recent: Vec<_> = if waiting.len() <= 3 {
-        waiting
-    } else {
-        let mut kept = vec![waiting[0]];
-        kept.extend_from_slice(&waiting[waiting.len() - 2..]);
-        kept
-    };
+    // The comment that started the wait and those a mention stands on are what the verdict
+    // turns on. On a busy item they would fall out of a plain "last three".
+    let pinged = pings(item, &waiting, me);
+    let recent: Vec<&Comment> = waiting
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| {
+            *at == 0
+                || pinged.first() == Some(at)
+                || pinged.last() == Some(at)
+                || at + 2 >= waiting.len()
+        })
+        .map(|(_, comment)| *comment)
+        .collect();
     let pr = item.pr().map(|pr| PrExcerpt {
         size: format!(
             "+{}/-{} in {} files",
@@ -1150,6 +1155,81 @@ mod tests {
             review("carol", 1, ReviewState::Approved, "LGTM"),
         ]);
         assert_eq!(waiting_sent(item), ["rename this", "LGTM"]);
+    }
+
+    /// A `false` read from what is left would drop an ask nobody can see is missing. A mention
+    /// stands on its first ping and its newest, and the first can be nothing but thanks.
+    #[test]
+    fn the_verdict_reads_the_comments_a_mention_stands_on() {
+        let thanks = format!("@{ME} thanks");
+        let ask = format!("@{ME} can you decide?");
+        let mine = "this should stay a plain u64 for now";
+        let quote = format!("> {mine}\nwhy?");
+        let quote_sent = format!("> {mine} why?");
+        let word = |text: &str| c("ann", 5, text);
+        let cases: Vec<(&str, Vec<Comment>, Vec<&str>)> = vec![
+            (
+                "the one ping, behind the first comment",
+                vec![
+                    word("one"),
+                    word("two"),
+                    word(&ask),
+                    word("three"),
+                    word("four"),
+                ],
+                vec!["one", &ask, "three", "four"],
+            ),
+            (
+                "a newer ping than the first",
+                vec![
+                    word("one"),
+                    word(&thanks),
+                    word("two"),
+                    word(&ask),
+                    word("three"),
+                    word("four"),
+                ],
+                vec!["one", &thanks, &ask, "three", "four"],
+            ),
+            (
+                "a quote reply is a ping",
+                vec![
+                    c(ME, 9, mine),
+                    word("one"),
+                    word("two"),
+                    word(&quote),
+                    word("three"),
+                    word("four"),
+                ],
+                vec!["one", &quote_sent, "three", "four"],
+            ),
+            (
+                "a ping between the first and the newest has no place",
+                vec![
+                    word(&thanks),
+                    word(&format!("@{ME} between")),
+                    word(&ask),
+                    word("one"),
+                    word("two"),
+                ],
+                vec![thanks.as_str(), &ask, "one", "two"],
+            ),
+            (
+                "with no ping it stays the first and the last two",
+                vec![
+                    word("one"),
+                    word("two"),
+                    word("three"),
+                    word("four"),
+                    word("five"),
+                ],
+                vec!["one", "four", "five"],
+            ),
+        ];
+        for (name, comments, want) in cases {
+            let item = pr(1).requested(ME, &day(0).to_string()).comments(comments);
+            assert_eq!(waiting_sent(item), want, "{name}");
+        }
     }
 
     /// The newest word of each thread the model would read of this PR.

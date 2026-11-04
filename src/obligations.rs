@@ -342,6 +342,19 @@ pub fn waiting_comments<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> 
     item.comments.iter().filter(waiting).collect()
 }
 
+/// Where in `waiting` someone addressed you, oldest first. A mention stands on the first of
+/// these, which dates and names it, and the newest, which moves it.
+pub fn pings(item: &Item, waiting: &[&Comment], me: &Viewer) -> Vec<usize> {
+    let mine: Vec<Said<'_>> = stream(item).filter(|s| me.is(s.author)).collect();
+    (0..waiting.len())
+        .filter(|&at| is_ping(&waiting[at].body, me, &mine))
+        .collect()
+}
+
+fn is_ping(body: &str, me: &Viewer, mine: &[Said<'_>]) -> bool {
+    me.is_mentioned_in(body) || quotes(body, mine)
+}
+
 fn norm(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
@@ -384,7 +397,7 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     let assigned_to_me = item.assignees.iter().any(|login| me.is(login));
     let after = said.iter().filter(|s| s.is_waiting(answered, me, now));
     let (pinged, others): (Vec<&Said<'_>>, Vec<&Said<'_>>) =
-        after.partition(|s| me.is_mentioned_in(s.body) || quotes(s.body, &mine));
+        after.partition(|s| is_ping(s.body, me, &mine));
 
     if let (Some(first), Some(newest)) = (pinged.first(), pinged.last()) {
         let verb = if !me.is_mentioned_in(first.body) {
