@@ -42,6 +42,7 @@ use anyhow::{Context, Result, bail};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
+use crate::config;
 use crate::obligations::{Fingerprint, ReasonKind, Seen};
 use crate::timestamp::Timestamp;
 
@@ -107,6 +108,14 @@ impl GitHubItem {
             number: found[3].parse().ok()?,
         })
     }
+
+    /// In one of the repos you work in, not a fork of one.
+    fn is_upstream(&self) -> bool {
+        config::PROJECTS.iter().any(|project| {
+            self.owner.eq_ignore_ascii_case(project.repo.owner)
+                && self.name.eq_ignore_ascii_case(project.repo.name)
+        })
+    }
 }
 
 /// What a card is about.
@@ -127,10 +136,12 @@ impl CardKey {
         Self::Branch(name.to_owned())
     }
 
-    /// What a card or the DM calls it: `cdk#2778`. A bare number could be any repo's.
+    /// What a card or the DM calls it: `cdk#2778`. A bare number could be any repo's, and
+    /// a fork has its upstream's name but not its numbers, so its owner stays.
     pub fn short(&self) -> String {
         match self {
-            Self::GitHub(item) => format!("{}#{}", item.name, item.number),
+            Self::GitHub(item) if item.is_upstream() => format!("{}#{}", item.name, item.number),
+            Self::GitHub(_) => self.to_string(),
             Self::Branch(name) => name.clone(),
         }
     }
@@ -821,6 +832,19 @@ mod tests {
         );
         for bad in ["", "planted", "a/b#x", "a/b", "#1"] {
             assert!(bad.parse::<CardKey>().is_err(), "{bad}");
+        }
+    }
+
+    /// A DM line has no link on it, so its name is all that says which item it means.
+    #[test]
+    fn a_short_name_tells_a_fork_from_its_upstream() {
+        for (text, want) in [
+            ("getfloresta/Floresta#6", "floresta#6"),
+            ("cashubtc/cdk#6", "cdk#6"),
+            ("lorenzolfm/floresta#6", "lorenzolfm/floresta#6"),
+            ("branch:cdk/wip", "cdk/wip"),
+        ] {
+            assert_eq!(key(text).short(), want, "{text}");
         }
     }
 

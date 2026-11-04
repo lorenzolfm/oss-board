@@ -124,3 +124,16 @@ fn home() -> PathBuf {
 pub fn default_board() -> PathBuf {
     home().join("Documents/Vault/Opensource/Tasks.md")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Short names, branch keys and note names all go by the label.
+    #[test]
+    fn no_two_projects_share_a_label() {
+        let labels: HashSet<String> = PROJECTS.iter().map(|p| p.repo.label()).collect();
+        assert_eq!(labels.len(), PROJECTS.len());
+    }
+}
