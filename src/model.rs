@@ -37,6 +37,8 @@ use crate::snapshot::{Ci, ReviewState};
 use crate::text::clip;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
+/// Enough that the repo you have fewer commits in still makes the list.
+const FOOTPRINT_AREAS: usize = 20;
 
 fn log(message: &str) {
     eprintln!("[model] {message}");
@@ -322,7 +324,7 @@ struct CandidatePr<'a> {
 
 #[derive(Serialize)]
 struct Candidate<'a> {
-    number: u64,
+    key: &'a CardKey,
     kind: &'static str,
     title: &'a str,
     author: &'a str,
@@ -343,7 +345,7 @@ fn candidate<'a>(o: &'a Opportunity<'_>) -> Candidate<'a> {
     let item = o.item;
     let merge = o.merge;
     Candidate {
-        number: item.number,
+        key: &item.key,
         kind: item.kind(),
         title: &item.title,
         author: &item.author,
@@ -402,25 +404,9 @@ struct RankAnswer {
 /// costs only itself.
 #[derive(Deserialize)]
 struct WirePick {
-    #[serde(deserialize_with = "number_or_numeric_text")]
-    number: u64,
+    key: CardKey,
     #[serde(default, deserialize_with = "text_or_nothing")]
     why: Option<String>,
-}
-
-/// The judge writes `"number": "1"` as readily as `"number": 1`. Anything else points
-/// at nothing.
-fn number_or_numeric_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Number {
-        Number(u64),
-        Text(String),
-    }
-    match Number::deserialize(deserializer)? {
-        Number::Number(number) => Ok(number),
-        Number::Text(text) => text.trim().parse().map_err(serde::de::Error::custom),
-    }
 }
 
 /// A field of the wrong type costs that field, not the pick.
@@ -476,8 +462,8 @@ pub fn rank<'o, 'a>(
     ttl_hours: f64,
     mut ask: impl FnMut(&str) -> Option<Value>,
 ) -> Result<Ranked<'o, 'a>> {
-    let by_number: HashMap<u64, &'o Opportunity<'a>> =
-        opps.iter().map(|o| (o.item.number, o)).collect();
+    let by_key: HashMap<&CardKey, &'o Opportunity<'a>> =
+        opps.iter().map(|o| (&o.item.key, o)).collect();
     let sig = rank_fingerprint(opps);
     let cache: RankCache = load_cache(cache_path);
     let now = SystemTime::now()
@@ -489,7 +475,7 @@ pub fn rank<'o, 'a>(
         let candidates: Vec<_> = opps.iter().map(candidate).collect();
         let areas: Vec<String> = fp
             .areas()
-            .take(10)
+            .take(FOOTPRINT_AREAS)
             .map(|area| Value::from(area).to_string())
             .collect();
         // The payload goes in last: it holds text from GitHub, and nothing after
@@ -518,10 +504,10 @@ pub fn rank<'o, 'a>(
         let Ok(pick) = serde_json::from_value::<WirePick>(pick) else {
             continue;
         };
-        let Some(opp) = by_number.get(&pick.number).copied() else {
+        let Some(opp) = by_key.get(&pick.key).copied() else {
             continue; // invented
         };
-        if !seen.insert(pick.number) {
+        if !seen.insert(pick.key) {
             continue; // a duplicate
         }
         let verdict = Verdict {
@@ -591,15 +577,45 @@ mod tests {
         let items = items();
         let opps = opportunities(&items);
         let answer = json!({"picks": [
-            {"number": 3, "why": "w"},
-            {"number": 99, "why": "invented"},
-            {"number": 3},
+            {"key": "getfloresta/Floresta#3", "why": "w"},
+            {"key": "getfloresta/Floresta#99", "why": "invented"},
+            {"key": "getfloresta/floresta#3"},
             {"bogus": 1},
-            {"number": "1", "why": "x"},
+            {"key": "GetFloresta/floresta#1", "why": "x"},
         ]});
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(answer));
         assert!(ranked.is_judged());
         assert_eq!(numbers(&ranked), [3, 1], "invented and duplicate dropped");
+    }
+
+    #[test]
+    fn the_judge_tells_the_same_number_in_two_repos_apart() {
+        let dir = TempDir::new().unwrap();
+        let items = vec![pr(7), pr(7).in_repo("cashubtc/cdk")];
+        let opps = opportunities(&items);
+        let answer = json!({"picks": [
+            {"key": "cashubtc/cdk#7", "why": "the cdk one"},
+            {"key": "getfloresta/Floresta#7", "why": "the floresta one"},
+        ]});
+        let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(answer));
+        let picks = ranked.picks();
+        let got: Vec<_> = picks
+            .iter()
+            .map(|(opp, verdict)| {
+                let why = verdict.and_then(|v| v.why.as_deref());
+                (opp.item.key.to_string(), why)
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("cashubtc/cdk#7".to_owned(), Some("the cdk one")),
+                (
+                    "getfloresta/floresta#7".to_owned(),
+                    Some("the floresta one")
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -608,13 +624,14 @@ mod tests {
         let items = items();
         let opps = opportunities(&items);
         let answer = json!({"picks": [
-            {"number": true, "why": "a boolean is not number 1"},
-            {"number": 1.5},
-            {"number": -1},
-            {"number": [1]},
-            {"number": null},
+            {"key": true, "why": "a boolean is not a key"},
+            {"key": 1, "why": "a bare number could be any repo's"},
+            {"key": "1"},
+            {"key": "#1"},
+            {"key": [1]},
+            {"key": null},
             "not an object",
-            {"number": 2, "why": true},
+            {"key": "getfloresta/Floresta#2", "why": true},
         ]});
         let ranked = rank_with(&opps, &cache(&dir, "r.json"), Some(answer));
         assert_eq!(numbers(&ranked), [2]);
@@ -649,7 +666,7 @@ mod tests {
         let calls = Cell::new(0);
         let ask = |_: &str| {
             calls.set(calls.get() + 1);
-            Some(json!({"picks": [{"number": 2}]}))
+            Some(json!({"picks": [{"key": "getfloresta/Floresta#2"}]}))
         };
         let items = items();
         let opps = opportunities(&items);
@@ -833,7 +850,7 @@ mod tests {
         let cached = json!({
             "sig": rank_fingerprint(&opps),
             "at": now,
-            "picks": [{"number": 2, "why": "w"}],
+            "picks": [{"key": "getfloresta/Floresta#2", "why": "w"}],
         });
         fs::write(&path, cached.to_string()).unwrap();
         let ranked = rank(&opps, &Footprint::default(), 8, &path, 12.0, |_| {
@@ -872,7 +889,8 @@ mod tests {
         fs::write(&path, "{{{ not json").unwrap();
         let items = items();
         let opps = opportunities(&items);
-        let ranked = rank_with(&opps, &path, Some(json!({"picks": [{"number": 1}]})));
+        let answer = json!({"picks": [{"key": "getfloresta/Floresta#1"}]});
+        let ranked = rank_with(&opps, &path, Some(answer));
         assert_eq!(numbers(&ranked), [1]);
     }
 }

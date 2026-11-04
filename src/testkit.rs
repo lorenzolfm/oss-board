@@ -108,6 +108,15 @@ fn item(number: u64, title: String, url: String, detail: Detail) -> Item {
     }
 }
 
+impl Item {
+    /// The same item in another repo, for what must not confuse two repos' numbers.
+    pub fn in_repo(mut self, repo: &str) -> Self {
+        self.url = self.url.replace("getfloresta/Floresta", repo);
+        self.key = item_key(&self.url).unwrap();
+        self
+    }
+}
+
 pub fn pr(number: u64) -> Item {
     item(
         number,

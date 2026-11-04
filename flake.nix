@@ -1,5 +1,5 @@
 {
-  description = "Floresta triage: what is blocked on you, then what is worth your evening";
+  description = "Open-source triage: what is blocked on you, then what is worth your evening";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -51,7 +51,7 @@
             doCheck = false;
 
             meta = {
-              description = "Floresta triage: what is blocked on you, then what is worth your evening";
+              description = "Open-source triage: what is blocked on you, then what is worth your evening";
               homepage = "https://github.com/lorenzolfm/oss-board";
               mainProgram = "oss-board";
               platforms = pkgs.lib.platforms.linux;

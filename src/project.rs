@@ -1,8 +1,9 @@
-//! The org project board's "Needs Review" column.
+//! An org project board's "Needs Review" column.
 //!
 //! Needs a token with `read:project`; without it the query fails and the source is
 //! simply absent from that run. `survey` exists for the one-off check that the
-//! column is curated -- items moving in and out recently, not a name nobody uses.
+//! column is curated -- items moving in and out recently, not a name nobody uses. It
+//! reads the boards of every project configured with a column.
 
 use std::collections::HashSet;
 
@@ -145,9 +146,20 @@ pub fn needs_review(repo: Repo, cfg: &ProjectColumn) -> Result<HashSet<u64>, GhE
         .collect())
 }
 
-/// Print every column of the org board, biggest first.
+/// Print every column of each org board, biggest first.
 pub fn survey() -> Result<(), GhError> {
-    let cfg = &config::PROJECT;
+    for project in &config::PROJECTS {
+        let Some(cfg) = &project.column else {
+            println!("{}: no column configured", project.repo);
+            continue;
+        };
+        println!("{}: {}'s board #{}", project.repo, cfg.org, cfg.number);
+        survey_board(cfg)?;
+    }
+    Ok(())
+}
+
+fn survey_board(cfg: &ProjectColumn) -> Result<(), GhError> {
     let mut columns: Vec<(Option<String>, Vec<ProjectItem>)> = Vec::new();
     for item in items(cfg.org, cfg.number)? {
         match columns

@@ -127,6 +127,14 @@ impl CardKey {
         Self::Branch(name.to_owned())
     }
 
+    /// What a card or the DM calls it: `cdk#2778`. A bare number could be any repo's.
+    pub fn short(&self) -> String {
+        match self {
+            Self::GitHub(item) => format!("{}#{}", item.name, item.number),
+            Self::Branch(name) => name.clone(),
+        }
+    }
+
     /// The issue or PR, for a key GitHub can be asked about.
     pub fn github(&self) -> Option<&GitHubItem> {
         match self {
@@ -564,6 +572,7 @@ mod tests {
     //! on.
 
     use super::*;
+    use crate::config::Repo;
     use crate::obligations::{self, is_muted};
     use crate::render;
     use crate::testkit::{ME, c, day, key, me, now, opportunity, pr, snap, thread};
@@ -839,6 +848,10 @@ mod tests {
             );
 
             let fork = Unshipped {
+                repo: Repo {
+                    owner: "getfloresta",
+                    name: "Floresta",
+                },
                 key: key("lorenzolfm/floresta#6"),
                 origin: Origin::ForkPr {
                     number: 6,

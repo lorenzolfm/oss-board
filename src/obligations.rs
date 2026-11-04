@@ -209,7 +209,7 @@ impl<'a> Obligation<'a> {
 
     /// Longest-waiting first. A state with no visible start (a conflict) sorts by
     /// when the item last moved, so it neither jumps the queue nor sinks.
-    fn sort_key(&self) -> Timestamp {
+    pub fn sort_key(&self) -> Timestamp {
         self.reasons
             .iter()
             .filter_map(Reason::since)
@@ -556,7 +556,7 @@ fn own_pr(
 
     if let Some(merge) = merge {
         if merge.is_conflicting() {
-            let text = "conflicts with master, needs a rebase".to_owned();
+            let text = "conflicts with its base, needs a rebase".to_owned();
             out.push(Reason::on_head(ReasonKind::Conflict, pr, None, text));
         }
         if merge.is_red() {
@@ -695,7 +695,7 @@ pub fn collect<'a>(
 
 /// Attach a reason to the item's obligation, creating it if needed.
 pub fn add_reason<'a>(obs: &mut Vec<Obligation<'a>>, item: &'a Item, reason: Reason) {
-    if let Some(ob) = obs.iter_mut().find(|ob| ob.item.number == item.number) {
+    if let Some(ob) = obs.iter_mut().find(|ob| ob.item.key == item.key) {
         ob.reasons.push(reason);
         return;
     }

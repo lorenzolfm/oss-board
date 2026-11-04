@@ -2,7 +2,7 @@
 name = "oss-board"
 version = "0.1.0"
 edition = "2024"
-description = "Floresta triage: what is blocked on you, then what is worth your evening"
+description = "Open-source triage: what is blocked on you, then what is worth your evening"
 repository = "https://github.com/lorenzolfm/oss-board"
 publish = false
 

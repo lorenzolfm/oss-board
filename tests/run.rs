@@ -23,7 +23,9 @@ case "$*" in
   *"viewer { login }"*) echo '{"data":{"viewer":{"login":"me"}}}';;
   *"creator=me"*) ;;
   *"first: 50"*) echo '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
+  *'owner: "cashubtc"'*"pullRequests(states: OPEN"*) cat "$FIXTURE_DIR/cdk_prs.json";;
   *"pullRequests(states: OPEN"*) cat "$FIXTURE_DIR/prs.json";;
+  *"repos/cashubtc/cdk/compare/main..."*) echo '[{"filename":"src/a.rs","patch":"same"}]';;
   *"issues(states: OPEN"*) echo '{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
   *mergeable*) cat "$FIXTURE_DIR/merge.json";;
   *projectV2*) echo '{"data":{"organization":{"projectV2":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}';;
@@ -59,7 +61,7 @@ case "$prompt" in
   "You are picking"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     [ -f "$FIXTURE_DIR/no_judge" ] && exit 1
-    echo '{"picks":[{"number":8,"why":"small and yours"}]}';;
+    echo '{"picks":[{"key":"getfloresta/Floresta#8","why":"small and yours"}]}';;
   "Write an Obsidian"*)
     echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     cp "$FIXTURE_DIR/vault/Tasks.md" "$FIXTURE_DIR/board_at_brief.md"
@@ -109,6 +111,11 @@ fn prs() -> String {
     ])
 }
 
+/// The same page as it would come from cdk, numbers and all.
+fn on_cdk(page: &str) -> String {
+    page.replace("getfloresta/Floresta", "cashubtc/cdk")
+}
+
 fn merge_node(mergeable: &str, ci: &str) -> String {
     format!(
         r#"{{"mergeable":"{mergeable}","commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{ci}}}}}]}}}}"#
@@ -148,6 +155,7 @@ impl Fixture {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         fs::write(fixture.path("prs.json"), prs()).unwrap();
+        fs::write(fixture.path("cdk_prs.json"), prs_page(&[])).unwrap();
         let clean = merge_node("MERGEABLE", "null");
         fs::write(
             fixture.path("merge.json"),
@@ -295,7 +303,7 @@ fn a_run_rewrites_the_agent_lanes_and_leaves_yours() {
     let needs_me = lane(&board, "Needs me");
     assert_eq!(needs_me.len(), 1, "{board}");
     assert!(
-        needs_me[0].contains("[#7](") && needs_me[0].contains("*(wants a yes/no)*"),
+        needs_me[0].contains("[floresta#7](") && needs_me[0].contains("*(wants a yes/no)*"),
         "{board}"
     );
     assert!(
@@ -305,7 +313,8 @@ fn a_run_rewrites_the_agent_lanes_and_leaves_yours() {
     let opportunities = lane(&board, "Opportunities");
     assert_eq!(opportunities.len(), 1, "{board}");
     assert!(
-        opportunities[0].contains("[#8](") && opportunities[0].contains("*(small and yours)*"),
+        opportunities[0].contains("[floresta#8](")
+            && opportunities[0].contains("*(small and yours)*"),
         "{board}"
     );
     assert_eq!(lane(&board, "Todo"), ["- [ ] my own words ^abc"]);
@@ -480,7 +489,7 @@ fn a_failed_merge_read_keeps_the_card_and_is_not_an_all_clear() {
     run(&mut fixture.command(&["--no-model", "--no-briefings"]));
     let board = fixture.read_board();
     let card = lane(&board, "Needs me")[0].to_owned();
-    assert!(card.contains("conflicts with master"), "{card}");
+    assert!(card.contains("conflicts with its base"), "{card}");
     assert!(card.contains(MY_PR_HEAD), "the head it was seen on: {card}");
 
     let (url, beats) = listener();
@@ -620,7 +629,7 @@ fn a_push_is_dated_by_its_force_push_or_failing_that_its_commit() {
         let board = fixture.read_board();
         let needs_me = lane(&board, "Needs me");
         assert_eq!(
-            needs_me.iter().any(|card| card.contains("[#50](")),
+            needs_me.iter().any(|card| card.contains("[floresta#50](")),
             open,
             "{name}: {board}"
         );
@@ -724,8 +733,8 @@ fn a_dry_run_prints_and_leaves_the_vault_alone() {
     fs::write(fixture.board(), &before).unwrap();
     let out = run(&mut fixture.command(&["--dry-run", "--no-model"]));
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[#7]("), "{stdout}");
-    assert!(stdout.contains("Floresta · "), "the DM too: {stdout}");
+    assert!(stdout.contains("[floresta#7]("), "{stdout}");
+    assert!(stdout.contains("OSS · "), "the DM too: {stdout}");
     assert_eq!(fixture.read_board(), before);
 }
 
@@ -791,7 +800,10 @@ fn the_board_is_written_before_any_briefing_starts() {
         .env("GH_TOKEN", "read-only-token"));
     let seen = fs::read_to_string(fixture.path("board_at_brief.md")).unwrap();
     assert_eq!(lane(&seen, "Needs me").len(), 1, "{seen}");
-    assert!(lane(&seen, "Needs me")[0].contains("[#7]("), "{seen}");
+    assert!(
+        lane(&seen, "Needs me")[0].contains("[floresta#7]("),
+        "{seen}"
+    );
 }
 
 /// Under its real name a note is complete, so what it needs is a link, not an agent.
@@ -943,7 +955,10 @@ fn what_the_model_says_asks_nothing_stays_on_the_board_and_out_of_the_dm() {
     assert!(!dm.contains("not filtered"), "{dm}");
 
     let board = fixture.read_board();
-    assert!(lane(&board, "Needs me")[0].contains("[#7]("), "{board}");
+    assert!(
+        lane(&board, "Needs me")[0].contains("[floresta#7]("),
+        "{board}"
+    );
 }
 
 /// GitHub answers UNKNOWN at 08:07 because master just moved. That says nothing about the
@@ -1008,7 +1023,7 @@ fn what_re_arms_a_mute_does_not_resend_what_you_were_told() {
     fs::write(fixture.path("prs.json"), prs_page(&[thanked])).unwrap();
     let rearmed = deliver(&fixture, &url, &messages, &[]);
     assert!(
-        lane(&fixture.read_board(), "Needs me")[0].contains("[#7]("),
+        lane(&fixture.read_board(), "Needs me")[0].contains("[floresta#7]("),
         "the mute re-armed"
     );
     assert!(rearmed.contains("nothing new"), "{rearmed}");
@@ -1023,7 +1038,7 @@ fn the_dm_carries_no_opportunities() {
     assert!(!dm.contains("pull/8"), "{dm}");
     let board = fixture.read_board();
     assert!(
-        lane(&board, "Opportunities")[0].contains("[#8]("),
+        lane(&board, "Opportunities")[0].contains("[floresta#8]("),
         "{board}"
     );
 }
@@ -1060,7 +1075,7 @@ fn a_claim_alert_goes_out_once_and_stays_on_the_card() {
     ] {
         fs::write(fixture.path("claims.json"), claims).unwrap();
         let dm = deliver(&fixture, &url, &messages, &["--no-model"]);
-        assert_eq!(dm.contains("#98 —"), sent, "{name}: {dm}");
+        assert_eq!(dm.contains("floresta#98 —"), sent, "{name}: {dm}");
     }
     let board = fixture.read_board();
     assert!(
@@ -1079,7 +1094,7 @@ fn a_card_in_done_raises_no_alert() {
     fs::write(fixture.path("claims.json"), claimed_issue("CLOSED", "me")).unwrap();
     run(&mut fixture.command(&["--no-model", "--no-briefings"]));
     let dm = fixture.read_state("summary.txt");
-    assert!(!dm.contains("#98 —"), "{dm}");
+    assert!(!dm.contains("floresta#98 —"), "{dm}");
     let board = fixture.read_board();
     assert!(
         lane(&board, "Done")[0].contains("closed upstream"),
@@ -1159,4 +1174,102 @@ fn a_failed_read_of_the_shortlist_does_not_warn_about_your_prs() {
     assert_eq!(fixture.degraded(), serde_json::json!(["opportunity_merge"]));
     let dm = fixture.read_state("summary.txt");
     assert!(!dm.contains("merge state unread"), "{dm}");
+}
+
+// ---------------------------------------------------------------- two repos
+
+/// Both repos have a #7 and a #8. The model only spoke about Floresta's, so what it said
+/// must not reach cdk's.
+#[test]
+fn the_same_number_in_two_repos_is_two_items() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("cdk_prs.json"), on_cdk(&prs())).unwrap();
+    run(&mut fixture.command(&[]));
+    let board = fixture.read_board();
+
+    let needs_me = lane(&board, "Needs me");
+    assert_eq!(needs_me.len(), 2, "{board}");
+    let of = |label: &str| needs_me.iter().find(|card| card.contains(label)).unwrap();
+    assert!(
+        of("[floresta#7](").contains("*(wants a yes/no)*"),
+        "{board}"
+    );
+    assert!(!of("[cdk#7](").contains("wants a yes/no"), "{board}");
+    assert!(of("[cdk#7](").contains("https://github.com/cashubtc/cdk/pull/7"));
+
+    let opportunities = lane(&board, "Opportunities");
+    assert_eq!(opportunities.len(), 1, "the judge kept one: {board}");
+    assert!(opportunities[0].contains("[floresta#8]("), "{board}");
+}
+
+#[test]
+fn the_dm_says_which_repo_an_ask_is_in() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("prs.json"), prs_page(&[])).unwrap();
+    fs::write(fixture.path("cdk_prs.json"), on_cdk(&prs())).unwrap();
+    let out = run(&mut fixture.command(&["--dry-run", "--no-model"]));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\ncdk#7 waiting on you"), "{stdout}");
+    assert!(
+        stdout.contains("\nhttps://github.com/cashubtc/cdk/pull/7"),
+        "{stdout}"
+    );
+}
+
+/// A snapshot is what every lane is computed from, and an answer from one repo is not an
+/// answer about the other's cards.
+#[test]
+fn a_failed_snapshot_of_either_repo_leaves_the_board_untouched() {
+    for failing in ["getfloresta", "cashubtc"] {
+        let fixture = Fixture::new();
+        fs::write(fixture.board(), board_text("", "")).unwrap();
+        let before = fixture.read_board();
+        let out = fixture
+            .command(&[])
+            .env("GH_FAIL_ON", format!("owner: \"{failing}\""))
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{failing}");
+        assert_eq!(fixture.read_board(), before, "{failing}");
+    }
+}
+
+/// cdk's default branch is `main`. Comparing against `master` fails, and a failed compare
+/// only costs the note, so nothing else would notice.
+#[test]
+fn a_stale_ack_on_cdk_is_diffed_against_its_own_base() {
+    let fixture = Fixture::new();
+    let acked = pr_node(7, "acked", "", "bbbbbbb", "bob").replace(
+        r#""comments":{"nodes":[]}"#,
+        r#""comments":{"nodes":[{"author":{"__typename":"User","login":"me"},
+            "body":"ACK aaaaaaa","createdAt":"2025-12-01T00:00:00Z"}]}"#,
+    );
+    fs::write(fixture.path("prs.json"), prs_page(&[])).unwrap();
+    fs::write(fixture.path("cdk_prs.json"), on_cdk(&prs_page(&[acked]))).unwrap();
+    run(&mut fixture.command(&["--no-model"]));
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Needs me")[0].contains("rebase only"),
+        "{board}"
+    );
+}
+
+#[test]
+fn claiming_a_cdk_pr_briefs_that_pr_not_florestas_with_the_same_number() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("cdk_prs.json"), on_cdk(&prs())).unwrap();
+    fs::write(fixture.board(), on_cdk(&claimed_pr_board())).unwrap();
+    run(fixture
+        .command(&["--no-model"])
+        .env("GH_TOKEN", "read-only"));
+    assert!(fixture.path("vault/cdk-8.md").exists());
+    assert!(!fixture.path("vault/Floresta-8.md").exists());
+    let board = fixture.read_board();
+    assert!(lane(&board, "Doing")[0].contains("[[cdk-8]]"), "{board}");
+    assert!(
+        lane(&board, "Opportunities")
+            .iter()
+            .any(|card| card.contains("[floresta#8](")),
+        "Floresta's #8 was not the one claimed: {board}"
+    );
 }

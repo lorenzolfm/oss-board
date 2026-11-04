@@ -1,4 +1,4 @@
-# Floresta triage: refreshes the board hourly, DMs once each morning.
+# Open-source triage: refreshes the board hourly, DMs once each morning.
 #
 # Mirrors the borgmatic pattern in backup.nix: a systemd timer with
 # Persistent = true, secrets via sops-nix, and an uptime-kuma push heartbeat so
@@ -66,7 +66,7 @@ in
   };
 
   systemd.services.oss-board = {
-    description = "Refresh the Floresta triage board";
+    description = "Refresh the open-source triage board";
     after = [ "network-online.target" ];
     wants = [ "network-online.target" ];
 
@@ -115,7 +115,7 @@ in
       IOSchedulingClass = "idle";
 
       # Hardening. It writes the vault and its own state dir and nothing else;
-      # the Floresta clone in ~/Projects/misc is only read.
+      # the project clones in ~/Projects/misc are only read.
       PrivateTmp = true;
       ProtectSystem = "strict";
       ProtectHome = "read-only";
@@ -140,7 +140,7 @@ in
   };
 
   systemd.timers.oss-board = {
-    description = "Refresh the Floresta triage board hourly";
+    description = "Refresh the open-source triage board hourly";
     wantedBy = [ "timers.target" ];
     timerConfig = {
       # Hourly for the board. The DM is not a timer concern: the run sends it on

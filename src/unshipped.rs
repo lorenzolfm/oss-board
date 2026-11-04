@@ -1,4 +1,4 @@
-//! Your Floresta work that exists but never reached upstream.
+//! Your work on a project that exists but never reached upstream.
 //!
 //! Two sources:
 //!   * open PRs against your own fork. They look reviewed-and-done there, but
@@ -24,7 +24,7 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::board::CardKey;
-use crate::config::{self, Repo};
+use crate::config::{self, Project, Repo};
 use crate::proc;
 use crate::snapshot::{self, Item, UpstreamPr};
 use crate::timestamp::Timestamp;
@@ -34,15 +34,19 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 static CHECKOUT_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:pr|review)[-_]?\d+(?:-head)?$").expect("a constant pattern compiles")
 });
-/// Consuming the character before a bare `#` stands in for the lookbehind the regex
-/// crate does not have: a match never starts inside the previous one, since that
-/// ends in a digit, which already rules the next `#` out.
-static REF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)(?:github\.com/getfloresta/floresta/(?:issues|pull)/|getfloresta/floresta#|(?:^|[^\w/])#)(\d+)",
-    )
-    .expect("a constant pattern compiles")
-});
+
+/// A reference to one of `repo`'s issues, spelled out or as a bare `#N`. Consuming the
+/// character before a bare `#` stands in for the lookbehind the regex crate does not
+/// have: a match never starts inside the previous one, since that ends in a digit, which
+/// already rules the next `#` out. It also means only a match naming the repo holds a `/`.
+fn ref_re(repo: Repo) -> Regex {
+    let repo = regex::escape(&repo.to_string());
+    Regex::new(&format!(
+        r"(?i)(?:github\.com/{repo}/(?:issues|pull)/|{repo}#|(?:^|[^\w/])#)(\d+)"
+    ))
+    .expect("an escaped repo compiles")
+}
+
 const STOP: [&str; 39] = [
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into", "is", "it",
     "its", "of", "on", "or", "per", "the", "to", "with", "without", "when", "not", "no", "via",
@@ -79,6 +83,7 @@ pub enum Origin {
 
 #[derive(Clone, Debug)]
 pub struct Unshipped {
+    pub repo: Repo,
     pub key: CardKey,
     pub origin: Origin,
     pub title: String,
@@ -155,15 +160,16 @@ fn tokens(text: &str) -> HashSet<String> {
 /// unless N is too big to be one, hence the >= 100 floor. Failing that, a title
 /// match on at least two shared words.
 fn link_issue<'a>(
+    refs: &Regex,
     text: &str,
     words: &HashSet<String>,
     issues: &[&'a Item],
 ) -> Option<(&'a Item, LinkHow)> {
-    for found in REF_RE.captures_iter(text) {
+    for found in refs.captures_iter(text) {
         let Ok(number) = found[1].parse::<u64>() else {
             continue;
         };
-        let named = found[0].to_lowercase().contains("floresta");
+        let named = found[0].contains('/');
         if (number >= 100 || named)
             && let Some(issue) = issues.iter().find(|issue| issue.number == number)
         {
@@ -332,8 +338,13 @@ fn local_branches(
     Ok(out)
 }
 
-fn link_of(text: &str, words: &HashSet<String>, issues: &[&Item]) -> Option<IssueLink> {
-    link_issue(text, words, issues).map(|(issue, how)| IssueLink {
+fn link_of(
+    refs: &Regex,
+    text: &str,
+    words: &HashSet<String>,
+    issues: &[&Item],
+) -> Option<IssueLink> {
+    link_issue(refs, text, words, issues).map(|(issue, how)| IssueLink {
         number: issue.number,
         url: issue.url.clone(),
         how,
@@ -343,12 +354,14 @@ fn link_of(text: &str, words: &HashSet<String>, issues: &[&Item]) -> Option<Issu
 /// Every piece of unshipped work, given your fork's PRs. `upstream_mine` is
 /// `snapshot::mine`: every PR you opened upstream.
 fn assemble(
+    repo: Repo,
     prs: Vec<ForkPr>,
     issues: &[&Item],
     upstream_mine: &[UpstreamPr],
     clones: &[PathBuf],
     upstream_ref: &str,
 ) -> Result<Vec<Unshipped>> {
+    let refs = ref_re(repo);
     let up_titles: HashSet<String> = upstream_mine.iter().map(|p| norm_title(&p.title)).collect();
     let up_refs: HashSet<&str> = upstream_mine.iter().map(|p| p.head_ref.as_str()).collect();
     let up_oids: HashSet<&String> = upstream_mine.iter().flat_map(|p| &p.commits).collect();
@@ -365,8 +378,9 @@ fn assemble(
         let words = tokens(&format!("{} {}", pr.title, pr.branch));
         let text = format!("{}\n{}", pr.body, pr.title);
         items.push(Unshipped {
+            repo,
             key: snapshot::item_key(&pr.url)?,
-            issue: link_of(&text, &words, issues),
+            issue: link_of(&refs, &text, &words, issues),
             origin: Origin::ForkPr {
                 number: pr.number,
                 url: pr.url,
@@ -392,8 +406,10 @@ fn assemble(
             let words = tokens(&format!("{} {}", branch.branch, branch.subjects.join(" ")));
             let text = format!("{}\n{}", branch.subjects.join("\n"), branch.title);
             items.push(Unshipped {
-                key: CardKey::branch(&branch.branch),
-                issue: link_of(&text, &words, issues),
+                repo,
+                // Two clones can both have a `fix-tests`, and they are not one card.
+                key: CardKey::branch(&format!("{}/{}", repo.label(), branch.branch)),
+                issue: link_of(&refs, &text, &words, issues),
                 origin: Origin::Branch,
                 title: branch.title,
                 branch: branch.branch,
@@ -405,13 +421,19 @@ fn assemble(
     Ok(items)
 }
 
-pub fn run(issues: &[&Item], upstream_mine: &[UpstreamPr], me: &str) -> Result<Vec<Unshipped>> {
+pub fn run(
+    project: &Project,
+    issues: &[&Item],
+    upstream_mine: &[UpstreamPr],
+    me: &str,
+) -> Result<Vec<Unshipped>> {
     assemble(
-        fork_prs(config::FORK, me)?,
+        project.repo,
+        fork_prs(project.fork, me)?,
         issues,
         upstream_mine,
-        &config::clones(),
-        config::UPSTREAM_REF,
+        &project.clones(),
+        &project.upstream_ref(),
     )
 }
 
@@ -433,6 +455,14 @@ mod tests {
     const MINE: &str = "me@example.com";
     const OTHER: &str = "other@example.com";
     const UPSTREAM: &str = "upstream/master";
+    const FLORESTA: Repo = Repo {
+        owner: "getfloresta",
+        name: "Floresta",
+    };
+    const CDK: Repo = Repo {
+        owner: "cashubtc",
+        name: "cdk",
+    };
 
     fn run_git(path: &Path, args: &[&str], email: &str) {
         let out = Command::new("git")
@@ -625,6 +655,7 @@ mod tests {
         let issues = linkable_issues();
         let issues: Vec<&Item> = issues.iter().collect();
         let items = assemble(
+            FLORESTA,
             prs,
             &issues,
             &upstream,
@@ -642,11 +673,11 @@ mod tests {
             "nobody upstream has seen it: {keys:?}"
         );
         assert!(
-            !keys.contains(&&CardKey::branch("shipped-as-pr")),
+            !keys.contains(&&CardKey::branch("floresta/shipped-as-pr")),
             "upstream merged it as a PR: {keys:?}"
         );
         assert!(
-            keys.contains(&&CardKey::branch("dedup-config-parse")),
+            keys.contains(&&CardKey::branch("floresta/dedup-config-parse")),
             "an unpushed branch stays: {keys:?}"
         );
     }
@@ -655,8 +686,9 @@ mod tests {
     fn linking_work_to_the_issue_it_fixes() {
         let issues = linkable_issues();
         let issues: Vec<&Item> = issues.iter().collect();
+        let refs = ref_re(FLORESTA);
         let link = |text: &str, words: &str| {
-            link_issue(text, &tokens(words), &issues).map(|(issue, how)| (issue.number, how))
+            link_issue(&refs, text, &tokens(words), &issues).map(|(issue, how)| (issue.number, how))
         };
         assert_eq!(
             link(
@@ -686,6 +718,46 @@ mod tests {
             Some((6, LinkHow::Refs)),
             "naming the repo makes even a small number upstream's"
         );
+    }
+
+    #[test]
+    fn a_reference_counts_only_for_the_repo_it_names() {
+        let issues = linkable_issues();
+        let issues: Vec<&Item> = issues.iter().collect();
+        let refs = ref_re(CDK);
+        let link = |text: &str| {
+            link_issue(&refs, text, &HashSet::new(), &issues).map(|(issue, _)| issue.number)
+        };
+        assert_eq!(link("see cashubtc/cdk#6"), Some(6));
+        assert_eq!(
+            link("https://github.com/cashubtc/cdk/issues/167"),
+            Some(167)
+        );
+        assert_eq!(
+            link("fixes #167"),
+            Some(167),
+            "a bare number is this repo's"
+        );
+        assert_eq!(link("see getfloresta/floresta#167"), None);
+        assert_eq!(
+            link("https://github.com/getfloresta/Floresta/issues/167"),
+            None
+        );
+    }
+
+    /// Two clones can both have a `fix-tests`, and dragging one to Passed is not about
+    /// the other.
+    #[test]
+    fn a_branch_is_keyed_by_its_repo_too() {
+        let repos = repos();
+        branch(&repos, "fix-tests", &["a"], MINE, Some("fix the tests"));
+        let clones = std::slice::from_ref(&repos.clone);
+        let keys = |repo| {
+            let items = assemble(repo, vec![], &[], &[], clones, UPSTREAM).unwrap();
+            items.into_iter().map(|u| u.key).collect::<Vec<_>>()
+        };
+        assert!(keys(FLORESTA).contains(&CardKey::branch("floresta/fix-tests")));
+        assert!(keys(CDK).contains(&CardKey::branch("cdk/fix-tests")));
     }
 
     #[test]

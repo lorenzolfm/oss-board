@@ -1,11 +1,12 @@
-//! Floresta triage: what is waiting on you, and one short DM a morning about what is
-//! new in it.
+//! Triage of the repos you work in: what is waiting on you, and one short DM a morning
+//! about what is new in it.
 //!
 //! Order of operations matters:
 //!   1. Read the board FIRST -- mutes, tombstones and claims are user state and must
 //!      be honoured before anything is decided.
-//!   2. Gather deterministically: one snapshot of the repo, then obligations,
-//!      unshipped work and opportunities as pure functions of it. A source that fails
+//!   2. Gather deterministically: one snapshot per repo, then obligations, unshipped
+//!      work and opportunities as pure functions of it, repo by repo, because issue
+//!      numbers repeat between them. Only keys cross from here on. A source that fails
 //!      leaves what it fed as it was, and the run says so.
 //!   3. Ask the model for gists and an opportunity ranking. Either can fail; the
 //!      board and the DM are still written, from computed reasons and ranking order,
@@ -47,6 +48,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use board::{AgentLane, Board, Card, CardKey, Changes, Claim, ClaimLane, GitHubItem};
 use brief::{BriefKind, Target};
+use config::Project;
 use footprint::Footprint;
 use model::Ranked;
 use obligations::{Obligation, Reason, ReasonKind, Seen, Viewer};
@@ -242,7 +244,7 @@ fn promote_unshipped<'a>(
 
 /// Say whether the push past your ACK was a rebase or new code. Computed, not
 /// guessed: the PR's diff at the ACKed commit against its diff now.
-fn enrich_stale_acks(obs: &mut [Obligation<'_>], me: &Viewer) {
+fn enrich_stale_acks(obs: &mut [Obligation<'_>], project: &Project, me: &Viewer) {
     for ob in obs {
         let item = ob.item;
         let Some(pr) = item.pr() else { continue };
@@ -252,7 +254,7 @@ fn enrich_stale_acks(obs: &mut [Obligation<'_>], me: &Viewer) {
         let Some((acked, _)) = obligations::latest_ack(item, pr, me) else {
             continue;
         };
-        let Some(diff) = snapshot::ack_interdiff(config::REPO, &acked, &pr.head) else {
+        let Some(diff) = snapshot::ack_interdiff(project, &acked, &pr.head) else {
             continue;
         };
         let suffix = if diff.is_rebase_only() {
@@ -286,22 +288,25 @@ struct Briefings {
 /// you deleted, and it is left that way.
 fn write_briefings(
     claimed: &[Claim],
-    snap: &Snapshot,
+    snaps: &[(&Project, Snapshot)],
     me: &str,
     vault_dir: &Path,
     limit: usize,
     today: &str,
 ) -> Briefings {
-    let items: HashMap<&CardKey, &Item> = snap.items.iter().map(|item| (&item.key, item)).collect();
+    let items: HashMap<&CardKey, (&Project, &Item)> = snaps
+        .iter()
+        .flat_map(|(project, snap)| snap.items.iter().map(|item| (&item.key, (*project, item))))
+        .collect();
     let mut out = Briefings::default();
     for claim in claimed {
-        let Some(item) = items.get(&claim.key).copied() else {
+        let Some((project, item)) = items.get(&claim.key).copied() else {
             continue; // closed, or not upstream
         };
         if claim.lane == ClaimLane::Done || (item.pr().is_some() && item.author == me) {
             continue; // finished, or you wrote it
         }
-        let path = brief::note_path(vault_dir, config::REPO, item.number);
+        let path = brief::note_path(vault_dir, project.repo, item.number);
         let link = brief::wikilink(&path);
         if claim.line.contains(&link) {
             continue;
@@ -320,7 +325,7 @@ fn write_briefings(
         };
         log(&format!("briefing {} ({})...", claim.key, kind.as_str()));
         let target = Target {
-            repo: config::REPO,
+            repo: project.repo,
             number: item.number,
             url: &item.url,
             kind,
@@ -337,6 +342,169 @@ fn write_briefings(
         }
     }
     out
+}
+
+/// What a run has lost so far: the sources it could not read, and the kinds of reason it
+/// therefore cannot say anything about. Not per repo: a kind unread in one holds that
+/// kind's cards in both, which only keeps a card one run longer than it had to.
+#[derive(Default)]
+struct Lost {
+    degraded: BTreeSet<Degraded>,
+    unread_kinds: Vec<ReasonKind>,
+}
+
+/// The user's state, which every repo is read against.
+struct Scan<'a> {
+    me: &'a Viewer,
+    now: DateTime<Utc>,
+    claimed: &'a [Claim],
+    tombstones: &'a HashSet<CardKey>,
+}
+
+/// What one repo adds to the run.
+struct Gathered<'s> {
+    obs: Vec<Obligation<'s>>,
+    /// `None`: its source failed.
+    shelf: Option<Vec<Unshipped>>,
+    promoted: usize,
+    opps: Vec<Opportunity<'s>>,
+    footprint: Footprint,
+}
+
+/// Everything that reads one repo. Numbers mean something only in here.
+///
+/// Apart from the snapshot, no source here may cost the board. A failed one leaves its
+/// lane as it was: stale cards are recoverable, deleted ones are not.
+fn gather<'s>(
+    project: &Project,
+    snap: &'s Snapshot,
+    scan: &Scan<'_>,
+    lost: &mut Lost,
+) -> Gathered<'s> {
+    let Scan {
+        me,
+        now,
+        claimed,
+        tombstones,
+    } = *scan;
+    let repo = project.repo;
+    let login = me.login.as_str();
+    let my_prs: Vec<u64> = snap
+        .prs()
+        .filter(|(item, _)| item.author == login)
+        .map(|(item, _)| item.number)
+        .collect();
+    let merge = snapshot::merge_state(repo, &my_prs);
+    if !merge.unread.is_empty() {
+        log(&format!(
+            "  {repo}: merge state unread for {:?}",
+            merge.unread
+        ));
+        lost.degraded.insert(Degraded::Merge);
+        lost.unread_kinds
+            .extend([ReasonKind::Conflict, ReasonKind::CiFailed]);
+    }
+    let computing = merge.computing();
+    if !computing.is_empty() {
+        log(&format!(
+            "  {repo}: GitHub is still computing conflicts for {computing:?}"
+        ));
+        lost.degraded.insert(Degraded::MergeComputing);
+        lost.unread_kinds.push(ReasonKind::Conflict);
+    }
+    let mut obs = obligations::collect(snap, me, now, &merge.states);
+    enrich_stale_acks(&mut obs, project, me);
+
+    let open_issues: Vec<&Item> = snap.issues().map(|(item, _)| item).collect();
+    let unshipped_result = snapshot::mine(repo, login)
+        .map_err(anyhow::Error::from)
+        .and_then(|mine| unshipped::run(project, &open_issues, &mine, login));
+    let read_unshipped = match unshipped_result {
+        Ok(items) => Some(items),
+        Err(err) => {
+            log(&format!("  {repo}: unshipped failed ({err:#})"));
+            lost.degraded.insert(Degraded::Unshipped);
+            lost.unread_kinds.push(ReasonKind::Unshipped);
+            None
+        }
+    };
+    let items = read_unshipped.as_deref().unwrap_or_default();
+    let promoted = promote_unshipped(&mut obs, items, snap, me);
+    // Work you have already done for an issue that is waiting on you is worth saying
+    // on that card, even when it isn't yours enough to promote.
+    for u in items.iter().filter(|u| !promoted.contains(&u.key)) {
+        let Some(number) = u.issue.as_ref().map(|issue| issue.number) else {
+            continue;
+        };
+        for ob in obs.iter_mut().filter(|ob| ob.item.number == number) {
+            let what = unshipped_name(u, "`");
+            ob.notes.push(format!("⚡ your {what} may fix this"));
+        }
+    }
+
+    let upstream_ref = project.upstream_ref();
+    let branch_refs: Vec<String> = items
+        .iter()
+        .filter(|u| matches!(u.origin, Origin::Branch))
+        .map(|u| format!("{upstream_ref}..{}", u.branch))
+        .collect();
+    let clones = project.clones();
+    // Ranking context, never a filter, so it is not worth the board either.
+    let footprint_result = unshipped::my_emails(&clones)
+        .and_then(|emails| footprint::compute(&emails, &clones, &upstream_ref, &branch_refs));
+    let footprint = footprint_result.unwrap_or_else(|err| {
+        log(&format!("  {repo}: footprint unread ({err:#})"));
+        lost.degraded.insert(Degraded::Footprint);
+        Footprint::default()
+    });
+
+    let is_claimed = |key: &CardKey| claimed.iter().any(|claim| claim.key == *key);
+    let shelf = read_unshipped.map(|items| {
+        let keep = |u: &Unshipped| {
+            !promoted.contains(&u.key) && !tombstones.contains(&u.key) && !is_claimed(&u.key)
+        };
+        items.into_iter().filter(|u| keep(u)).collect()
+    });
+
+    let mut column = HashSet::new();
+    if let Some(cfg) = &project.column {
+        match project::needs_review(repo, cfg) {
+            Ok(numbers) => column = numbers,
+            Err(err) => {
+                log(&format!("  {repo}: project board unreadable ({err})"));
+                lost.degraded.insert(Degraded::Project);
+            }
+        }
+    }
+    let skip: HashSet<CardKey> = obs
+        .iter()
+        .map(|ob| ob.item.key.clone())
+        .chain(claimed.iter().map(|claim| claim.key.clone()))
+        .collect();
+    let mut opps = opportunities::collect(snap, me, now, &skip, tombstones, &footprint, &column);
+    let pr_numbers: Vec<u64> = opps
+        .iter()
+        .filter(|o| o.item.pr().is_some())
+        .map(|o| o.item.number)
+        .collect();
+    let opp_merge = snapshot::merge_state(repo, &pr_numbers);
+    if !opp_merge.unread.is_empty() {
+        log(&format!(
+            "  {repo}: merge state unread for {:?}",
+            opp_merge.unread
+        ));
+        lost.degraded.insert(Degraded::OpportunityMerge);
+    }
+    for o in &mut opps {
+        o.merge = opp_merge.states.get(&o.item.number).copied();
+    }
+    Gathered {
+        obs,
+        shelf,
+        promoted: promoted.len(),
+        opps,
+        footprint,
+    }
 }
 
 #[derive(Serialize)]
@@ -367,9 +535,6 @@ fn run(args: &Refresh) -> Result<()> {
     let now = Utc::now();
     let local = now.with_timezone(&Local).fixed_offset();
     let vault_dir = args.board.parent().unwrap_or(Path::new(".")).to_owned();
-    let mut degraded: BTreeSet<Degraded> = BTreeSet::new();
-    // The kinds of reason this run cannot say anything about.
-    let mut unread_kinds: Vec<ReasonKind> = Vec::new();
 
     // 1. user state first
     let board = Board::open(&args.board)?;
@@ -384,75 +549,62 @@ fn run(args: &Refresh) -> Result<()> {
         claimed.len()
     ));
 
-    // 2. gather. The snapshot is the one source that may fail the run: without it
-    //    every lane would be computed from nothing, so the board is left exactly as
-    //    it was and the heartbeat goes down.
+    // 2. gather. A snapshot is the one source that may fail the run: without it every
+    //    lane would be computed from nothing, so the board is left exactly as it was and
+    //    the heartbeat goes down. One repo's failure holds up the other's refresh, which
+    //    costs an hour; GitHub being down is nearly always both anyway.
     let login = gh::viewer_login()?;
     let me = Viewer::new(&login);
-    log(&format!("snapshot of {} as {login}...", config::REPO));
-    let snap = snapshot::fetch(config::REPO)?;
-    log(&format!(
-        "  {} open PRs, {} open issues",
-        snap.prs().count(),
-        snap.issues().count()
-    ));
-    let my_prs: Vec<u64> = snap
-        .prs()
-        .filter(|(item, _)| item.author == login)
-        .map(|(item, _)| item.number)
-        .collect();
-    let merge = snapshot::merge_state(config::REPO, &my_prs);
-    if !merge.unread.is_empty() {
-        log(&format!("  merge state unread for {:?}", merge.unread));
-        degraded.insert(Degraded::Merge);
-        unread_kinds.extend([ReasonKind::Conflict, ReasonKind::CiFailed]);
-    }
-    let computing = merge.computing();
-    if !computing.is_empty() {
-        log(&format!(
-            "  GitHub is still computing conflicts for {computing:?}"
-        ));
-        degraded.insert(Degraded::MergeComputing);
-        unread_kinds.push(ReasonKind::Conflict);
-    }
-    let mut obs = obligations::collect(&snap, &me, now, &merge.states);
-    enrich_stale_acks(&mut obs, &me);
-
-    // Neither of these may cost the board. A failed source leaves its lane as it
-    // was: stale cards are recoverable, deleted ones are not.
-    let open_issues: Vec<&Item> = snap.issues().map(|(item, _)| item).collect();
-    let unshipped_result = snapshot::mine(config::REPO, &login)
-        .map_err(anyhow::Error::from)
-        .and_then(|mine| unshipped::run(&open_issues, &mine, &login));
-    let read_unshipped = match unshipped_result {
-        Ok(items) => Some(items),
-        Err(err) => {
-            log(&format!("  unshipped failed ({err:#})"));
-            degraded.insert(Degraded::Unshipped);
-            unread_kinds.push(ReasonKind::Unshipped);
-            None
-        }
-    };
-    let items = read_unshipped.as_deref().unwrap_or_default();
-    let promoted = promote_unshipped(&mut obs, items, &snap, &me);
-    // Work you have already done for an issue that is waiting on you is worth saying
-    // on that card, even when it isn't yours enough to promote.
-    for u in items.iter().filter(|u| !promoted.contains(&u.key)) {
-        let Some(number) = u.issue.as_ref().map(|issue| issue.number) else {
-            continue;
-        };
-        for ob in obs.iter_mut().filter(|ob| ob.item.number == number) {
-            let what = unshipped_name(u, "`");
-            ob.notes.push(format!("⚡ your {what} may fix this"));
-        }
-    }
-    let is_claimed = |key: &CardKey| claimed.iter().any(|claim| claim.key == *key);
-    let shelf: Vec<&Unshipped> = items
+    let snaps = config::PROJECTS
         .iter()
-        .filter(|u| {
-            !promoted.contains(&u.key) && !tombstones.contains(&u.key) && !is_claimed(&u.key)
+        .map(|project| {
+            log(&format!("snapshot of {} as {login}...", project.repo));
+            let snap = snapshot::fetch(project.repo)?;
+            log(&format!(
+                "  {} open PRs, {} open issues",
+                snap.prs().count(),
+                snap.issues().count()
+            ));
+            Ok((project, snap))
         })
+        .collect::<Result<Vec<_>>>()?;
+    let scan = Scan {
+        me: &me,
+        now,
+        claimed: &claimed,
+        tombstones: &tombstones,
+    };
+    let mut lost = Lost::default();
+    let gathered: Vec<Gathered<'_>> = snaps
+        .iter()
+        .map(|(project, snap)| gather(project, snap, &scan, &mut lost))
         .collect();
+    let Lost {
+        mut degraded,
+        unread_kinds,
+    } = lost;
+
+    // Nothing below reads a bare number: from here on only keys tell two repos' #7 apart.
+    let mut obs: Vec<Obligation<'_>> = Vec::new();
+    let mut opps: Vec<Opportunity<'_>> = Vec::new();
+    let mut shelf: Option<Vec<Unshipped>> = Some(Vec::new());
+    let mut footprints = Vec::new();
+    let mut n_promoted = 0;
+    for repo in gathered {
+        obs.extend(repo.obs);
+        opps.extend(repo.opps);
+        footprints.push(repo.footprint);
+        n_promoted += repo.promoted;
+        // One repo's source failing leaves the whole lane as it was: the lane is rewritten
+        // wholesale, so what that repo had on it would go with a partial answer.
+        shelf = shelf.zip(repo.shelf).map(|(mut all, more)| {
+            all.extend(more);
+            all
+        });
+    }
+    obs.sort_by_key(Obligation::sort_key);
+    let fp = Footprint::merged(footprints);
+    opportunities::fallback_rank(&mut opps, &fp);
 
     let visible: Vec<Obligation<'_>> = obs
         .iter()
@@ -460,63 +612,16 @@ fn run(args: &Refresh) -> Result<()> {
         .cloned()
         .collect();
     let n_muted = obs.len() - visible.len();
-    let promoted_note = if promoted.is_empty() {
+    let n_unshipped = shelf.as_ref().map_or(0, Vec::len);
+    let promoted_note = if n_promoted == 0 {
         String::new()
     } else {
-        format!(" · {} promoted", promoted.len())
+        format!(" · {n_promoted} promoted")
     };
     log(&format!(
-        "  {} obligations ({n_muted} muted) · {} unshipped{promoted_note}",
+        "  {} obligations ({n_muted} muted) · {n_unshipped} unshipped{promoted_note}",
         visible.len(),
-        shelf.len()
     ));
-
-    let branch_refs: Vec<String> = items
-        .iter()
-        .filter(|u| matches!(u.origin, Origin::Branch))
-        .map(|u| format!("{}..{}", config::UPSTREAM_REF, u.branch))
-        .collect();
-    let clones = config::clones();
-    // Ranking context, never a filter, so it is not worth the board either.
-    let footprint_result = unshipped::my_emails(&clones)
-        .and_then(|emails| footprint::compute(&emails, &clones, &branch_refs));
-    let fp = footprint_result.unwrap_or_else(|err| {
-        log(&format!("  footprint unread ({err:#})"));
-        degraded.insert(Degraded::Footprint);
-        Footprint::default()
-    });
-
-    let mut column = HashSet::new();
-    if config::PROJECT.enabled {
-        match project::needs_review(config::REPO, &config::PROJECT) {
-            Ok(numbers) => column = numbers,
-            Err(err) => {
-                log(&format!("  project board unreadable ({err})"));
-                degraded.insert(Degraded::Project);
-            }
-        }
-    }
-    let skip: HashSet<CardKey> = obs
-        .iter()
-        .map(|ob| ob.item.key.clone())
-        .chain(claimed.iter().map(|claim| claim.key.clone()))
-        .collect();
-    let mut opps: Vec<Opportunity<'_>> =
-        opportunities::collect(&snap, &me, now, &skip, &tombstones, &fp, &column);
-    let pr_numbers: Vec<u64> = opps
-        .iter()
-        .filter(|o| o.item.pr().is_some())
-        .map(|o| o.item.number)
-        .collect();
-    let opp_merge = snapshot::merge_state(config::REPO, &pr_numbers);
-    if !opp_merge.unread.is_empty() {
-        log(&format!("  merge state unread for {:?}", opp_merge.unread));
-        degraded.insert(Degraded::OpportunityMerge);
-    }
-    for o in &mut opps {
-        o.merge = opp_merge.states.get(&o.item.number).copied();
-    }
-    opportunities::fallback_rank(&mut opps, &fp);
     log(&format!("  {} opportunity candidates", opps.len()));
 
     // 3. model. Gists are decoration; the ranking falls back to fallback_rank.
@@ -579,10 +684,10 @@ fn run(args: &Refresh) -> Result<()> {
             .map(|(opp, verdict)| render::opp_card(opp, verdict.and_then(|v| v.why.as_deref())))
             .collect(),
     ));
-    if read_unshipped.is_some() {
+    if let Some(shelf) = &shelf {
         changes.lanes.push((
             AgentLane::Unshipped,
-            shelf.iter().map(|u| render::unshipped_card(u)).collect(),
+            shelf.iter().map(render::unshipped_card).collect(),
         ));
     } else {
         log("  Unshipped left untouched: its source failed");
@@ -617,8 +722,8 @@ fn run(args: &Refresh) -> Result<()> {
         changes.notes.push((claim.key.clone(), notes.join(" · ")));
         // Done is finished with, so what happens upstream of it is no alarm. The card says it.
         let urgent = held.filter(|s| s.urgent && claim.lane.is_active());
-        if let (Some(held), Some(item)) = (urgent, claim.key.github()) {
-            let said = format!("#{} — {}", item.number(), held.notes.join(" · "));
+        if let Some(held) = urgent {
+            let said = format!("{} — {}", claim.key.short(), held.notes.join(" · "));
             claim_alerts.insert(claim.key.clone(), said);
         }
     }
@@ -636,7 +741,7 @@ fn run(args: &Refresh) -> Result<()> {
     if !args.no_briefings && !args.dry_run {
         let done = write_briefings(
             &claimed,
-            &snap,
+            &snaps,
             &login,
             &vault_dir,
             args.max_briefings,
@@ -710,7 +815,7 @@ fn run(args: &Refresh) -> Result<()> {
             muted: n_muted,
             opportunities: n_picks,
             candidates: opps.len(),
-            unshipped: shelf.len(),
+            unshipped: n_unshipped,
             judged,
             gists: n_gists,
         },

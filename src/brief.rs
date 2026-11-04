@@ -148,11 +148,14 @@ pub fn write_briefing(vault_dir: &Path, target: &Target<'_>) -> Result<PathBuf, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config;
 
     #[test]
     fn a_note_is_named_after_the_repo_and_number_and_links_back() {
-        let path = note_path(Path::new("/vault"), config::REPO, 1298);
+        let repo = Repo {
+            owner: "getfloresta",
+            name: "Floresta",
+        };
+        let path = note_path(Path::new("/vault"), repo, 1298);
         assert_eq!(path, Path::new("/vault/Floresta-1298.md"));
         assert_eq!(wikilink(&path), "[[Floresta-1298]]");
     }

@@ -1,8 +1,8 @@
-//! Which parts of Floresta are yours, computed rather than declared.
+//! Which parts of each project are yours, computed rather than declared.
 //!
-//! There is no CODEOWNERS. Instead: every file your commits touched, on upstream
-//! master and on your unshipped branches, rolled up to its crate. The judge gets
-//! this as context for ranking; nothing is ever excluded on it.
+//! There is no CODEOWNERS to use. Instead: every file your commits touched, on the
+//! upstream branch and on your unshipped branches, rolled up to its crate. The judge
+//! gets this as context for ranking; nothing is ever excluded on it.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::config;
 use crate::proc;
 
 const GIT_LOG_TIMEOUT: Duration = Duration::from_secs(60);
@@ -34,6 +33,18 @@ impl Footprint {
     pub fn areas(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(|(name, _)| name.as_str())
     }
+
+    /// Several repos' footprints as one. Crates are named after their project, so what
+    /// adds up is the likes of `docs` and `(root)`, which only rank anything by a little.
+    pub fn merged(all: impl IntoIterator<Item = Self>) -> Self {
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        for (name, count) in all.into_iter().flat_map(|fp| fp.0) {
+            *counts.entry(name).or_insert(0) += count;
+        }
+        let mut ranked: Vec<(String, u64)> = counts.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Self(ranked)
+    }
 }
 
 fn area(path: &str) -> String {
@@ -48,16 +59,17 @@ fn area(path: &str) -> String {
     }
 }
 
-/// `extra` adds refs to upstream master, e.g. your unshipped branches. A history
+/// `extra` adds refs to the upstream branch, e.g. your unshipped branches. A history
 /// that cannot be read is an error, so the run can say the judge ranked without it.
 pub fn compute(
     emails: &BTreeSet<String>,
     clones: &[PathBuf],
+    upstream_ref: &str,
     extra: &[String],
 ) -> Result<Footprint> {
     let mut counts: HashMap<String, u64> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
-    let refs: Vec<&str> = std::iter::once(config::UPSTREAM_REF)
+    let refs: Vec<&str> = std::iter::once(upstream_ref)
         .chain(extra.iter().map(String::as_str))
         .collect();
     for clone in clones {
@@ -131,6 +143,24 @@ mod tests {
         ] {
             assert_eq!(area(path), want, "{path}");
         }
+    }
+
+    #[test]
+    fn repos_merge_into_one_list_most_touched_first() {
+        let floresta = Footprint(vec![
+            ("crates/floresta-wire".to_owned(), 40),
+            ("docs".to_owned(), 2),
+        ]);
+        let cdk = Footprint(vec![
+            ("crates/cdk-common".to_owned(), 7),
+            ("docs".to_owned(), 1),
+        ]);
+        let merged = Footprint::merged([floresta, cdk]);
+        assert_eq!(
+            merged.areas().collect::<Vec<_>>(),
+            ["crates/floresta-wire", "crates/cdk-common", "docs"]
+        );
+        assert_eq!(merged.get("docs"), 3);
     }
 
     #[test]

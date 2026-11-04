@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::board::CardKey;
-use crate::config::Repo;
+use crate::config::{Project, Repo};
 use crate::gh::{self, Conn, GhError, Login, Page};
 use crate::timestamp::Timestamp;
 
@@ -312,7 +312,7 @@ pub struct MergeRead {
 
 impl MergeRead {
     /// PRs GitHub has not finished testing for conflicts. It answers `UNKNOWN` while it
-    /// recomputes, as it does after master moves, so these say nothing about a conflict
+    /// recomputes, as it does after the base moves, so these say nothing about a conflict
     /// either way. Their CI was read.
     pub fn computing(&self) -> Vec<u64> {
         let mut numbers: Vec<u64> = self
@@ -333,7 +333,7 @@ pub struct UpstreamPr {
     pub commits: HashSet<String>,
 }
 
-/// What changed between the commit you ACKed and the head, wherever in master
+/// What changed between the commit you ACKed and the head, wherever in the base
 /// each sits.
 #[derive(Clone, Debug)]
 pub struct Interdiff {
@@ -874,10 +874,11 @@ struct DiffFile {
 
 /// `file -> patch without hunk headers` for the PR as it stood at `sha`. Three-dot
 /// compare diffs from the merge base, which is the PR's own diff at that commit no
-/// matter how far master has moved since.
-fn pr_diff(repo: Repo, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
+/// matter how far the base has moved since.
+fn pr_diff(project: &Project, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
+    let Project { repo, base, .. } = project;
     let raw = gh::rest(
-        &format!("repos/{repo}/compare/master...{sha}"),
+        &format!("repos/{repo}/compare/{base}...{sha}"),
         false,
         Some(r#"[.files[] | {filename, patch: (.patch // "")}]"#),
     )?;
@@ -899,9 +900,9 @@ fn pr_diff(repo: Repo, sha: &str) -> Result<BTreeMap<String, String>, GhError> {
 
 /// `None` if either side cannot be compared (an ACKed commit GitHub has since
 /// dropped).
-pub fn ack_interdiff(repo: Repo, acked: &str, head: &str) -> Option<Interdiff> {
-    let before = pr_diff(repo, acked).ok()?;
-    let after = pr_diff(repo, head).ok()?;
+pub fn ack_interdiff(project: &Project, acked: &str, head: &str) -> Option<Interdiff> {
+    let before = pr_diff(project, acked).ok()?;
+    let after = pr_diff(project, head).ok()?;
     let files: BTreeSet<&String> = before.keys().chain(after.keys()).collect();
     let changed: Vec<String> = files
         .into_iter()
