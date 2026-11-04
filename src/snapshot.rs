@@ -26,7 +26,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::board::{CardKey, GitHubItem};
-use crate::config::{Project, Repo};
+use crate::config::{self, Project, Repo};
 use crate::gh::{self, Conn, GhError, Login, Page};
 use crate::timestamp::Timestamp;
 
@@ -105,6 +105,8 @@ pub enum CommentKind {
 #[derive(Clone, Debug)]
 pub struct Comment {
     pub author: String,
+    /// Machine traffic: a machine said it, or it only tells one what to do. Either way nobody
+    /// is talking to you.
     pub bot: bool,
     pub at: Timestamp,
     pub body: String,
@@ -439,7 +441,9 @@ fn actor(author: Option<Actor>) -> (String, bool) {
     match author {
         None => ("ghost".to_owned(), false),
         Some(author) => {
-            let bot = author.typename == "Bot" || author.login.ends_with("[bot]");
+            let bot = author.typename == "Bot"
+                || author.login.ends_with("[bot]")
+                || config::MACHINE_ACCOUNTS.contains(&author.login.as_str());
             (author.login, bot)
         }
     }
@@ -469,9 +473,10 @@ struct CommentNode {
 impl CommentNode {
     fn into_comment(self, kind: CommentKind) -> Comment {
         let (author, bot) = actor(self.author);
+        let words = self.body.split_whitespace().collect::<Vec<_>>().join(" ");
         Comment {
             author,
-            bot,
+            bot: bot || config::MACHINE_COMMANDS.contains(&words.as_str()),
             at: self.created_at,
             body: self.body,
             kind,

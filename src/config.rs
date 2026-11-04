@@ -113,6 +113,14 @@ pub static PROJECTS: [Project; 2] = [
 /// Branches that are never work in their own right.
 pub const BRANCH_IGNORE: [&str; 2] = ["backup/", "worktree-agent-"];
 
+/// Machines that post as a `User`, so GitHub's type cannot tell. Checked 2026-11-04: of 412
+/// comments and review bodies on cdk's open PRs, 89 were this account's and 150 told it what to
+/// do.
+pub const MACHINE_ACCOUNTS: [&str; 1] = ["cdk-bot"];
+/// A whole comment that only tells one of them what to do. Anything longer may be talking to a
+/// person too, so it stays a comment.
+pub const MACHINE_COMMANDS: [&str; 2] = ["@cdk-bot", "@cdk-bot review"];
+
 /// Board lane, across every project.
 pub const OPPORTUNITY_CAP: usize = 8;
 /// New asks in one DM, across every project. Any beyond this wait for the next one.
