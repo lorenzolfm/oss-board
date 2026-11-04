@@ -21,7 +21,7 @@ use crate::board::CardKey;
 use crate::config;
 use crate::snapshot::{
     Comment, CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review,
-    ReviewState, Snapshot,
+    ReviewState, Snapshot, Thread,
 };
 use crate::text::{basename, plural, prefix};
 use crate::timestamp::Timestamp;
@@ -195,6 +195,8 @@ pub struct Obligation<'a> {
     /// Context that informs, but is not part of what a mute remembers.
     pub notes: Vec<String>,
     pub interdiff: Option<Interdiff>,
+    /// The review threads the rules still count, which is what the model may read of them.
+    pub threads: Vec<&'a Thread>,
 }
 
 impl<'a> Obligation<'a> {
@@ -204,6 +206,7 @@ impl<'a> Obligation<'a> {
             reasons,
             notes: Vec::new(),
             interdiff: None,
+            threads: Vec::new(),
         }
     }
 
@@ -431,6 +434,68 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     out
 }
 
+/// The first word still waiting on you in a thread on someone else's PR, and its newest.
+fn thread_wait<'t>(
+    thread: &'t Thread,
+    engaged: Option<Timestamp>,
+    me: &Viewer,
+    now: DateTime<Utc>,
+) -> Option<(&'t Comment, &'t Comment)> {
+    let comments: Vec<_> = thread.comments.iter().filter(|c| !c.bot).collect();
+    if thread.resolved || !comments.iter().any(|c| me.is(&c.author)) {
+        return None;
+    }
+    let newest = *comments.last().filter(|c| !me.is(&c.author))?;
+    let first = comments
+        .iter()
+        .find(|c| Some(c.at) > engaged && !me.is(&c.author) && is_live(c.at, now))?;
+    Some((*first, newest))
+}
+
+/// What dates an open thread on your own PR, if it still counts. Dated by what someone else
+/// said: your own reply and a bot's are no new trigger.
+fn own_thread_said(
+    thread: &Thread,
+    me: &Viewer,
+    now: DateTime<Utc>,
+    threads_block_merge: bool,
+) -> Option<Timestamp> {
+    if thread.resolved {
+        return None;
+    }
+    let others = thread
+        .comments
+        .iter()
+        .filter(|c| !me.is(&c.author) && !c.bot);
+    let said = others.map(|c| c.at).max();
+    if threads_block_merge {
+        // It has to be resolved all the same, so with nothing else in it, it is dated from
+        // when it opened.
+        said.or_else(|| thread.comments.iter().map(|c| c.at).min())
+    } else {
+        said.filter(|at| is_live(*at, now))
+    }
+}
+
+/// The threads the rules still count on this PR.
+fn waiting_threads<'i>(
+    item: &Item,
+    pr: &'i PrDetail,
+    me: &Viewer,
+    now: DateTime<Utc>,
+    threads_block_merge: bool,
+) -> Vec<&'i Thread> {
+    let engaged = engaged_at(item, me);
+    let counts = |thread: &&Thread| {
+        if me.is(&item.author) {
+            own_thread_said(thread, me, now, threads_block_merge).is_some()
+        } else {
+            thread_wait(thread, engaged, me, now).is_some()
+        }
+    };
+    pr.threads.iter().filter(counts).collect()
+}
+
 /// Rule 2, inline half: someone answered in a review thread you're in.
 fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     if me.is(&item.author) {
@@ -441,20 +506,9 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
     let engaged = engaged_at(item, me);
     let mut waiting = Vec::new();
     for thread in &pr.threads {
-        let comments: Vec<_> = thread.comments.iter().filter(|c| !c.bot).collect();
-        if thread.resolved || !comments.iter().any(|c| me.is(&c.author)) {
-            continue;
+        if let Some((first, newest)) = thread_wait(thread, engaged, me, now) {
+            waiting.push((first, newest, thread.path.as_str()));
         }
-        let Some(newest) = comments.last().filter(|c| !me.is(&c.author)) else {
-            continue;
-        };
-        let Some(first) = comments
-            .iter()
-            .find(|c| Some(c.at) > engaged && !me.is(&c.author) && is_live(c.at, now))
-        else {
-            continue;
-        };
-        waiting.push((*first, *newest, thread.path.as_str()));
     }
     waiting.sort_by_key(|(first, _, _)| first.at);
     let Some((first, _, path)) = waiting.first() else {
@@ -513,22 +567,10 @@ fn own_pr(
         return Vec::new();
     }
     let mut out = Vec::new();
-    // Dated by what someone else said. Your own reply and a bot's are no new trigger.
     let lasts: Vec<Timestamp> = pr
         .threads
         .iter()
-        .filter(|t| !t.resolved)
-        .filter_map(|t| {
-            let others = t.comments.iter().filter(|c| !me.is(&c.author) && !c.bot);
-            let said = others.map(|c| c.at).max();
-            if threads_block_merge {
-                // It has to be resolved all the same, so with nothing else in it, it is
-                // dated from when it opened.
-                said.or_else(|| t.comments.iter().map(|c| c.at).min())
-            } else {
-                said.filter(|at| is_live(*at, now))
-            }
-        })
+        .filter_map(|t| own_thread_said(t, me, now, threads_block_merge))
         .collect();
     if let (Some(oldest), Some(newest)) = (lasts.iter().min(), lasts.iter().max()) {
         let n = lasts.len();
@@ -715,7 +757,11 @@ pub fn collect<'a>(
             }
         };
         if !reasons.is_empty() {
-            out.push(Obligation::new(item, reasons));
+            let mut ob = Obligation::new(item, reasons);
+            if let Detail::Pr(pr) = &item.detail {
+                ob.threads = waiting_threads(item, pr, me, now, snap.project.threads_block_merge);
+            }
+            out.push(ob);
         }
     }
     out.sort_by_key(Obligation::sort_key);
@@ -933,7 +979,7 @@ mod tests {
     //! conversation).
 
     use super::*;
-    use crate::snapshot::{Ci, Mergeability, Thread};
+    use crate::snapshot::{Ci, Mergeability};
     use crate::testkit::{
         ME, bot, c, day, floresta, issue, key, me, now, pr, review, snap, thread,
     };

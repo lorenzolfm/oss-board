@@ -200,13 +200,9 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excer
             pr.additions, pr.deletions, pr.changed_files
         ),
         files: &pr.files[..pr.files.len().min(12)],
-        threads: pr
+        threads: ob
             .threads
             .iter()
-            .filter(|t| {
-                !t.resolved
-                    && (item.author == me.login || t.comments.iter().any(|c| c.author == me.login))
-            })
             .take(4)
             .map(|t| ThreadExcerpt {
                 path: &t.path,
@@ -1142,6 +1138,62 @@ mod tests {
             review("carol", 1, ReviewState::Approved, "LGTM"),
         ]);
         assert_eq!(waiting_sent(item), ["rename this", "LGTM"]);
+    }
+
+    /// The newest word of each thread the model would read of this PR.
+    fn threads_sent(project: &'static crate::config::Project, item: Item) -> Vec<String> {
+        let viewer = me();
+        let snapshot = crate::snapshot::Snapshot {
+            project,
+            items: vec![item],
+        };
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert_eq!(obs.len(), 1, "the case needs a reason to be asked about");
+        let payload = payload_sent(&obs, &viewer);
+        let threads = payload[0]["threads"].as_array().unwrap();
+        threads
+            .iter()
+            .map(|t| {
+                t["last"].as_array().unwrap().last().unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_verdict_reads_only_the_threads_the_rules_still_count() {
+        let (floresta, cdk) = (&crate::config::PROJECTS[0], &crate::config::PROJECTS[1]);
+        let waiting = || thread(vec![c(ME, 9, "why?"), c("bob", 2, "waiting")]);
+        // Someone else's PR. Displaced threads stay out of the four sent.
+        let others = pr(1).threads(vec![
+            thread(vec![c("bob", 9, "why?"), c(ME, 8, "you had the last word")]),
+            thread(vec![c(ME, 50, "why?"), c("bob", 40, "past the expiry")]),
+            thread(vec![
+                c(ME, 9, "why?"),
+                c("bob", 8, "answered by your review"),
+            ]),
+            waiting(),
+        ]);
+        let others = others.reviews(vec![review(ME, 7, ReviewState::Commented, "")]);
+        assert_eq!(threads_sent(floresta, others), ["waiting"]);
+        // Your own PR, where only some repos let a thread expire.
+        let own = |repo| {
+            pr(2)
+                .author(ME)
+                .in_repo(repo)
+                .pushed_at(day(60))
+                .threads(vec![
+                    thread(vec![c("bob", 40, "old")]),
+                    thread(vec![c("bob", 2, "new")]),
+                ])
+        };
+        assert_eq!(threads_sent(cdk, own("cashubtc/cdk")), ["new"]);
+        assert_eq!(
+            threads_sent(floresta, own("getfloresta/Floresta")),
+            ["old", "new"]
+        );
     }
 
     /// Asked to judge a "can you rebase?" with no owner on it, the model could not tell
