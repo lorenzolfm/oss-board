@@ -21,6 +21,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -29,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::board::CardKey;
 use crate::footprint::Footprint;
-use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind};
+use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind, waiting_comments};
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
@@ -112,9 +113,15 @@ pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
 
 // ---------------------------------------------------------------- gists
 
-fn gist_fingerprint(ob: &Obligation<'_>) -> String {
+/// What has to move for a verdict to be read again. A comment that pings nobody moves no
+/// reason, so the newest one waiting has to be here too. With nothing waiting the key is what
+/// it was before that, so a cache from then still matches.
+fn gist_fingerprint(ob: &Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> String {
+    let newest_waiting = waiting_comments(ob.item, me, now)
+        .last()
+        .map_or(String::new(), |comment| format!("|{}", comment.at));
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}{newest_waiting}",
         last_per_kind(ob),
         fingerprint(ob).kinds_text(),
         ob.item.head().unwrap_or("")
@@ -163,19 +170,9 @@ struct AckDiff<'a> {
     changed: &'a [String],
 }
 
-fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
+fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excerpt<'a> {
     let item = ob.item;
-    let since = item
-        .comments
-        .iter()
-        .filter(|c| c.author == me.login)
-        .map(|c| c.at)
-        .max();
-    let waiting: Vec<_> = item
-        .comments
-        .iter()
-        .filter(|c| c.author != me.login && !c.bot && Some(c.at) > since)
-        .collect();
+    let waiting = waiting_comments(item, me, now);
     // The comment that started the wait is the one the gist is about; on a busy
     // thread it would fall out of a plain "last three".
     let recent: Vec<_> = if waiting.len() <= 3 {
@@ -267,20 +264,21 @@ struct WireGist {
 pub fn gists(
     obs: &[Obligation<'_>],
     me: &Viewer,
+    now: DateTime<Utc>,
     cache_path: &Path,
     mut ask: impl FnMut(&str) -> Option<Value>,
 ) -> Result<BTreeMap<CardKey, Gist>> {
     let mut cache: BTreeMap<CardKey, CachedGist> = load_cache(cache_path);
     let want: HashMap<&CardKey, String> = obs
         .iter()
-        .map(|ob| (&ob.item.key, gist_fingerprint(ob)))
+        .map(|ob| (&ob.item.key, gist_fingerprint(ob, me, now)))
         .collect();
     let todo: Vec<_> = obs
         .iter()
         .filter(|ob| cache.get(&ob.item.key).map(|cached| &cached.fp) != want.get(&ob.item.key))
         .collect();
     if !todo.is_empty() {
-        let excerpts: Vec<_> = todo.iter().map(|ob| excerpt(ob, me)).collect();
+        let excerpts: Vec<_> = todo.iter().map(|ob| excerpt(ob, me, now)).collect();
         let prompt = prompts::GIST.replace("%s", &dumps(&excerpts)?);
         let answer = ask(&prompt).and_then(|answer| serde_json::from_value(answer).ok());
         let entries = answer.map_or(Vec::new(), |answer: GistAnswer| answer.gists);
@@ -545,8 +543,10 @@ mod tests {
 
     use super::*;
     use crate::obligations::collect;
-    use crate::snapshot::Item;
-    use crate::testkit::{ME, c, day, key, me, now, opportunity, pr, snap};
+    use crate::snapshot::{Comment, Item};
+    use crate::testkit::{
+        ME, bot, c, day, issue, key, me, now, opportunity, pr, review, snap, thread,
+    };
     use serde_json::json;
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
@@ -774,8 +774,8 @@ mod tests {
                 {"key": item_key.to_string(), "gist": "asks for a yes/no", "asks": true}
             ]}))
         };
-        let first = gists(&obs, &viewer, &path, ask).unwrap();
-        let second = gists(&obs, &viewer, &path, ask).unwrap();
+        let first = gists(&obs, &viewer, now(), &path, ask).unwrap();
+        let second = gists(&obs, &viewer, now(), &path, ask).unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(first, second);
         assert_eq!(
@@ -794,12 +794,12 @@ mod tests {
             vec![],
         );
         let newer_obs = collect(&newer, &viewer, now(), &empty);
-        gists(&newer_obs, &viewer, &path, ask).unwrap();
+        gists(&newer_obs, &viewer, now(), &path, ask).unwrap();
         assert_eq!(calls.get(), 2, "a new trigger asks again");
 
         let changed = snap(vec![pr(100).requested(ME, &day(0).to_string())], vec![]);
         let changed_obs = collect(&changed, &viewer, now(), &empty);
-        let after_failure = gists(&changed_obs, &viewer, &path, |_| None).unwrap();
+        let after_failure = gists(&changed_obs, &viewer, now(), &path, |_| None).unwrap();
         assert!(
             after_failure.is_empty(),
             "a failed gist pass leaves no stale gist on a changed item"
@@ -829,19 +829,154 @@ mod tests {
         let answer = |asks: bool| {
             Some(json!({"gists": [{"key": item_key.to_string(), "gist": "g", "asks": asks}]}))
         };
-        gists(&obs, &viewer, &path, |_| answer(false)).unwrap();
+        gists(&obs, &viewer, now(), &path, |_| answer(false)).unwrap();
 
         let next = snap(vec![acked(vec![ack, thanks, question])], vec![]);
         let obs = collect(&next, &viewer, now(), &empty);
-        let got = gists(&obs, &viewer, &path, |_| answer(true)).unwrap();
+        let got = gists(&obs, &viewer, now(), &path, |_| answer(true)).unwrap();
         assert!(got[&item_key].asks, "the cached verdict decided it");
+    }
+
+    /// Whether a verdict cached on a PR is asked for again once `after` replaces `before`.
+    fn is_read_again(before: Vec<Comment>, after: Vec<Comment>) -> bool {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let empty = HashMap::new();
+        let first = snap(vec![pr(1).comments(before)], vec![]);
+        let obs = collect(&first, &viewer, now(), &empty);
+        let item_key = obs[0].item.key.to_string();
+        gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [{"key": item_key, "gist": "g", "asks": true}]}))
+        })
+        .unwrap();
+
+        let next = snap(vec![pr(1).comments(after)], vec![]);
+        let obs = collect(&next, &viewer, now(), &empty);
+        let asked = Cell::new(false);
+        gists(&obs, &viewer, now(), &path, |_| {
+            asked.set(true);
+            None
+        })
+        .unwrap();
+        asked.get()
+    }
+
+    /// A follow-up that pings nobody moves no reason, and it is what the verdict turns on.
+    #[test]
+    fn a_verdict_is_read_again_when_a_comment_arrives_after_it() {
+        let question = c("bob", 3, &format!("@{ME} can you look?"));
+        let followed_up = vec![question.clone(), c("bob", 1, "never mind, sorted it")];
+        assert!(is_read_again(vec![question], followed_up));
+    }
+
+    /// CI comments on every push, and none of it is what a verdict reads.
+    #[test]
+    fn a_bots_comment_costs_no_model_pass() {
+        let question = c("bob", 3, &format!("@{ME} can you look?"));
+        let with_bot = vec![question.clone(), bot("ci[bot]", 1, "coverage report")];
+        assert!(!is_read_again(vec![question], with_bot));
+    }
+
+    /// The items the gist pass would send the model, from an empty cache.
+    fn payload_sent(obs: &[Obligation<'_>], viewer: &Viewer) -> Value {
+        let dir = TempDir::new().unwrap();
+        let prompt = RefCell::new(String::new());
+        gists(obs, viewer, now(), &cache(&dir, "g.json"), |sent| {
+            prompt.replace(sent.to_owned());
+            None
+        })
+        .unwrap();
+        let sent = prompt.into_inner();
+        serde_json::from_str(&sent[sent.find("ITEMS:").unwrap() + 6..]).unwrap()
+    }
+
+    /// What goes under `waiting_comments` for one obligation, the only one on the snapshot.
+    fn waiting_sent(item: Item) -> Vec<String> {
+        let viewer = me();
+        let snapshot = snap(vec![item], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert_eq!(obs.len(), 1, "the case needs a reason to be asked about");
+        let payload = payload_sent(&obs, &viewer);
+        let waiting = payload[0]["waiting_comments"].as_array().unwrap();
+        waiting
+            .iter()
+            .map(|said| said["text"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The prompt says a direct question means `asks: true`, so a question the rules have
+    /// closed would still send the DM.
+    #[test]
+    fn the_verdict_does_not_read_what_the_rules_ruled_out() {
+        let question = |days_ago| c("bob", days_ago, &format!("@{ME} can you look?"));
+        let requested = |n| pr(n).requested(ME, &day(0).to_string());
+        let cases = vec![
+            ("past the expiry", requested(1).comments(vec![question(40)])),
+            (
+                "answered by a review with no body",
+                requested(2)
+                    .comments(vec![question(5)])
+                    .reviews(vec![review(ME, 3, ReviewState::Commented, "")]),
+            ),
+            (
+                "answered by an inline reply",
+                requested(3)
+                    .comments(vec![question(5)])
+                    .threads(vec![thread(vec![c(ME, 3, "a nit")]).resolved()]),
+            ),
+            (
+                "answered by a push on your own PR",
+                pr(4)
+                    .author(ME)
+                    .pushed_at(day(3))
+                    .comments(vec![question(5)])
+                    .threads(vec![thread(vec![c("carol", 1, "a nit")])]),
+            ),
+            (
+                "from before you were handed the issue",
+                issue(5).assigned(ME, day(3)).comments(vec![question(5)]),
+            ),
+        ];
+        for (name, item) in cases {
+            assert_eq!(waiting_sent(item), Vec::<String>::new(), "{name}");
+        }
+    }
+
+    /// `waiting_comments` is everything since your answer, not only what makes a reason: on
+    /// someone else's PR "never mind" pings nobody, and it is what the verdict turns on.
+    #[test]
+    fn the_verdict_reads_everything_said_since_your_answer() {
+        let item = pr(1)
+            .comments(vec![
+                c("bob", 5, &format!("@{ME} can you look?")),
+                c("carol", 4, "never mind, sorted it"),
+            ])
+            .reviews(vec![review(ME, 6, ReviewState::Commented, "")]);
+        assert_eq!(
+            waiting_sent(item),
+            [
+                format!("@{ME} can you look?"),
+                "never mind, sorted it".to_owned()
+            ]
+        );
+    }
+
+    /// The rules drop a review's verdict from the conversation, because it has a rule of its
+    /// own or asks nothing. Its body is still where a reviewer says what they want.
+    #[test]
+    fn the_gist_reads_what_a_reviewer_said_with_their_verdict() {
+        let item = pr(1).author(ME).pushed_at(day(5)).reviews(vec![
+            review("bob", 2, ReviewState::ChangesRequested, "rename this"),
+            review("carol", 1, ReviewState::Approved, "LGTM"),
+        ]);
+        assert_eq!(waiting_sent(item), ["rename this", "LGTM"]);
     }
 
     /// Asked to judge a "can you rebase?" with no owner on it, the model could not tell
     /// who was being asked.
     #[test]
     fn the_verdict_can_see_whose_item_it_is() {
-        let dir = TempDir::new().unwrap();
         let viewer = me();
         let snapshot = snap(
             vec![
@@ -851,15 +986,7 @@ mod tests {
             vec![],
         );
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let prompt = RefCell::new(String::new());
-        gists(&obs, &viewer, &cache(&dir, "g.json"), |sent| {
-            prompt.replace(sent.to_owned());
-            None
-        })
-        .unwrap();
-        let sent = prompt.into_inner();
-        let payload: Value =
-            serde_json::from_str(&sent[sent.find("ITEMS:").unwrap() + 6..]).unwrap();
+        let payload = payload_sent(&obs, &viewer);
         assert_eq!(payload[0]["author"], ME);
         assert_eq!(payload[0]["his"], true);
         assert_eq!(payload[1]["author"], "alice");
@@ -878,7 +1005,7 @@ mod tests {
             json!({"key": key, "gist": "text"}),
             json!({"key": key, "gist": "text", "asks": "false"}),
         ] {
-            let got = gists(&obs, &viewer, &cache(&dir, "g.json"), |_| {
+            let got = gists(&obs, &viewer, now(), &cache(&dir, "g.json"), |_| {
                 Some(json!({"gists": [entry.clone()]}))
             })
             .unwrap();
@@ -909,7 +1036,7 @@ mod tests {
             "f".repeat(40),
         );
         fs::write(&path, cached).unwrap();
-        let got = gists(&obs, &viewer, &path, |_| {
+        let got = gists(&obs, &viewer, now(), &path, |_| {
             panic!("a cached gist must not ask")
         })
         .unwrap();
@@ -945,11 +1072,10 @@ mod tests {
         let snapshot = snap(vec![pr(100).requested(ME, "2026-10-08T17:14:49Z")], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let item_key = obs[0].item.key.clone();
-        let cached =
-            json!({ item_key.to_string(): {"fp": gist_fingerprint(&obs[0]), "gist": "old"} });
+        let cached = json!({ item_key.to_string(): {"fp": gist_fingerprint(&obs[0], &viewer, now()), "gist": "old"} });
         fs::write(&path, cached.to_string()).unwrap();
         let calls = Cell::new(0);
-        let got = gists(&obs, &viewer, &path, |_| {
+        let got = gists(&obs, &viewer, now(), &path, |_| {
             calls.set(calls.get() + 1);
             Some(json!({"gists": [{"key": item_key.to_string(), "gist": "new", "asks": false}]}))
         })

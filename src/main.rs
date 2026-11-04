@@ -630,7 +630,7 @@ fn run(args: &Refresh) -> Result<()> {
             Ranked::mechanical(&opps, config::OPPORTUNITY_CAP),
         )
     } else {
-        let gists = model::gists(&visible, &me, &state_path("gists.json"), model::claude)?;
+        let gists = model::gists(&visible, &me, now, &state_path("gists.json"), model::claude)?;
         let ranked = model::rank(
             &opps,
             &fp,

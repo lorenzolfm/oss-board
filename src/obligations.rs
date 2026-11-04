@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::board::CardKey;
 use crate::config;
 use crate::snapshot::{
-    CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review, ReviewState,
-    Snapshot,
+    Comment, CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review,
+    ReviewState, Snapshot,
 };
 use crate::text::{basename, plural, prefix};
 use crate::timestamp::Timestamp;
@@ -259,6 +259,25 @@ struct Said<'a> {
     kind: Option<CommentKind>,
 }
 
+impl<'a> From<&'a Comment> for Said<'a> {
+    fn from(comment: &'a Comment) -> Self {
+        Self {
+            author: &comment.author,
+            bot: comment.bot,
+            at: comment.at,
+            body: &comment.body,
+            kind: Some(comment.kind),
+        }
+    }
+}
+
+impl Said<'_> {
+    /// Whether this can still be waiting on you, given the newest thing that answered.
+    fn is_waiting(&self, answered: Option<Timestamp>, me: &Viewer, now: DateTime<Utc>) -> bool {
+        !me.is(self.author) && !self.bot && Some(self.at) > answered && is_live(self.at, now)
+    }
+}
+
 /// The main conversation, with the item's own body as its first comment so a
 /// "cc @you" in a PR description counts like any other mention.
 fn stream(item: &Item) -> impl Iterator<Item = Said<'_>> {
@@ -269,13 +288,7 @@ fn stream(item: &Item) -> impl Iterator<Item = Said<'_>> {
         body: &item.body,
         kind: None,
     };
-    std::iter::once(head).chain(item.comments.iter().map(|comment| Said {
-        author: &comment.author,
-        bot: comment.bot,
-        at: comment.at,
-        body: &comment.body,
-        kind: Some(comment.kind),
-    }))
+    std::iter::once(head).chain(item.comments.iter().map(Said::from))
 }
 
 /// Your newest activity of any kind on the item: a comment, a submitted review
@@ -300,6 +313,30 @@ pub fn engaged_at(item: &Item, me: &Viewer) -> Option<Timestamp> {
         reviewed.chain(replied)
     });
     spoke.chain(pr_activity).max()
+}
+
+/// The newest thing that answers what came before it: anything of yours, a push on your
+/// own PR, or being handed an issue you had not spoken on.
+fn answered_up_to(item: &Item, me: &Viewer) -> Option<Timestamp> {
+    let engaged = engaged_at(item, me);
+    match &item.detail {
+        Detail::Pr(pr) if me.is(&item.author) => engaged.max(pr.pushed_at),
+        // Chatter from before you were handed it was never addressed to you. Once you have
+        // spoken, though, an answer to you stays an answer even if the assignment came later.
+        Detail::Issue(issue) if engaged.is_none() && item.assignees.iter().any(|a| me.is(a)) => {
+            issue.assigned_at.get(&me.login).copied()
+        }
+        _ => engaged,
+    }
+}
+
+/// The comments still waiting on you, oldest first: what the conversation rule reads, before
+/// it decides which of them make a reason. So this keeps a "never mind" that pings nobody,
+/// and a review's body, which is where a reviewer says what they want done.
+pub fn waiting_comments<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
+    let answered = answered_up_to(item, me);
+    let waiting = |comment: &&Comment| Said::from(*comment).is_waiting(answered, me, now);
+    item.comments.iter().filter(waiting).collect()
 }
 
 fn norm(text: &str) -> String {
@@ -340,25 +377,9 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     let mut out = Vec::new();
     let said: Vec<Said<'_>> = stream(item).collect();
     let mine: Vec<Said<'_>> = said.iter().copied().filter(|s| me.is(s.author)).collect();
-    let mut mine_at = engaged_at(item, me);
-    if let Detail::Pr(pr) = &item.detail
-        && me.is(&item.author)
-    {
-        mine_at = mine_at.max(pr.pushed_at); // a push answers too
-    }
+    let answered = answered_up_to(item, me);
     let assigned_to_me = item.assignees.iter().any(|login| me.is(login));
-    if mine_at.is_none()
-        && assigned_to_me
-        && let Detail::Issue(issue) = &item.detail
-    {
-        // Chatter from before you were handed it was never addressed to you. Once
-        // you have spoken, though, an answer to you stays an answer even if the
-        // assignment came later.
-        mine_at = issue.assigned_at.get(&me.login).copied();
-    }
-    let after = said
-        .iter()
-        .filter(|s| !me.is(s.author) && !s.bot && Some(s.at) > mine_at && is_live(s.at, now));
+    let after = said.iter().filter(|s| s.is_waiting(answered, me, now));
     let (pinged, others): (Vec<&Said<'_>>, Vec<&Said<'_>>) =
         after.partition(|s| me.is_mentioned_in(s.body) || quotes(s.body, &mine));
 
@@ -912,7 +933,7 @@ mod tests {
     //! conversation).
 
     use super::*;
-    use crate::snapshot::{Ci, Comment, Mergeability, Thread};
+    use crate::snapshot::{Ci, Mergeability, Thread};
     use crate::testkit::{
         ME, bot, c, day, floresta, issue, key, me, now, pr, review, snap, thread,
     };
