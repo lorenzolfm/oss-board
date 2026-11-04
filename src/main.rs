@@ -623,14 +623,15 @@ fn run(args: &Refresh) -> Result<()> {
     ));
     log(&format!("  {} opportunity candidates", opps.len()));
 
-    // 3. model. Gists are decoration; the ranking falls back to fallback_rank.
+    // 3. model. A card with no gist keeps its reasons, a new item with no verdict goes through
+    //    to the DM, and the ranking falls back to fallback_rank.
     let (gists, ranked) = if args.no_model {
         (
             BTreeMap::new(),
             Ranked::mechanical(&opps, config::OPPORTUNITY_CAP),
         )
     } else {
-        let gists = model::gists(&visible, &me, &state_path("gists.json"), model::claude)?;
+        let gists = model::gists(&visible, &me, now, &state_path("gists.json"), model::claude)?;
         let ranked = model::rank(
             &opps,
             &fp,

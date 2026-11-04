@@ -34,8 +34,9 @@ hide, drop or reorder it there. Six rules (`src/obligations.rs`):
    once does *not* count -- that is the notifications inbox this replaces.
    Any activity of yours (a comment, a submitted review, an inline reply)
    answers what came before it, in any thread; on your own PR, so does a push.
-   A comment left unanswered for 14 days stops counting. If it still matters
-   someone will ping again, and that brings the card back.
+   Telling a machine to run (`@cdk-bot review`) answers nothing, here or for a
+   review request. A comment left unanswered for 14 days stops counting. If it
+   still matters someone will ping again, and that brings the card back.
 3. **Your own PRs when there's something for you to do**: an unresolved
    thread, changes requested since your push, a conflict, red CI, or a comment
    since your last push. ACKs and approvals are good news, not requests.
@@ -112,9 +113,11 @@ a mute uses: a newer event, a new kind of reason, or a new head) and only if it 
 **ask**. A review request, changes requested, a conflict, red CI or an assignment is
 an ask by its nature. Anything else needs the model to read someone waiting on you
 specifically. Your own reply, a bot's, and more work on your own unshipped fix aren't
-new triggers. At most 3 per message across both repos, longest-waiting first; any more
-stay new for the next one. A quiet morning is the header line alone, so a missing
-message means something is broken.
+new triggers. A bot is what GitHub types as one or what `config::MACHINE_ACCOUNTS`
+names, and a comment that only tells one what to do counts the same. At most 3 per
+message across both repos, longest-waiting first; any more stay new for the next one.
+A quiet morning is the header line alone, so a missing message means something is
+broken.
 
 Only clearing forgets what you were told. Dragging a card to Passed doesn't, so what
 re-arms the mute is new and what you already knew is not. A source that can't be read

@@ -641,6 +641,76 @@ fn a_push_is_dated_by_its_force_push_or_failing_that_its_commit() {
     }
 }
 
+/// On your own PR any comment from a person makes a reply, so a card here means it counted.
+/// GitHub types this machine as a `User`, so only its name can say what it is.
+#[test]
+fn machine_traffic_on_your_pr_is_nobody_waiting_on_you() {
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let comment = |login: &str, body: &str| {
+        format!(
+            r#""comments":{{"nodes":[{{"author":{{"__typename":"User","login":"{login}"}},
+            "body":"{body}","createdAt":"{now}"}}]}}"#
+        )
+    };
+    let review = |login: &str, body: &str| {
+        format!(
+            r#""reviews":{{"nodes":[{{"author":{{"__typename":"User","login":"{login}"}},
+            "state":"COMMENTED","body":"{body}","submittedAt":"{now}","createdAt":"{now}"}}]}}"#
+        )
+    };
+    let cases = [
+        (
+            "the machine's comment",
+            r#""comments":{"nodes":[]}"#,
+            comment("cdk-bot", "Verified findings"),
+            false,
+        ),
+        (
+            "the machine's review",
+            r#""reviews":{"nodes":[]}"#,
+            review("cdk-bot", "Verified findings"),
+            false,
+        ),
+        (
+            "a bare command",
+            r#""comments":{"nodes":[]}"#,
+            comment("bob", r"\r\n@cdk-bot review\r\n"),
+            false,
+        ),
+        (
+            "a command with more to say",
+            r#""comments":{"nodes":[]}"#,
+            comment("bob", "@cdk-bot review, then can you rebase?"),
+            true,
+        ),
+        (
+            "a bare command as a review's body",
+            r#""reviews":{"nodes":[]}"#,
+            review("bob", r"\r\n@cdk-bot review\r\n"),
+            false,
+        ),
+        (
+            "a review's command with more to say",
+            r#""reviews":{"nodes":[]}"#,
+            review("bob", "@cdk-bot review, then can you rebase?"),
+            true,
+        ),
+    ];
+    for (name, empty, filled, counts) in cases {
+        let node = pr_node(9, "my pr", "", MY_PR_HEAD, "me").replace(empty, &filled);
+        let fixture = Fixture::new();
+        fs::write(fixture.path("prs.json"), prs_page(&[node])).unwrap();
+        run(&mut fixture.command(&["--no-model", "--no-briefings"]));
+        let board = fixture.read_board();
+        let needs_me = lane(&board, "Needs me");
+        assert_eq!(
+            needs_me.iter().any(|card| card.contains("[floresta#9](")),
+            counts,
+            "{name}: {board}"
+        );
+    }
+}
+
 /// A failed read says nothing about the card, so it must not erase what it says.
 #[test]
 fn a_failed_claims_read_keeps_the_warning_on_your_card() {

@@ -21,6 +21,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -29,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::board::CardKey;
 use crate::footprint::Footprint;
-use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind};
+use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind, waiting_comments};
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
@@ -112,13 +113,22 @@ pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
 
 // ---------------------------------------------------------------- gists
 
-fn gist_fingerprint(ob: &Obligation<'_>) -> String {
-    format!(
-        "{}|{}|{}",
+fn short_hash(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    hex[..16].to_owned()
+}
+
+/// What has to move for a verdict to be read again: its reasons, or the words it was read
+/// from. The hash is of what is sent, so nothing the model reads can change without moving it.
+fn gist_fingerprint(ob: &Obligation<'_>, evidence: &Evidence<'_>) -> Result<String> {
+    Ok(format!(
+        "{}|{}|{}|{}",
         last_per_kind(ob),
         fingerprint(ob).kinds_text(),
-        ob.item.head().unwrap_or("")
-    )
+        ob.item.head().unwrap_or(""),
+        short_hash(&serde_json::to_vec(evidence)?)
+    ))
 }
 
 #[derive(Serialize)]
@@ -140,15 +150,24 @@ struct PrExcerpt<'a> {
     threads: Vec<ThreadExcerpt<'a>>,
 }
 
+/// One item as the model reads it.
 #[derive(Serialize)]
 struct Excerpt<'a> {
+    #[serde(flatten)]
+    evidence: Evidence<'a>,
+    /// Outside the hash, because "3d ago" moves every day. The key carries what they mean.
+    reasons: Vec<&'a str>,
+}
+
+/// What a verdict is read from, apart from its reasons.
+#[derive(Serialize)]
+struct Evidence<'a> {
     key: &'a CardKey,
     kind: &'static str,
     title: &'a str,
     author: &'a str,
     /// He opened it or is assigned it, so a request on it is for him.
     his: bool,
-    reasons: Vec<&'a str>,
     description: String,
     waiting_comments: Vec<Said<'a>>,
     #[serde(flatten)]
@@ -163,19 +182,9 @@ struct AckDiff<'a> {
     changed: &'a [String],
 }
 
-fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
+fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excerpt<'a> {
     let item = ob.item;
-    let since = item
-        .comments
-        .iter()
-        .filter(|c| c.author == me.login)
-        .map(|c| c.at)
-        .max();
-    let waiting: Vec<_> = item
-        .comments
-        .iter()
-        .filter(|c| c.author != me.login && !c.bot && Some(c.at) > since)
-        .collect();
+    let waiting = waiting_comments(item, me, now);
     // The comment that started the wait is the one the gist is about; on a busy
     // thread it would fall out of a plain "last three".
     let recent: Vec<_> = if waiting.len() <= 3 {
@@ -191,46 +200,50 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer) -> Excerpt<'a> {
             pr.additions, pr.deletions, pr.changed_files
         ),
         files: &pr.files[..pr.files.len().min(12)],
-        threads: pr
+        // A machine is nobody waiting on you, so it can't push out what a person said, and a
+        // thread with only a machine in it takes none of the four places.
+        threads: ob
             .threads
             .iter()
-            .filter(|t| {
-                !t.resolved
-                    && (item.author == me.login || t.comments.iter().any(|c| c.author == me.login))
+            .map(|t| {
+                let said: Vec<_> = t.comments.iter().filter(|c| !c.bot).collect();
+                ThreadExcerpt {
+                    path: &t.path,
+                    last: said[said.len().saturating_sub(2)..]
+                        .iter()
+                        .map(|c| Said {
+                            by: &c.author,
+                            text: clip(&c.body, 400),
+                        })
+                        .collect(),
+                }
             })
+            .filter(|t| !t.last.is_empty())
             .take(4)
-            .map(|t| ThreadExcerpt {
-                path: &t.path,
-                last: t.comments[t.comments.len().saturating_sub(2)..]
-                    .iter()
-                    .map(|c| Said {
-                        by: &c.author,
-                        text: clip(&c.body, 400),
-                    })
-                    .collect(),
-            })
             .collect(),
     });
     Excerpt {
-        key: &item.key,
-        kind: item.kind(),
-        title: &item.title,
-        author: &item.author,
-        his: item.author == me.login || item.assignees.contains(&me.login),
+        evidence: Evidence {
+            key: &item.key,
+            kind: item.kind(),
+            title: &item.title,
+            author: &item.author,
+            his: item.author == me.login || item.assignees.contains(&me.login),
+            description: clip(&item.body, 500),
+            waiting_comments: recent
+                .iter()
+                .map(|c| Said {
+                    by: &c.author,
+                    text: clip(&c.body, 700),
+                })
+                .collect(),
+            pr,
+            since_your_ack: ob.interdiff.as_ref().map(|diff| AckDiff {
+                rebase_only: diff.is_rebase_only(),
+                changed: &diff.changed,
+            }),
+        },
         reasons: ob.reasons.iter().map(|r| r.text.as_str()).collect(),
-        description: clip(&item.body, 500),
-        waiting_comments: recent
-            .iter()
-            .map(|c| Said {
-                by: &c.author,
-                text: clip(&c.body, 700),
-            })
-            .collect(),
-        pr,
-        since_your_ack: ob.interdiff.as_ref().map(|diff| AckDiff {
-            rebase_only: diff.is_rebase_only(),
-            changed: &diff.changed,
-        }),
     }
 }
 
@@ -263,25 +276,32 @@ struct WireGist {
 }
 
 /// `key -> gist`. Cached per fingerprint; only changed items reach the model. An entry
-/// of another shape costs that one gist.
+/// of another shape costs that one gist, and one for a card it was not sent is dropped: it
+/// can only have come from the text it was sent.
 pub fn gists(
     obs: &[Obligation<'_>],
     me: &Viewer,
+    now: DateTime<Utc>,
     cache_path: &Path,
     mut ask: impl FnMut(&str) -> Option<Value>,
 ) -> Result<BTreeMap<CardKey, Gist>> {
     let mut cache: BTreeMap<CardKey, CachedGist> = load_cache(cache_path);
-    let want: HashMap<&CardKey, String> = obs
+    let excerpts: Vec<Excerpt<'_>> = obs.iter().map(|ob| excerpt(ob, me, now)).collect();
+    let want = obs
         .iter()
-        .map(|ob| (&ob.item.key, gist_fingerprint(ob)))
-        .collect();
-    let todo: Vec<_> = obs
+        .zip(&excerpts)
+        .map(|(ob, read)| Ok((&ob.item.key, gist_fingerprint(ob, &read.evidence)?)))
+        .collect::<Result<HashMap<&CardKey, String>>>()?;
+    let todo: Vec<&Excerpt<'_>> = excerpts
         .iter()
-        .filter(|ob| cache.get(&ob.item.key).map(|cached| &cached.fp) != want.get(&ob.item.key))
+        .filter(|read| {
+            let key = read.evidence.key;
+            cache.get(key).map(|cached| &cached.fp) != want.get(key)
+        })
         .collect();
     if !todo.is_empty() {
-        let excerpts: Vec<_> = todo.iter().map(|ob| excerpt(ob, me)).collect();
-        let prompt = prompts::GIST.replace("%s", &dumps(&excerpts)?);
+        let asked: HashSet<&CardKey> = todo.iter().map(|read| read.evidence.key).collect();
+        let prompt = prompts::GIST.replace("%s", &dumps(&todo)?);
         let answer = ask(&prompt).and_then(|answer| serde_json::from_value(answer).ok());
         let entries = answer.map_or(Vec::new(), |answer: GistAnswer| answer.gists);
         for entry in entries {
@@ -289,7 +309,10 @@ pub fn gists(
                 continue;
             };
             let gist = clip(&gist, 120);
-            if let Some(fp) = want.get(&key).filter(|_| !gist.is_empty()) {
+            if let Some(fp) = want
+                .get(&key)
+                .filter(|_| asked.contains(&key) && !gist.is_empty())
+            {
                 let fp = fp.clone();
                 cache.insert(key, CachedGist { fp, gist, asks });
             }
@@ -383,9 +406,7 @@ fn rank_fingerprint(opps: &[Opportunity<'_>]) -> String {
         .map(|o| format!("{}@{}", o.item.key, o.item.head().unwrap_or("")))
         .collect();
     signature.sort_unstable();
-    let digest = Sha256::digest(signature.join("\n").as_bytes());
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    hex[..16].to_owned()
+    short_hash(signature.join("\n").as_bytes())
 }
 
 /// One that will not read costs a model pass, as `load_cache` says. That covers a cache
@@ -545,8 +566,9 @@ mod tests {
 
     use super::*;
     use crate::obligations::collect;
-    use crate::snapshot::Item;
-    use crate::testkit::{ME, c, day, key, me, now, opportunity, pr, snap};
+    use crate::snapshot::{Interdiff, Item};
+    use crate::testkit::{ME, bot, c, day, issue, me, now, opportunity, pr, review, snap, thread};
+    use chrono::TimeDelta;
     use serde_json::json;
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
@@ -774,8 +796,8 @@ mod tests {
                 {"key": item_key.to_string(), "gist": "asks for a yes/no", "asks": true}
             ]}))
         };
-        let first = gists(&obs, &viewer, &path, ask).unwrap();
-        let second = gists(&obs, &viewer, &path, ask).unwrap();
+        let first = gists(&obs, &viewer, now(), &path, ask).unwrap();
+        let second = gists(&obs, &viewer, now(), &path, ask).unwrap();
         assert_eq!(calls.get(), 1);
         assert_eq!(first, second);
         assert_eq!(
@@ -794,12 +816,12 @@ mod tests {
             vec![],
         );
         let newer_obs = collect(&newer, &viewer, now(), &empty);
-        gists(&newer_obs, &viewer, &path, ask).unwrap();
+        gists(&newer_obs, &viewer, now(), &path, ask).unwrap();
         assert_eq!(calls.get(), 2, "a new trigger asks again");
 
         let changed = snap(vec![pr(100).requested(ME, &day(0).to_string())], vec![]);
         let changed_obs = collect(&changed, &viewer, now(), &empty);
-        let after_failure = gists(&changed_obs, &viewer, &path, |_| None).unwrap();
+        let after_failure = gists(&changed_obs, &viewer, now(), &path, |_| None).unwrap();
         assert!(
             after_failure.is_empty(),
             "a failed gist pass leaves no stale gist on a changed item"
@@ -829,19 +851,399 @@ mod tests {
         let answer = |asks: bool| {
             Some(json!({"gists": [{"key": item_key.to_string(), "gist": "g", "asks": asks}]}))
         };
-        gists(&obs, &viewer, &path, |_| answer(false)).unwrap();
+        gists(&obs, &viewer, now(), &path, |_| answer(false)).unwrap();
 
         let next = snap(vec![acked(vec![ack, thanks, question])], vec![]);
         let obs = collect(&next, &viewer, now(), &empty);
-        let got = gists(&obs, &viewer, &path, |_| answer(true)).unwrap();
+        let got = gists(&obs, &viewer, now(), &path, |_| answer(true)).unwrap();
         assert!(got[&item_key].asks, "the cached verdict decided it");
+    }
+
+    /// A comment on one card can name another, and that card must keep what was read from it.
+    #[test]
+    fn an_answer_speaks_only_for_the_cards_it_was_sent() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let empty = HashMap::new();
+        let sent = || pr(1).requested(ME, &day(5).to_string());
+        let other = || pr(2).requested(ME, &day(5).to_string());
+        let first = snap(vec![sent(), other()], vec![]);
+        let obs = collect(&first, &viewer, now(), &empty);
+        let (sent_key, other_key) = (obs[0].item.key.clone(), obs[1].item.key.clone());
+        gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [
+                {"key": sent_key.to_string(), "gist": "sent", "asks": false},
+                {"key": other_key.to_string(), "gist": "other", "asks": false},
+            ]}))
+        })
+        .unwrap();
+
+        let moved = sent().comments(vec![c("bob", 1, &format!("@{ME} and now?"))]);
+        let next = snap(vec![moved, other()], vec![]);
+        let obs = collect(&next, &viewer, now(), &empty);
+        let got = gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [
+                {"key": sent_key.to_string(), "gist": "sent again", "asks": false},
+                {"key": other_key.to_string(), "gist": "told to say this", "asks": true},
+            ]}))
+        })
+        .unwrap();
+        assert_eq!(got[&sent_key].text, "sent again");
+        assert_eq!(
+            got[&other_key],
+            Gist {
+                text: "other".to_owned(),
+                asks: false
+            }
+        );
+    }
+
+    /// Whether a verdict cached on `before` is asked for again once `after` replaces it, at
+    /// `later`.
+    fn is_read_again_at(before: Item, after: Item, later: DateTime<Utc>) -> bool {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let empty = HashMap::new();
+        let first = snap(vec![before], vec![]);
+        let obs = collect(&first, &viewer, now(), &empty);
+        let item_key = obs[0].item.key.to_string();
+        gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [{"key": item_key, "gist": "g", "asks": true}]}))
+        })
+        .unwrap();
+
+        let next = snap(vec![after], vec![]);
+        let obs = collect(&next, &viewer, later, &empty);
+        assert_eq!(obs.len(), 1, "the case needs a reason to be asked about");
+        let asked = Cell::new(false);
+        gists(&obs, &viewer, later, &path, |_| {
+            asked.set(true);
+            None
+        })
+        .unwrap();
+        asked.get()
+    }
+
+    /// Your own PR, where any comment from a person makes a reply.
+    fn yours() -> Item {
+        pr(1).author(ME).pushed_at(day(60))
+    }
+
+    /// None of these moves a reason, and each changes what the verdict would read.
+    #[test]
+    fn a_verdict_is_read_again_when_what_it_read_changes() {
+        let ask = format!("@{ME} can you look?");
+        let asked = || pr(1).comments(vec![c("bob", 3, &ask)]);
+        let requested = || pr(1).requested(ME, &day(1).to_string());
+        let nit = |days_ago| thread(vec![c("bob", days_ago, "a nit")]);
+        let cases = vec![
+            (
+                "a follow-up that pings nobody",
+                asked(),
+                asked().comments(vec![c("bob", 1, "never mind, sorted it")]),
+            ),
+            (
+                "a comment edited",
+                asked(),
+                pr(1).comments(vec![c("bob", 3, &format!("@{ME} never mind"))]),
+            ),
+            (
+                "an older comment deleted",
+                yours().comments(vec![c("bob", 3, "can you rebase?"), c("bob", 1, "thanks")]),
+                yours().comments(vec![c("bob", 1, "thanks")]),
+            ),
+            (
+                "an older thread resolved",
+                yours().threads(vec![nit(3), nit(1)]),
+                yours().threads(vec![nit(3).resolved(), nit(1)]),
+            ),
+            (
+                "the description edited",
+                requested().body("please review"),
+                requested().body("superseded, do not review"),
+            ),
+        ];
+        for (name, before, after) in cases {
+            assert!(is_read_again_at(before, after, now()), "{name}");
+        }
+    }
+
+    /// The question it was read from is gone, and the newest comment and every reason are not.
+    #[test]
+    fn a_verdict_is_read_again_when_an_older_comment_expires() {
+        let item =
+            || yours().comments(vec![c("bob", 14, "can you rebase?"), c("bob", 1, "thanks")]);
+        let tomorrow = now() + TimeDelta::days(1);
+        assert!(is_read_again_at(item(), item(), tomorrow));
+    }
+
+    /// The reasons say "3d ago", which moves every day, and the words do not.
+    #[test]
+    fn a_day_passing_costs_no_model_pass() {
+        let item = || pr(1).comments(vec![c("bob", 3, &format!("@{ME} can you look?"))]);
+        let tomorrow = now() + TimeDelta::days(1);
+        assert!(!is_read_again_at(item(), item(), tomorrow));
+    }
+
+    /// A compare that failed on one run and worked on the next: the first verdict never saw it.
+    #[test]
+    fn a_verdict_is_read_again_when_the_interdiff_arrives() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let item = pr(1)
+            .pushed_at(day(2))
+            .comments(vec![c(ME, 5, "ACK 1234567")]);
+        let snapshot = snap(vec![item], vec![]);
+        let mut obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let item_key = obs[0].item.key.to_string();
+        gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [{"key": item_key, "gist": "g", "asks": true}]}))
+        })
+        .unwrap();
+
+        obs[0].interdiff = Some(Interdiff {
+            changed: vec!["src/a.rs".to_owned()],
+        });
+        let got = gists(&obs, &viewer, now(), &path, |_| None).unwrap();
+        assert!(got.is_empty(), "the verdict from without it does not stand");
+    }
+
+    /// CI comments on every push and a machine replies in threads, and a verdict reads neither.
+    #[test]
+    fn a_bots_comment_costs_no_model_pass() {
+        let question = c("bob", 3, &format!("@{ME} can you look?"));
+        let with_bot = vec![question.clone(), bot("ci[bot]", 1, "coverage report")];
+        assert!(!is_read_again_at(
+            pr(1).comments(vec![question]),
+            pr(1).comments(with_bot),
+            now()
+        ));
+        let nit = || c("bob", 3, "a nit");
+        assert!(!is_read_again_at(
+            yours().threads(vec![thread(vec![nit()])]),
+            yours().threads(vec![thread(vec![nit(), bot("cdk-bot", 1, "a finding")])]),
+            now()
+        ));
+    }
+
+    /// What a run on the last key cached, which may have read what the rules have since ruled
+    /// out. Nothing says which, so all of it is read again, in the one pass that first run makes.
+    #[test]
+    fn a_verdict_cached_under_the_earlier_key_is_read_again() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let snapshot = snap(vec![pr(100).requested(ME, "2026-10-08T17:14:49Z")], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        let item_key = obs[0].item.key.clone();
+        let cached = format!(
+            "{{\n \"getfloresta/Floresta#100\": {{\n  \"fp\": \"2026-10-08T17:14:49Z|review_requested|{}\",\n  \"gist\": \"old\",\n  \"asks\": true\n }}\n}}",
+            "f".repeat(40),
+        );
+        fs::write(&path, cached).unwrap();
+        let got = gists(&obs, &viewer, now(), &path, |_| {
+            Some(json!({"gists": [{"key": item_key.to_string(), "gist": "new", "asks": false}]}))
+        })
+        .unwrap();
+        assert_eq!(
+            got[&item_key],
+            Gist {
+                text: "new".to_owned(),
+                asks: false
+            }
+        );
+    }
+
+    /// The items the gist pass would send the model, from an empty cache.
+    fn payload_sent(obs: &[Obligation<'_>], viewer: &Viewer) -> Value {
+        let dir = TempDir::new().unwrap();
+        let prompt = RefCell::new(String::new());
+        gists(obs, viewer, now(), &cache(&dir, "g.json"), |sent| {
+            prompt.replace(sent.to_owned());
+            None
+        })
+        .unwrap();
+        let sent = prompt.into_inner();
+        serde_json::from_str(&sent[sent.find("ITEMS:").unwrap() + 6..]).unwrap()
+    }
+
+    /// What goes under `waiting_comments` for one obligation, the only one on the snapshot.
+    fn waiting_sent(item: Item) -> Vec<String> {
+        let viewer = me();
+        let snapshot = snap(vec![item], vec![]);
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert_eq!(obs.len(), 1, "the case needs a reason to be asked about");
+        let payload = payload_sent(&obs, &viewer);
+        let waiting = payload[0]["waiting_comments"].as_array().unwrap();
+        waiting
+            .iter()
+            .map(|said| said["text"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    /// The prompt says a direct question means `asks: true`, so a question the rules have
+    /// closed would still send the DM.
+    #[test]
+    fn the_verdict_does_not_read_what_the_rules_ruled_out() {
+        let question = |days_ago| c("bob", days_ago, &format!("@{ME} can you look?"));
+        let requested = |n| pr(n).requested(ME, &day(0).to_string());
+        let cases = vec![
+            ("past the expiry", requested(1).comments(vec![question(40)])),
+            (
+                "answered by a review with no body",
+                requested(2)
+                    .comments(vec![question(5)])
+                    .reviews(vec![review(ME, 3, ReviewState::Commented, "")]),
+            ),
+            (
+                "answered by an inline reply",
+                requested(3)
+                    .comments(vec![question(5)])
+                    .threads(vec![thread(vec![c(ME, 3, "a nit")]).resolved()]),
+            ),
+            (
+                "answered by a push on your own PR",
+                pr(4)
+                    .author(ME)
+                    .pushed_at(day(3))
+                    .comments(vec![question(5)])
+                    .threads(vec![thread(vec![c("carol", 1, "a nit")])]),
+            ),
+            (
+                "from before you were handed the issue",
+                issue(5).assigned(ME, day(3)).comments(vec![question(5)]),
+            ),
+        ];
+        for (name, item) in cases {
+            assert_eq!(waiting_sent(item), Vec::<String>::new(), "{name}");
+        }
+    }
+
+    /// `waiting_comments` is everything since your answer, not only what makes a reason: on
+    /// someone else's PR "never mind" pings nobody, and it is what the verdict turns on.
+    #[test]
+    fn the_verdict_reads_everything_said_since_your_answer() {
+        let item = pr(1)
+            .comments(vec![
+                c("bob", 5, &format!("@{ME} can you look?")),
+                c("carol", 4, "never mind, sorted it"),
+            ])
+            .reviews(vec![review(ME, 6, ReviewState::Commented, "")]);
+        assert_eq!(
+            waiting_sent(item),
+            [
+                format!("@{ME} can you look?"),
+                "never mind, sorted it".to_owned()
+            ]
+        );
+    }
+
+    /// The rules drop a review's verdict from the conversation, because it has a rule of its
+    /// own or asks nothing. Its body is still where a reviewer says what they want.
+    #[test]
+    fn the_gist_reads_what_a_reviewer_said_with_their_verdict() {
+        let item = pr(1).author(ME).pushed_at(day(5)).reviews(vec![
+            review("bob", 2, ReviewState::ChangesRequested, "rename this"),
+            review("carol", 1, ReviewState::Approved, "LGTM"),
+        ]);
+        assert_eq!(waiting_sent(item), ["rename this", "LGTM"]);
+    }
+
+    /// The newest word of each thread the model would read of this PR.
+    fn threads_sent(project: &'static crate::config::Project, item: Item) -> Vec<String> {
+        let viewer = me();
+        let snapshot = crate::snapshot::Snapshot {
+            project,
+            items: vec![item],
+        };
+        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
+        assert_eq!(obs.len(), 1, "the case needs a reason to be asked about");
+        let payload = payload_sent(&obs, &viewer);
+        let threads = payload[0]["threads"].as_array().unwrap();
+        threads
+            .iter()
+            .map(|t| {
+                t["last"].as_array().unwrap().last().unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_verdict_reads_only_the_threads_the_rules_still_count() {
+        let (floresta, cdk) = (&crate::config::PROJECTS[0], &crate::config::PROJECTS[1]);
+        let waiting = || thread(vec![c(ME, 9, "why?"), c("bob", 2, "waiting")]);
+        // Someone else's PR. Displaced threads stay out of the four sent.
+        let others = pr(1).threads(vec![
+            thread(vec![c("bob", 9, "why?"), c(ME, 8, "you had the last word")]),
+            thread(vec![c(ME, 50, "why?"), c("bob", 40, "past the expiry")]),
+            thread(vec![
+                c(ME, 9, "why?"),
+                c("bob", 8, "answered by your review"),
+            ]),
+            waiting(),
+        ]);
+        let others = others.reviews(vec![review(ME, 7, ReviewState::Commented, "")]);
+        assert_eq!(threads_sent(floresta, others), ["waiting"]);
+        // Your own PR, where only some repos let a thread expire.
+        let own = |repo| {
+            pr(2)
+                .author(ME)
+                .in_repo(repo)
+                .pushed_at(day(60))
+                .threads(vec![
+                    thread(vec![c("bob", 40, "old")]),
+                    thread(vec![c("bob", 2, "new")]),
+                ])
+        };
+        assert_eq!(threads_sent(cdk, own("cashubtc/cdk")), ["new"]);
+        assert_eq!(
+            threads_sent(floresta, own("getfloresta/Floresta")),
+            ["old", "new"]
+        );
+    }
+
+    /// A machine's findings open a PR's threads, so they would take the four places, and it can
+    /// reply after a person. Reading only that, the model answers `false` on a real request.
+    #[test]
+    fn the_verdict_reads_what_people_said_in_a_thread() {
+        let (floresta, cdk) = (&crate::config::PROJECTS[0], &crate::config::PROJECTS[1]);
+        let find = |days_ago| bot("cdk-bot", days_ago, "a finding");
+        let own = |repo| {
+            pr(2)
+                .author(ME)
+                .in_repo(repo)
+                .pushed_at(day(60))
+                .threads(vec![
+                    thread(vec![find(5)]),
+                    thread(vec![find(5)]),
+                    thread(vec![find(5)]),
+                    thread(vec![find(5)]),
+                    thread(vec![c("bob", 1, "a question")]),
+                ])
+        };
+        // Whether those threads count is up to each repo's rules. They are never what is read.
+        for (project, repo) in [(cdk, "cashubtc/cdk"), (floresta, "getfloresta/Floresta")] {
+            assert_eq!(threads_sent(project, own(repo)), ["a question"], "{repo}");
+        }
+        let replied_after_a_person = pr(1).threads(vec![thread(vec![
+            c(ME, 9, "why?"),
+            c("bob", 3, "because"),
+            find(2),
+            find(1),
+        ])]);
+        assert_eq!(threads_sent(floresta, replied_after_a_person), ["because"]);
     }
 
     /// Asked to judge a "can you rebase?" with no owner on it, the model could not tell
     /// who was being asked.
     #[test]
     fn the_verdict_can_see_whose_item_it_is() {
-        let dir = TempDir::new().unwrap();
         let viewer = me();
         let snapshot = snap(
             vec![
@@ -851,15 +1253,7 @@ mod tests {
             vec![],
         );
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let prompt = RefCell::new(String::new());
-        gists(&obs, &viewer, &cache(&dir, "g.json"), |sent| {
-            prompt.replace(sent.to_owned());
-            None
-        })
-        .unwrap();
-        let sent = prompt.into_inner();
-        let payload: Value =
-            serde_json::from_str(&sent[sent.find("ITEMS:").unwrap() + 6..]).unwrap();
+        let payload = payload_sent(&obs, &viewer);
         assert_eq!(payload[0]["author"], ME);
         assert_eq!(payload[0]["his"], true);
         assert_eq!(payload[1]["author"], "alice");
@@ -878,7 +1272,7 @@ mod tests {
             json!({"key": key, "gist": "text"}),
             json!({"key": key, "gist": "text", "asks": "false"}),
         ] {
-            let got = gists(&obs, &viewer, &cache(&dir, "g.json"), |_| {
+            let got = gists(&obs, &viewer, now(), &cache(&dir, "g.json"), |_| {
                 Some(json!({"gists": [entry.clone()]}))
             })
             .unwrap();
@@ -898,23 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn state_files_written_by_earlier_runs_are_still_read() {
-        let dir = TempDir::new().unwrap();
-        let path = cache(&dir, "g.json");
-        let viewer = me();
-        let snapshot = snap(vec![pr(100).requested(ME, "2026-10-08T17:14:49Z")], vec![]);
-        let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let cached = format!(
-            "{{\n \"getfloresta/Floresta#100\": {{\n  \"fp\": \"2026-10-08T17:14:49Z|review_requested|{}\",\n  \"gist\": \"caf\\u00e9\",\n  \"asks\": false\n }}\n}}",
-            "f".repeat(40),
-        );
-        fs::write(&path, cached).unwrap();
-        let got = gists(&obs, &viewer, &path, |_| {
-            panic!("a cached gist must not ask")
-        })
-        .unwrap();
-        assert_eq!(got[&key("getfloresta/floresta#100")].text, "café");
-
+    fn a_rank_cache_written_by_an_earlier_run_is_still_read() {
         let dir = TempDir::new().unwrap();
         let path = cache(&dir, "r.json");
         let items = items();
@@ -945,11 +1323,12 @@ mod tests {
         let snapshot = snap(vec![pr(100).requested(ME, "2026-10-08T17:14:49Z")], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let item_key = obs[0].item.key.clone();
-        let cached =
-            json!({ item_key.to_string(): {"fp": gist_fingerprint(&obs[0]), "gist": "old"} });
+        let read = excerpt(&obs[0], &viewer, now());
+        let fp = gist_fingerprint(&obs[0], &read.evidence).unwrap();
+        let cached = json!({ item_key.to_string(): {"fp": fp, "gist": "old"} });
         fs::write(&path, cached.to_string()).unwrap();
         let calls = Cell::new(0);
-        let got = gists(&obs, &viewer, &path, |_| {
+        let got = gists(&obs, &viewer, now(), &path, |_| {
             calls.set(calls.get() + 1);
             Some(json!({"gists": [{"key": item_key.to_string(), "gist": "new", "asks": false}]}))
         })

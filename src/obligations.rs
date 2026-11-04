@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use crate::board::CardKey;
 use crate::config;
 use crate::snapshot::{
-    CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review, ReviewState,
-    Snapshot,
+    Comment, CommentKind, Detail, Interdiff, IssueDetail, Item, MergeState, PrDetail, Review,
+    ReviewState, Snapshot, Thread,
 };
 use crate::text::{basename, plural, prefix};
 use crate::timestamp::Timestamp;
@@ -195,6 +195,8 @@ pub struct Obligation<'a> {
     /// Context that informs, but is not part of what a mute remembers.
     pub notes: Vec<String>,
     pub interdiff: Option<Interdiff>,
+    /// The review threads the rules still count, which is what the model may read of them.
+    pub threads: Vec<&'a Thread>,
 }
 
 impl<'a> Obligation<'a> {
@@ -204,6 +206,7 @@ impl<'a> Obligation<'a> {
             reasons,
             notes: Vec::new(),
             interdiff: None,
+            threads: Vec::new(),
         }
     }
 
@@ -259,6 +262,25 @@ struct Said<'a> {
     kind: Option<CommentKind>,
 }
 
+impl<'a> From<&'a Comment> for Said<'a> {
+    fn from(comment: &'a Comment) -> Self {
+        Self {
+            author: &comment.author,
+            bot: comment.bot,
+            at: comment.at,
+            body: &comment.body,
+            kind: Some(comment.kind),
+        }
+    }
+}
+
+impl Said<'_> {
+    /// Whether this can still be waiting on you, given the newest thing that answered.
+    fn is_waiting(&self, answered: Option<Timestamp>, me: &Viewer, now: DateTime<Utc>) -> bool {
+        !me.is(self.author) && !self.bot && Some(self.at) > answered && is_live(self.at, now)
+    }
+}
+
 /// The main conversation, with the item's own body as its first comment so a
 /// "cc @you" in a PR description counts like any other mention.
 fn stream(item: &Item) -> impl Iterator<Item = Said<'_>> {
@@ -269,37 +291,55 @@ fn stream(item: &Item) -> impl Iterator<Item = Said<'_>> {
         body: &item.body,
         kind: None,
     };
-    std::iter::once(head).chain(item.comments.iter().map(|comment| Said {
-        author: &comment.author,
-        bot: comment.bot,
-        at: comment.at,
-        body: &comment.body,
-        kind: Some(comment.kind),
-    }))
+    std::iter::once(head).chain(item.comments.iter().map(Said::from))
 }
 
 /// Your newest activity of any kind on the item: a comment, a submitted review
 /// (even one with no body), an inline reply. Any of them is an answer to whatever
-/// came before it.
+/// came before it. Telling a machine to run says nothing to anyone, so it is none of them.
 pub fn engaged_at(item: &Item, me: &Viewer) -> Option<Timestamp> {
     let spoke = stream(item)
-        .filter(|said| me.is(said.author))
+        .filter(|said| me.is(said.author) && !said.bot)
         .map(|said| said.at);
     let pr_activity = item.pr().into_iter().flat_map(|pr| {
         let reviewed = pr
             .reviews
             .iter()
-            .filter(|r| me.is(&r.author) && r.state != ReviewState::Pending)
+            .filter(|r| me.is(&r.author) && !r.bot && r.state != ReviewState::Pending)
             .map(|r| r.at);
         let replied = pr
             .threads
             .iter()
             .flat_map(|t| &t.comments)
-            .filter(|c| me.is(&c.author))
+            .filter(|c| me.is(&c.author) && !c.bot)
             .map(|c| c.at);
         reviewed.chain(replied)
     });
     spoke.chain(pr_activity).max()
+}
+
+/// The newest thing that answers what came before it: your activity, a push on your own
+/// PR, or being handed an issue you had not spoken on.
+fn answered_up_to(item: &Item, me: &Viewer) -> Option<Timestamp> {
+    let engaged = engaged_at(item, me);
+    match &item.detail {
+        Detail::Pr(pr) if me.is(&item.author) => engaged.max(pr.pushed_at),
+        // Chatter from before you were handed it was never addressed to you. Once you have
+        // spoken, though, an answer to you stays an answer even if the assignment came later.
+        Detail::Issue(issue) if engaged.is_none() && item.assignees.iter().any(|a| me.is(a)) => {
+            issue.assigned_at.get(&me.login).copied()
+        }
+        _ => engaged,
+    }
+}
+
+/// The comments still waiting on you, oldest first: what the conversation rule reads, before
+/// it decides which of them make a reason. So this keeps a "never mind" that pings nobody,
+/// and a review's body, which is where a reviewer says what they want done.
+pub fn waiting_comments<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
+    let answered = answered_up_to(item, me);
+    let waiting = |comment: &&Comment| Said::from(*comment).is_waiting(answered, me, now);
+    item.comments.iter().filter(waiting).collect()
 }
 
 fn norm(text: &str) -> String {
@@ -340,25 +380,9 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     let mut out = Vec::new();
     let said: Vec<Said<'_>> = stream(item).collect();
     let mine: Vec<Said<'_>> = said.iter().copied().filter(|s| me.is(s.author)).collect();
-    let mut mine_at = engaged_at(item, me);
-    if let Detail::Pr(pr) = &item.detail
-        && me.is(&item.author)
-    {
-        mine_at = mine_at.max(pr.pushed_at); // a push answers too
-    }
+    let answered = answered_up_to(item, me);
     let assigned_to_me = item.assignees.iter().any(|login| me.is(login));
-    if mine_at.is_none()
-        && assigned_to_me
-        && let Detail::Issue(issue) = &item.detail
-    {
-        // Chatter from before you were handed it was never addressed to you. Once
-        // you have spoken, though, an answer to you stays an answer even if the
-        // assignment came later.
-        mine_at = issue.assigned_at.get(&me.login).copied();
-    }
-    let after = said
-        .iter()
-        .filter(|s| !me.is(s.author) && !s.bot && Some(s.at) > mine_at && is_live(s.at, now));
+    let after = said.iter().filter(|s| s.is_waiting(answered, me, now));
     let (pinged, others): (Vec<&Said<'_>>, Vec<&Said<'_>>) =
         after.partition(|s| me.is_mentioned_in(s.body) || quotes(s.body, &mine));
 
@@ -410,6 +434,68 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     out
 }
 
+/// The first word still waiting on you in a thread on someone else's PR, and its newest.
+fn thread_wait<'t>(
+    thread: &'t Thread,
+    engaged: Option<Timestamp>,
+    me: &Viewer,
+    now: DateTime<Utc>,
+) -> Option<(&'t Comment, &'t Comment)> {
+    let comments: Vec<_> = thread.comments.iter().filter(|c| !c.bot).collect();
+    if thread.resolved || !comments.iter().any(|c| me.is(&c.author)) {
+        return None;
+    }
+    let newest = *comments.last().filter(|c| !me.is(&c.author))?;
+    let first = comments
+        .iter()
+        .find(|c| Some(c.at) > engaged && !me.is(&c.author) && is_live(c.at, now))?;
+    Some((*first, newest))
+}
+
+/// What dates an open thread on your own PR, if it still counts. Dated by what someone else
+/// said: your own reply and a bot's are no new trigger.
+fn own_thread_said(
+    thread: &Thread,
+    me: &Viewer,
+    now: DateTime<Utc>,
+    threads_block_merge: bool,
+) -> Option<Timestamp> {
+    if thread.resolved {
+        return None;
+    }
+    let others = thread
+        .comments
+        .iter()
+        .filter(|c| !me.is(&c.author) && !c.bot);
+    let said = others.map(|c| c.at).max();
+    if threads_block_merge {
+        // It has to be resolved all the same, so with nothing else in it, it is dated from
+        // when it opened.
+        said.or_else(|| thread.comments.iter().map(|c| c.at).min())
+    } else {
+        said.filter(|at| is_live(*at, now))
+    }
+}
+
+/// The threads the rules still count on this PR.
+fn waiting_threads<'i>(
+    item: &Item,
+    pr: &'i PrDetail,
+    me: &Viewer,
+    now: DateTime<Utc>,
+    threads_block_merge: bool,
+) -> Vec<&'i Thread> {
+    let engaged = engaged_at(item, me);
+    let counts = |thread: &&Thread| {
+        if me.is(&item.author) {
+            own_thread_said(thread, me, now, threads_block_merge).is_some()
+        } else {
+            thread_wait(thread, engaged, me, now).is_some()
+        }
+    };
+    pr.threads.iter().filter(counts).collect()
+}
+
 /// Rule 2, inline half: someone answered in a review thread you're in.
 fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     if me.is(&item.author) {
@@ -420,20 +506,9 @@ fn threads(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<R
     let engaged = engaged_at(item, me);
     let mut waiting = Vec::new();
     for thread in &pr.threads {
-        let comments: Vec<_> = thread.comments.iter().filter(|c| !c.bot).collect();
-        if thread.resolved || !comments.iter().any(|c| me.is(&c.author)) {
-            continue;
+        if let Some((first, newest)) = thread_wait(thread, engaged, me, now) {
+            waiting.push((first, newest, thread.path.as_str()));
         }
-        let Some(newest) = comments.last().filter(|c| !me.is(&c.author)) else {
-            continue;
-        };
-        let Some(first) = comments
-            .iter()
-            .find(|c| Some(c.at) > engaged && !me.is(&c.author) && is_live(c.at, now))
-        else {
-            continue;
-        };
-        waiting.push((*first, *newest, thread.path.as_str()));
     }
     waiting.sort_by_key(|(first, _, _)| first.at);
     let Some((first, _, path)) = waiting.first() else {
@@ -492,22 +567,10 @@ fn own_pr(
         return Vec::new();
     }
     let mut out = Vec::new();
-    // Dated by what someone else said. Your own reply and a bot's are no new trigger.
     let lasts: Vec<Timestamp> = pr
         .threads
         .iter()
-        .filter(|t| !t.resolved)
-        .filter_map(|t| {
-            let others = t.comments.iter().filter(|c| !me.is(&c.author) && !c.bot);
-            let said = others.map(|c| c.at).max();
-            if threads_block_merge {
-                // It has to be resolved all the same, so with nothing else in it, it is
-                // dated from when it opened.
-                said.or_else(|| t.comments.iter().map(|c| c.at).min())
-            } else {
-                said.filter(|at| is_live(*at, now))
-            }
-        })
+        .filter_map(|t| own_thread_said(t, me, now, threads_block_merge))
         .collect();
     if let (Some(oldest), Some(newest)) = (lasts.iter().min(), lasts.iter().max()) {
         let n = lasts.len();
@@ -694,7 +757,11 @@ pub fn collect<'a>(
             }
         };
         if !reasons.is_empty() {
-            out.push(Obligation::new(item, reasons));
+            let mut ob = Obligation::new(item, reasons);
+            if let Detail::Pr(pr) = &item.detail {
+                ob.threads = waiting_threads(item, pr, me, now, snap.project.threads_block_merge);
+            }
+            out.push(ob);
         }
     }
     out.sort_by_key(Obligation::sort_key);
@@ -912,7 +979,7 @@ mod tests {
     //! conversation).
 
     use super::*;
-    use crate::snapshot::{Ci, Comment, Mergeability, Thread};
+    use crate::snapshot::{Ci, Mergeability};
     use crate::testkit::{
         ME, bot, c, day, floresta, issue, key, me, now, pr, review, snap, thread,
     };
@@ -1311,6 +1378,55 @@ mod tests {
                     c("carol", 2, "a comment"),
                 ])]),
                 vec![],
+            ),
+        ]);
+    }
+
+    /// It says nothing to anyone, so whatever came before it is still waiting.
+    #[test]
+    fn telling_a_machine_to_run_answers_nothing() {
+        let command = || bot(ME, 1, "@cdk-bot review");
+        let ping = at_me("@me can you look?");
+        let command_as_review = || Review {
+            bot: true,
+            ..review(ME, 1, ReviewState::Commented, "@cdk-bot review")
+        };
+        check(vec![
+            (
+                "a reply on your own PR",
+                pr(80)
+                    .author(ME)
+                    .pushed_at(day(60))
+                    .comments(vec![c("bob", 3, "can you rebase?"), command()]),
+                vec!["reply"],
+            ),
+            (
+                "a mention",
+                pr(81).comments(vec![c("bob", 3, &ping), command()]),
+                vec!["mention"],
+            ),
+            (
+                "a review request",
+                pr(82)
+                    .requested(ME, &day(5).to_string())
+                    .comments(vec![command()]),
+                vec!["review_requested"],
+            ),
+            (
+                "a thread you are in",
+                pr(83).threads(vec![thread(vec![
+                    c(ME, 9, "why?"),
+                    c("bob", 3, "because"),
+                    command(),
+                ])]),
+                vec!["thread"],
+            ),
+            (
+                "a mention, with the command as a review's body",
+                pr(84)
+                    .comments(vec![c("bob", 3, &ping)])
+                    .reviews(vec![command_as_review()]),
+                vec!["mention"],
             ),
         ]);
     }
