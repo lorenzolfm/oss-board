@@ -42,7 +42,7 @@ use anyhow::{Context, Result, bail};
 use regex::{Captures, Regex};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::obligations::{Fingerprint, Mute, ReasonKind};
+use crate::obligations::{Fingerprint, ReasonKind, Seen};
 use crate::timestamp::Timestamp;
 
 const LANE_ORDER: [&str; 7] = [
@@ -394,8 +394,8 @@ impl Board {
 
     /// Obligation cards dragged to Passed. Muting the same item twice leaves two
     /// cards, and both count.
-    pub fn mutes(&self) -> HashMap<CardKey, Mute> {
-        let mut out: HashMap<CardKey, Mute> = HashMap::new();
+    pub fn mutes(&self) -> HashMap<CardKey, Seen> {
+        let mut out: HashMap<CardKey, Seen> = HashMap::new();
         for line in self.cards(PASSED) {
             let (Some(key), Some(found)) = (card_key(line), MUTE_RE.captures(line)) else {
                 continue;

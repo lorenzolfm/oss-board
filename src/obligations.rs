@@ -14,6 +14,7 @@ use std::sync::LazyLock;
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::board::CardKey;
 use crate::config;
@@ -713,23 +714,66 @@ pub fn fingerprint(ob: &Obligation<'_>) -> Fingerprint {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct Seen {
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct SeenKind {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     heads: BTreeSet<String>,
 }
 
-/// What every muted card for an item adds up to: for each kind of reason you muted,
-/// the newest event you saw it with and the heads you saw it on. A fingerprint whose
-/// time does not parse (a hand-edited card) counts as older than everything.
-#[derive(Clone, Debug, Default)]
-pub struct Mute(BTreeMap<ReasonKind, Seen>);
+/// What you have seen of an item: for each kind of reason, the newest event you saw it
+/// with and the heads you saw it on. A reason this does not cover is a new trigger. It is
+/// what every muted card for an item adds up to, and what `last_dm.json` keeps per item.
+/// A fingerprint whose time does not parse (a hand-edited card) counts as older than
+/// everything.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(
+    from = "BTreeMap<String, SeenKind>",
+    into = "BTreeMap<&'static str, SeenKind>"
+)]
+pub struct Seen(BTreeMap<ReasonKind, SeenKind>);
 
-impl Mute {
+/// A kind no longer known is simply not remembered, so its card comes back.
+impl From<BTreeMap<String, SeenKind>> for Seen {
+    fn from(wire: BTreeMap<String, SeenKind>) -> Self {
+        let known = wire
+            .into_iter()
+            .filter_map(|(kind, seen)| Some((ReasonKind::parse(&kind)?, seen)));
+        Self(known.collect())
+    }
+}
+
+impl From<Seen> for BTreeMap<&'static str, SeenKind> {
+    fn from(seen: Seen) -> Self {
+        let kinds = seen.0.into_iter();
+        kinds.map(|(kind, seen)| (kind.as_str(), seen)).collect()
+    }
+}
+
+impl Seen {
+    /// A record from before kinds were named, which says only how far you had read.
+    /// It names no head, so a state of the PR reads as new once.
+    pub fn read_up_to(last: Timestamp) -> Self {
+        let mut seen = Self::default();
+        for kind in ReasonKind::ALL {
+            seen.remember(kind, Some(last), None);
+        }
+        seen
+    }
+
     pub fn remember(&mut self, kind: ReasonKind, last: Option<Timestamp>, head: Option<&str>) {
         let seen = self.0.entry(kind).or_default();
         seen.last = seen.last.max(last);
         seen.heads.extend(head.map(str::to_owned));
+    }
+
+    /// Remember a reason as `covers` will test it.
+    fn saw(&mut self, reason: &Reason) {
+        match &reason.when {
+            When::Events { last, .. } => self.remember(reason.kind, Some(*last), None),
+            When::Head { oid, .. } => self.remember(reason.kind, None, Some(oid)),
+        }
     }
 
     fn covers(&self, reason: &Reason) -> bool {
@@ -747,47 +791,16 @@ impl Mute {
 /// it, a timed event newer than the newest one you saw, or a new head for a state of
 /// the PR. General activity on the item never re-arms it -- only what would have made
 /// it an obligation in the first place.
-pub fn is_muted(ob: &Obligation<'_>, mute: Option<&Mute>) -> bool {
+pub fn is_muted(ob: &Obligation<'_>, mute: Option<&Seen>) -> bool {
     mute.is_some_and(|mute| ob.reasons.iter().all(|reason| mute.covers(reason)))
 }
 
 // ---------------------------------------------------------------- the DM
 
-/// What the last DM saw of an item, as `last_dm.json` keeps it.
-fn seen_text(ob: &Obligation<'_>) -> String {
-    let fp = fingerprint(ob);
-    format!(
-        "{}|{}|{}",
-        fp.last_text(),
-        fp.kinds_text(),
-        fp.head.unwrap_or_default()
-    )
-}
-
-/// The reasons that are a new trigger since the last DM, by the same test a mute uses.
-fn new_reasons<'o>(ob: &'o Obligation<'_>, seen: Option<&str>) -> Vec<&'o Reason> {
-    let Some(seen) = seen else {
-        return ob.reasons.iter().collect();
-    };
-    let mut parts = seen.split('|');
-    let last = parts.next().and_then(Timestamp::parse);
-    let Some(kinds) = parts.next() else {
-        // Written before the record named kinds, so all it says is how far you had read.
-        return if fingerprint(ob).last <= last {
-            Vec::new()
-        } else {
-            ob.reasons.iter().collect()
-        };
-    };
-    let head = parts.next().filter(|head| !head.is_empty());
-    let mut mute = Mute::default();
-    for kind in kinds.split(',').filter_map(ReasonKind::parse) {
-        mute.remember(kind, last, head);
-    }
-    ob.reasons
-        .iter()
-        .filter(|reason| !mute.covers(reason))
-        .collect()
+/// The reasons that are a new trigger since the last DM, by the test a mute uses.
+fn new_reasons<'o>(ob: &'o Obligation<'_>, told: Option<&Seen>) -> Vec<&'o Reason> {
+    let is_new = |reason: &&Reason| !told.is_some_and(|told| told.covers(reason));
+    ob.reasons.iter().filter(is_new).collect()
 }
 
 /// Everything the DM may interrupt you with, in the order of `obs`: a new trigger since
@@ -796,12 +809,12 @@ fn new_reasons<'o>(ob: &'o Obligation<'_>, seen: Option<&str>) -> Vec<&'o Reason
 /// missing and a capped message can afford a false alarm.
 pub fn new_asks<'o, 'a>(
     obs: &'o [Obligation<'a>],
-    seen: &BTreeMap<CardKey, String>,
+    seen: &BTreeMap<CardKey, Seen>,
     asks: impl Fn(&CardKey) -> Option<bool>,
 ) -> Vec<&'o Obligation<'a>> {
     obs.iter()
         .filter(|ob| {
-            let new = new_reasons(ob, seen.get(&ob.item.key).map(String::as_str));
+            let new = new_reasons(ob, seen.get(&ob.item.key));
             !new.is_empty()
                 && (new.iter().any(|reason| reason.kind.is_an_ask())
                     || asks(&ob.item.key).unwrap_or(true))
@@ -814,18 +827,20 @@ pub fn new_asks<'o, 'a>(
 pub fn seen_after(
     obs: &[Obligation<'_>],
     held: &[&Obligation<'_>],
-    seen: &BTreeMap<CardKey, String>,
-) -> BTreeMap<CardKey, String> {
+    seen: &BTreeMap<CardKey, Seen>,
+) -> BTreeMap<CardKey, Seen> {
     let is_held = |key: &CardKey| held.iter().any(|ob| ob.item.key == *key);
     obs.iter()
         .filter_map(|ob| {
             let key = &ob.item.key;
-            let text = if is_held(key) {
+            let told = if is_held(key) {
                 seen.get(key)?.clone()
             } else {
-                seen_text(ob)
+                let mut told = Seen::default();
+                ob.reasons.iter().for_each(|reason| told.saw(reason));
+                told
             };
-            Some((key.clone(), text))
+            Some((key.clone(), told))
         })
         .collect()
 }
@@ -841,7 +856,7 @@ mod tests {
     //! conversation).
 
     use super::*;
-    use crate::snapshot::{Ci, Mergeability};
+    use crate::snapshot::{Ci, Comment, Mergeability};
     use crate::testkit::{ME, bot, c, day, issue, me, now, pr, review, snap, thread};
 
     fn merge_of(number: u64, mergeable: Mergeability, ci: Option<Ci>) -> HashMap<u64, MergeState> {
@@ -1322,9 +1337,9 @@ mod tests {
         assert_eq!(order, [51, 53, 52, 50]);
     }
 
-    fn mute_of(ob: &Obligation<'_>) -> Mute {
+    fn mute_of(ob: &Obligation<'_>) -> Seen {
         let fp = fingerprint(ob);
-        let mut mute = Mute::default();
+        let mut mute = Seen::default();
         for kind in fp.kinds {
             mute.remember(kind, fp.last, fp.head.as_deref());
         }
@@ -1445,7 +1460,7 @@ mod tests {
         let viewer = me();
         let snapshot = snap(vec![pr(62).requested(ME, &day(3).to_string())], vec![]);
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
-        let mut mute = Mute::default();
+        let mut mute = Seen::default();
         mute.remember(
             ReasonKind::ReviewRequested,
             Timestamp::parse("not a time"),
@@ -1457,7 +1472,7 @@ mod tests {
     // ------------------------------------------------------------ the DM
 
     /// What a delivered DM leaves behind when nothing was held back.
-    fn seen_of(obs: &[Obligation<'_>]) -> BTreeMap<CardKey, String> {
+    fn seen_of(obs: &[Obligation<'_>]) -> BTreeMap<CardKey, Seen> {
         seen_after(obs, &[], &BTreeMap::new())
     }
 
@@ -1465,7 +1480,7 @@ mod tests {
     fn asking(
         item: Item,
         merge: &HashMap<u64, MergeState>,
-        seen: &BTreeMap<CardKey, String>,
+        seen: &BTreeMap<CardKey, Seen>,
         verdict: Option<bool>,
     ) -> Vec<u64> {
         let viewer = me();
@@ -1477,7 +1492,7 @@ mod tests {
             .collect()
     }
 
-    fn seen_on(item: Item, merge: &HashMap<u64, MergeState>) -> BTreeMap<CardKey, String> {
+    fn seen_on(item: Item, merge: &HashMap<u64, MergeState>) -> BTreeMap<CardKey, Seen> {
         let viewer = me();
         let snapshot = snap(vec![item], vec![]);
         seen_of(&collect(&snapshot, &viewer, now(), merge))
@@ -1591,19 +1606,21 @@ mod tests {
         assert_eq!(next[0].item.number, 96);
     }
 
-    /// The record from before this one named kinds, and opportunities by their head.
+    /// A mention the record has seen, on an item whose head was committed ahead of the next
+    /// ping. Dates from different kinds of reason say nothing about each other.
     #[test]
-    fn a_record_from_before_kinds_covers_everything_up_to_its_time() {
+    fn a_commit_dated_ahead_does_not_cover_a_newer_mention() {
         let empty = HashMap::new();
-        let item = pr(97).comments(vec![c("bob", 5, &at_me("@me ping"))]);
-        let key = item.key.clone();
-        let seen_as = |text: String| BTreeMap::from([(key.clone(), text)]);
-
-        let current = seen_as(day(5).to_string());
-        assert!(asking(item.clone(), &empty, &current, Some(true)).is_empty());
-        let older = seen_as(day(6).to_string());
-        assert_eq!(asking(item.clone(), &empty, &older, Some(true)), [97]);
-        let a_head = seen_as("d6c385e521c36cc9c24bc534db3f4b1693194a20".to_owned());
-        assert_eq!(asking(item, &empty, &a_head, Some(true)), [97]);
+        let acked = |comments: Vec<Comment>| {
+            let mut said = vec![c(ME, 9, "ACK 1234567"), c("bob", 5, &at_me("@me first"))];
+            said.extend(comments);
+            pr(98)
+                .with_head(&"a".repeat(40))
+                .head_at(day(-30))
+                .comments(said)
+        };
+        let seen = seen_on(acked(vec![]), &empty);
+        let pinged = acked(vec![c("bob", 1, &at_me("@me a question"))]);
+        assert_eq!(asking(pinged, &empty, &seen, Some(true)), [98]);
     }
 }

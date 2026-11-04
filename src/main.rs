@@ -42,13 +42,13 @@ use std::process::ExitCode;
 use anyhow::Result;
 use chrono::{DateTime, Days, FixedOffset, Local, SecondsFormat, TimeDelta, Utc};
 use clap::{Args, Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use board::{AgentLane, Board, Card, CardKey, Changes, Claim, ClaimLane, GitHubItem};
 use brief::{BriefKind, Target};
 use footprint::Footprint;
 use model::Ranked;
-use obligations::{Obligation, Reason, ReasonKind, Viewer};
+use obligations::{Obligation, Reason, ReasonKind, Seen, Viewer};
 use opportunities::Opportunity;
 use render::{Degraded, Dm};
 use snapshot::{Item, Snapshot};
@@ -146,8 +146,27 @@ fn due_slot(
 #[derive(Default, Deserialize, Serialize)]
 struct LastDm {
     at: Option<DateTime<FixedOffset>>,
-    #[serde(default)]
-    seen: BTreeMap<CardKey, String>,
+    #[serde(default, deserialize_with = "seen_records")]
+    seen: BTreeMap<CardKey, Seen>,
+}
+
+/// Parsed once, here. Earlier versions wrote a bare time for how far you had read, and a
+/// bare head for an opportunity, which says nothing about an obligation.
+fn seen_records<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<CardKey, Seen>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Wire {
+        Triggers(Seen),
+        Legacy(String),
+    }
+    let wire = BTreeMap::<CardKey, Wire>::deserialize(deserializer)?;
+    let records = wire.into_iter().filter_map(|(key, record)| match record {
+        Wire::Triggers(told) => Some((key, told)),
+        Wire::Legacy(text) => Timestamp::parse(&text).map(|at| (key, Seen::read_up_to(at))),
+    });
+    Ok(records.collect())
 }
 
 // ---------------------------------------------------------------- gathering
@@ -695,6 +714,9 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::obligations::{collect, new_asks};
+    use crate::snapshot::MergeState;
+    use crate::testkit::{ME, c, day, me, now, pr, snap};
     use chrono::TimeZone;
 
     const SLOTS: [(u32, u32); 1] = [(8, 7)];
@@ -764,9 +786,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(due_slot(at(15, 9, 7), &SLOTS, record.at), None);
-        assert_eq!(
-            record.seen[&"getfloresta/floresta#7".parse().unwrap()],
-            "2026-10-08T17:14:49Z"
+        assert!(
+            record
+                .seen
+                .contains_key(&"getfloresta/floresta#7".parse().unwrap())
         );
+    }
+
+    /// Whether item 97 is new to a `last_dm.json` holding this entry for it.
+    fn is_new_to(item: Item, merge: &HashMap<u64, MergeState>, entry: &str) -> bool {
+        let text = format!(r#"{{"at": null, "seen": {{"getfloresta/Floresta#97": {entry}}}}}"#);
+        let record: LastDm = serde_json::from_str(&text).unwrap();
+        let snapshot = snap(vec![item], vec![]);
+        let viewer = me();
+        let obs = collect(&snapshot, &viewer, now(), merge);
+        !new_asks(&obs, &record.seen, |_| Some(true)).is_empty()
+    }
+
+    #[test]
+    fn what_a_record_says_about_a_mention() {
+        let mention = format!("@{ME} ping");
+        let at_day = |n| format!(r#""{}""#, day(n));
+        let cases = [
+            ("a bare time at the mention", at_day(5), false),
+            ("a bare time before the mention", at_day(6), true),
+            (
+                "a bare head says nothing",
+                r#""d6c385e521c36cc9c24bc534db3f4b1693194a20""#.to_owned(),
+                true,
+            ),
+            (
+                "a kind no longer known does not cost the file",
+                format!(
+                    r#"{{"a_retired_kind": {{"last": "{0}"}}, "mention": {{"last": "{0}"}}}}"#,
+                    day(5)
+                ),
+                false,
+            ),
+        ];
+        for (name, entry, new) in cases {
+            let item = pr(97).comments(vec![c("bob", 5, &mention)]);
+            assert_eq!(is_new_to(item, &HashMap::new(), &entry), new, "{name}");
+        }
+    }
+
+    /// A bare time names no head, so the morning after deploy repeats this once.
+    #[test]
+    fn a_conflict_on_a_bare_time_reads_as_new() {
+        let merge = HashMap::from([(97, MergeState::conflicting())]);
+        let item = pr(97).author(ME).head_at(day(5));
+        assert!(is_new_to(item, &merge, &format!(r#""{}""#, day(0))));
     }
 }
