@@ -777,6 +777,23 @@ fn a_failed_briefing_leaves_nothing_and_is_tried_again() {
     assert!(!lane(&board, "Doing")[0].contains("[["), "{board}");
 }
 
+/// A run killed mid-briefing leaves its draft, and the next agent can exit 0 having
+/// written nothing. What it finds is not that agent's work.
+#[test]
+fn a_draft_left_by_a_killed_run_does_not_become_the_note() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), claimed_pr_board()).unwrap();
+    fs::write(fixture.path("vault/.Floresta-8.md.tmp"), "x".repeat(400)).unwrap();
+    fs::write(fixture.path("bin/claude"), "#!/bin/sh\nexit 0\n").unwrap();
+    run(fixture
+        .command(&["--no-model"])
+        .env("GH_TOKEN", "read-only-token"));
+    assert!(!fixture.path("vault/Floresta-8.md").exists());
+    assert!(!fixture.path("vault/.Floresta-8.md.tmp").exists());
+    let board = fixture.read_board();
+    assert!(!lane(&board, "Doing")[0].contains("[["), "{board}");
+}
+
 /// An agent that succeeds with next to nothing is failing in a way that looks answered.
 #[test]
 fn a_thin_note_is_discarded() {

@@ -14,6 +14,7 @@
 //! note under its real name is always a complete one.
 
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -89,6 +90,14 @@ fn draft_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp"))
 }
 
+/// A run killed mid-briefing leaves its draft, which must not pass for this agent's work.
+fn clear_draft(draft: &Path) -> Result<(), String> {
+    match fs::remove_file(draft) {
+        Err(err) if err.kind() != ErrorKind::NotFound => Err(err.to_string()),
+        _ => Ok(()),
+    }
+}
+
 fn write_draft(draft: &Path, target: &Target<'_>, token: &str) -> Result<(), String> {
     let out = proc::run(
         Command::new("claude")
@@ -126,6 +135,7 @@ pub fn write_briefing(vault_dir: &Path, target: &Target<'_>) -> Result<PathBuf, 
         .filter(|token| !token.is_empty())
         .ok_or("no read-only GH_TOKEN; refusing to fall back to user auth")?;
     let draft = draft_path(&path);
+    clear_draft(&draft)?;
     let written = write_draft(&draft, target, &token)
         .and_then(|()| fs::rename(&draft, &path).map_err(|err| err.to_string()));
     if written.is_err() {
