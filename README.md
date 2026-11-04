@@ -34,8 +34,9 @@ hide, drop or reorder it there. Six rules (`src/obligations.rs`):
    once does *not* count -- that is the notifications inbox this replaces.
    Any activity of yours (a comment, a submitted review, an inline reply)
    answers what came before it, in any thread; on your own PR, so does a push.
-   A comment left unanswered for 14 days stops counting. If it still matters
-   someone will ping again, and that brings the card back.
+   Telling a machine to run (`@cdk-bot review`) answers nothing, here or for a
+   review request. A comment left unanswered for 14 days stops counting. If it
+   still matters someone will ping again, and that brings the card back.
 3. **Your own PRs when there's something for you to do**: an unresolved
    thread, changes requested since your push, a conflict, red CI, or a comment
    since your last push. ACKs and approvals are good news, not requests.

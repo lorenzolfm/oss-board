@@ -296,30 +296,30 @@ fn stream(item: &Item) -> impl Iterator<Item = Said<'_>> {
 
 /// Your newest activity of any kind on the item: a comment, a submitted review
 /// (even one with no body), an inline reply. Any of them is an answer to whatever
-/// came before it.
+/// came before it. Telling a machine to run says nothing to anyone, so it is none of them.
 pub fn engaged_at(item: &Item, me: &Viewer) -> Option<Timestamp> {
     let spoke = stream(item)
-        .filter(|said| me.is(said.author))
+        .filter(|said| me.is(said.author) && !said.bot)
         .map(|said| said.at);
     let pr_activity = item.pr().into_iter().flat_map(|pr| {
         let reviewed = pr
             .reviews
             .iter()
-            .filter(|r| me.is(&r.author) && r.state != ReviewState::Pending)
+            .filter(|r| me.is(&r.author) && !r.bot && r.state != ReviewState::Pending)
             .map(|r| r.at);
         let replied = pr
             .threads
             .iter()
             .flat_map(|t| &t.comments)
-            .filter(|c| me.is(&c.author))
+            .filter(|c| me.is(&c.author) && !c.bot)
             .map(|c| c.at);
         reviewed.chain(replied)
     });
     spoke.chain(pr_activity).max()
 }
 
-/// The newest thing that answers what came before it: anything of yours, a push on your
-/// own PR, or being handed an issue you had not spoken on.
+/// The newest thing that answers what came before it: your activity, a push on your own
+/// PR, or being handed an issue you had not spoken on.
 fn answered_up_to(item: &Item, me: &Viewer) -> Option<Timestamp> {
     let engaged = engaged_at(item, me);
     match &item.detail {
@@ -1378,6 +1378,55 @@ mod tests {
                     c("carol", 2, "a comment"),
                 ])]),
                 vec![],
+            ),
+        ]);
+    }
+
+    /// It says nothing to anyone, so whatever came before it is still waiting.
+    #[test]
+    fn telling_a_machine_to_run_answers_nothing() {
+        let command = || bot(ME, 1, "@cdk-bot review");
+        let ping = at_me("@me can you look?");
+        let command_as_review = || Review {
+            bot: true,
+            ..review(ME, 1, ReviewState::Commented, "@cdk-bot review")
+        };
+        check(vec![
+            (
+                "a reply on your own PR",
+                pr(80)
+                    .author(ME)
+                    .pushed_at(day(60))
+                    .comments(vec![c("bob", 3, "can you rebase?"), command()]),
+                vec!["reply"],
+            ),
+            (
+                "a mention",
+                pr(81).comments(vec![c("bob", 3, &ping), command()]),
+                vec!["mention"],
+            ),
+            (
+                "a review request",
+                pr(82)
+                    .requested(ME, &day(5).to_string())
+                    .comments(vec![command()]),
+                vec!["review_requested"],
+            ),
+            (
+                "a thread you are in",
+                pr(83).threads(vec![thread(vec![
+                    c(ME, 9, "why?"),
+                    c("bob", 3, "because"),
+                    command(),
+                ])]),
+                vec!["thread"],
+            ),
+            (
+                "a mention, with the command as a review's body",
+                pr(84)
+                    .comments(vec![c("bob", 3, &ping)])
+                    .reviews(vec![command_as_review()]),
+                vec!["mention"],
             ),
         ]);
     }
