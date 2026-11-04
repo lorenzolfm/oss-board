@@ -197,17 +197,17 @@ reuse cached gists and rankings unless something they look at moved.
 2. **The unit.** `oss-board.nix` is the deployed copy, and the binary comes from
    this repo as a flake input, like `wt` and `claude-ps`: what runs is what the
    lock pins, not whatever is checked out here. So a change reaches the timer only
-   when you commit it and update the input:
+   when it is on `main` on GitHub and you update the input:
    ```sh
    cd /etc/nixos
    nix flake update oss-board
    sudo nixos-rebuild switch
    ```
-   The repo is private, so the input is a local one rather than `github:`, and
-   only what is committed on `main` can deploy:
+   The input has to be one a GitHub runner can fetch, because the workflows in
+   `/etc/nixos` evaluate and re-lock it there. A local `git+file:` input fails both:
    ```nix
    oss-board = {
-     url = "git+file:///home/lorenzo/Projects/misc/opensource?ref=main";
+     url = "github:lorenzolfm/oss-board";
      inputs.nixpkgs.follows = "nixpkgs";
      inputs.rust-overlay.follows = "rust-overlay";
    };
