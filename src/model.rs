@@ -200,20 +200,26 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excer
             pr.additions, pr.deletions, pr.changed_files
         ),
         files: &pr.files[..pr.files.len().min(12)],
+        // A machine is nobody waiting on you, so it can't push out what a person said, and a
+        // thread with only a machine in it takes none of the four places.
         threads: ob
             .threads
             .iter()
-            .take(4)
-            .map(|t| ThreadExcerpt {
-                path: &t.path,
-                last: t.comments[t.comments.len().saturating_sub(2)..]
-                    .iter()
-                    .map(|c| Said {
-                        by: &c.author,
-                        text: clip(&c.body, 400),
-                    })
-                    .collect(),
+            .map(|t| {
+                let said: Vec<_> = t.comments.iter().filter(|c| !c.bot).collect();
+                ThreadExcerpt {
+                    path: &t.path,
+                    last: said[said.len().saturating_sub(2)..]
+                        .iter()
+                        .map(|c| Said {
+                            by: &c.author,
+                            text: clip(&c.body, 400),
+                        })
+                        .collect(),
+                }
             })
+            .filter(|t| !t.last.is_empty())
+            .take(4)
             .collect(),
     });
     Excerpt {
@@ -1005,7 +1011,7 @@ mod tests {
         assert!(got.is_empty(), "the verdict from without it does not stand");
     }
 
-    /// CI comments on every push, and none of it is what a verdict reads.
+    /// CI comments on every push and a machine replies in threads, and a verdict reads neither.
     #[test]
     fn a_bots_comment_costs_no_model_pass() {
         let question = c("bob", 3, &format!("@{ME} can you look?"));
@@ -1013,6 +1019,12 @@ mod tests {
         assert!(!is_read_again_at(
             pr(1).comments(vec![question]),
             pr(1).comments(with_bot),
+            now()
+        ));
+        let nit = || c("bob", 3, "a nit");
+        assert!(!is_read_again_at(
+            yours().threads(vec![thread(vec![nit()])]),
+            yours().threads(vec![thread(vec![nit(), bot("cdk-bot", 1, "a finding")])]),
             now()
         ));
     }
@@ -1194,6 +1206,38 @@ mod tests {
             threads_sent(floresta, own("getfloresta/Floresta")),
             ["old", "new"]
         );
+    }
+
+    /// A machine's findings open a PR's threads, so they would take the four places, and it can
+    /// reply after a person. Reading only that, the model answers `false` on a real request.
+    #[test]
+    fn the_verdict_reads_what_people_said_in_a_thread() {
+        let (floresta, cdk) = (&crate::config::PROJECTS[0], &crate::config::PROJECTS[1]);
+        let find = |days_ago| bot("cdk-bot", days_ago, "a finding");
+        let own = |repo| {
+            pr(2)
+                .author(ME)
+                .in_repo(repo)
+                .pushed_at(day(60))
+                .threads(vec![
+                    thread(vec![find(5)]),
+                    thread(vec![find(5)]),
+                    thread(vec![find(5)]),
+                    thread(vec![find(5)]),
+                    thread(vec![c("bob", 1, "a question")]),
+                ])
+        };
+        // Whether those threads count is up to each repo's rules. They are never what is read.
+        for (project, repo) in [(cdk, "cashubtc/cdk"), (floresta, "getfloresta/Floresta")] {
+            assert_eq!(threads_sent(project, own(repo)), ["a question"], "{repo}");
+        }
+        let replied_after_a_person = pr(1).threads(vec![thread(vec![
+            c(ME, 9, "why?"),
+            c("bob", 3, "because"),
+            find(2),
+            find(1),
+        ])]);
+        assert_eq!(threads_sent(floresta, replied_after_a_person), ["because"]);
     }
 
     /// Asked to judge a "can you rebase?" with no owner on it, the model could not tell
