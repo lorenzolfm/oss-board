@@ -65,7 +65,7 @@ pub enum LinkHow {
 
 #[derive(Clone, Debug)]
 pub struct IssueLink {
-    pub number: u64,
+    pub key: CardKey,
     pub url: String,
     pub how: LinkHow,
 }
@@ -177,7 +177,7 @@ fn link_issue<'a>(
         };
         let named = found[0].contains('/');
         if (number >= 100 || named)
-            && let Some(issue) = issues.iter().find(|issue| issue.number == number)
+            && let Some(issue) = issues.iter().find(|issue| issue.is_number(number))
         {
             return Some((*issue, LinkHow::Refs));
         }
@@ -345,7 +345,7 @@ fn link_of(
     issues: &[&Item],
 ) -> Option<IssueLink> {
     link_issue(refs, text, words, issues).map(|(issue, how)| IssueLink {
-        number: issue.number,
+        key: issue.key.clone(),
         url: issue.url.clone(),
         how,
     })
@@ -698,7 +698,8 @@ mod tests {
         let issues: Vec<&Item> = issues.iter().collect();
         let refs = ref_re(FLORESTA);
         let link = |text: &str, words: &str| {
-            link_issue(&refs, text, &tokens(words), &issues).map(|(issue, how)| (issue.number, how))
+            link_issue(&refs, text, &tokens(words), &issues)
+                .map(|(issue, how)| (issue.number(), how))
         };
         assert_eq!(
             link(
@@ -736,7 +737,7 @@ mod tests {
         let issues: Vec<&Item> = issues.iter().collect();
         let refs = ref_re(CDK);
         let link = |text: &str| {
-            link_issue(&refs, text, &HashSet::new(), &issues).map(|(issue, _)| issue.number)
+            link_issue(&refs, text, &HashSet::new(), &issues).map(|(issue, _)| issue.number())
         };
         assert_eq!(link("see cashubtc/cdk#6"), Some(6));
         assert_eq!(

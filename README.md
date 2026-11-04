@@ -194,9 +194,9 @@ reuse cached gists and rankings unless something they look at moved.
   the open items, so the rules are tested against fixtures with no network, and a
   failed snapshot of either repo fails the whole run *before* the board is touched --
   a lane computed from nothing would delete every card.
-- **Numbers stay inside their repo.** Each repo is gathered on its own, and only keys
-  cross after that. The judge answers with a key rather than a number, because both
-  repos can have a #7 in the same list.
+- **Numbers stay inside their repo.** Both repos can have a #7, so an item is its key
+  everywhere: the merge states, the org column and an issue link are all read by key,
+  the judge answers with one, and only the queries in `snapshot.rs` spell a number.
 - **No GitHub notifications.** You don't use them, and a read-only fine-grained
   token can't read them anyway. The rules reconstruct "waiting on you" from the
   conversation itself.

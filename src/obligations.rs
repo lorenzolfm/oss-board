@@ -613,7 +613,7 @@ fn stale_ack(item: &Item, pr: &PrDetail, me: &Viewer, now: DateTime<Utc>) -> Vec
 
 /// Rule 5: assigned to you and nothing links a fix yet.
 fn assigned(item: &Item, issue: &IssueDetail, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
-    if !item.assignees.iter().any(|login| me.is(login)) || !issue.linked_prs.is_empty() {
+    if !item.assignees.iter().any(|login| me.is(login)) || issue.has_linked_pr {
         return Vec::new();
     }
     let at = issue
@@ -665,7 +665,7 @@ pub fn collect<'a>(
     snap: &'a Snapshot,
     me: &Viewer,
     now: DateTime<Utc>,
-    merge: &HashMap<u64, MergeState>,
+    merge: &HashMap<CardKey, MergeState>,
 ) -> Vec<Obligation<'a>> {
     let mut out = Vec::new();
     for item in &snap.items {
@@ -674,7 +674,7 @@ pub fn collect<'a>(
                 let mut reasons = review_request(item, pr, me, now);
                 reasons.extend(conversation(item, me, now));
                 reasons.extend(threads(item, pr, me, now));
-                reasons.extend(own_pr(item, pr, me, now, merge.get(&item.number)));
+                reasons.extend(own_pr(item, pr, me, now, merge.get(&item.key)));
                 reasons.extend(stale_ack(item, pr, me, now));
                 reasons.extend(pending_review(pr, me, now));
                 reasons
@@ -905,10 +905,16 @@ mod tests {
 
     use super::*;
     use crate::snapshot::{Ci, Comment, Mergeability};
-    use crate::testkit::{ME, bot, c, day, issue, me, now, pr, review, snap, thread};
+    use crate::testkit::{
+        ME, bot, c, day, floresta, issue, key, me, now, pr, review, snap, thread,
+    };
 
-    fn merge_of(number: u64, mergeable: Mergeability, ci: Option<Ci>) -> HashMap<u64, MergeState> {
-        HashMap::from([(number, MergeState { mergeable, ci })])
+    fn merge_of(
+        number: u64,
+        mergeable: Mergeability,
+        ci: Option<Ci>,
+    ) -> HashMap<CardKey, MergeState> {
+        HashMap::from([(floresta(number), MergeState { mergeable, ci })])
     }
 
     #[test]
@@ -932,7 +938,7 @@ mod tests {
         }
     }
 
-    fn kinds_with(item: Item, merge: &HashMap<u64, MergeState>) -> Vec<&'static str> {
+    fn kinds_with(item: Item, merge: &HashMap<CardKey, MergeState>) -> Vec<&'static str> {
         let viewer = me();
         let snapshot = match item.detail {
             Detail::Pr(_) => snap(vec![item], vec![]),
@@ -1057,7 +1063,7 @@ mod tests {
             ),
             (
                 "an assigned issue with a fix linked is not idle",
-                issue(12).assigned(ME, day(5)).linked_pr(1327),
+                issue(12).assigned(ME, day(5)).linked_pr(),
                 vec![],
             ),
             (
@@ -1154,6 +1160,19 @@ mod tests {
             kinds_with(pr(28).author(ME).draft(), &merge),
             ["ci_failed", "conflict"]
         );
+    }
+
+    /// Two repos' #28 are two PRs, so one's state says nothing about the other.
+    #[test]
+    fn a_merge_state_belongs_to_the_item_not_its_number() {
+        let conflict = MergeState {
+            mergeable: Mergeability::Conflicting,
+            ci: None,
+        };
+        let merge = HashMap::from([(key("cashubtc/cdk#28"), conflict)]);
+        assert!(kinds_with(pr(28).author(ME), &merge).is_empty());
+        let on_cdk = pr(28).author(ME).in_repo("cashubtc/cdk");
+        assert_eq!(kinds_with(on_cdk, &merge), ["conflict"]);
     }
 
     #[test]
@@ -1385,7 +1404,7 @@ mod tests {
         let merge = merge_of(52, Mergeability::Conflicting, None);
         let order: Vec<u64> = collect(&snapshot, &viewer, now(), &merge)
             .iter()
-            .map(|ob| ob.item.number)
+            .map(|ob| ob.item.number())
             .collect();
         assert_eq!(order, [51, 53, 52, 50]);
     }
@@ -1532,7 +1551,7 @@ mod tests {
     /// The numbers the DM would carry, given a model that always says the same thing.
     fn asking(
         item: Item,
-        merge: &HashMap<u64, MergeState>,
+        merge: &HashMap<CardKey, MergeState>,
         seen: &BTreeMap<CardKey, Seen>,
         verdict: Option<bool>,
     ) -> Vec<u64> {
@@ -1541,11 +1560,11 @@ mod tests {
         let obs = collect(&snapshot, &viewer, now(), merge);
         new_asks(&obs, seen, |_| verdict)
             .iter()
-            .map(|ob| ob.item.number)
+            .map(|ob| ob.item.number())
             .collect()
     }
 
-    fn seen_on(item: Item, merge: &HashMap<u64, MergeState>) -> BTreeMap<CardKey, Seen> {
+    fn seen_on(item: Item, merge: &HashMap<CardKey, MergeState>) -> BTreeMap<CardKey, Seen> {
         let viewer = me();
         let snapshot = snap(vec![item], vec![]);
         seen_of(&collect(&snapshot, &viewer, now(), merge))
@@ -1655,12 +1674,12 @@ mod tests {
         let obs = collect(&snapshot, &viewer, now(), &HashMap::new());
         let waiting = new_asks(&obs, &told, |_| None);
         let (shown, held) = waiting.split_at(1);
-        assert_eq!(shown[0].item.number, 95);
+        assert_eq!(shown[0].item.number(), 95);
 
         let seen = seen_after(&obs, held, &told, &[]);
         let next: Vec<u64> = new_asks(&obs, &seen, |_| None)
             .iter()
-            .map(|ob| ob.item.number)
+            .map(|ob| ob.item.number())
             .collect();
         assert_eq!(next, [99, 96], "new when held, with a record or without");
     }
@@ -1669,7 +1688,7 @@ mod tests {
     /// that read `between` with these kinds unread.
     fn conflict_after(
         between: Item,
-        between_merge: &HashMap<u64, MergeState>,
+        between_merge: &HashMap<CardKey, MergeState>,
         unread: &[ReasonKind],
         next: Item,
     ) -> Vec<u64> {

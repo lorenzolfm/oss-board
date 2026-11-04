@@ -590,7 +590,7 @@ mod tests {
     use crate::config::Repo;
     use crate::obligations::{self, is_muted};
     use crate::render;
-    use crate::testkit::{ME, c, day, key, me, now, opportunity, pr, snap, thread};
+    use crate::testkit::{ME, c, day, floresta, key, me, now, opportunity, pr, snap, thread};
     use crate::unshipped::{IssueLink, LinkHow, Origin, Unshipped};
     use chrono::NaiveDate;
     use tempfile::TempDir;
@@ -892,7 +892,7 @@ mod tests {
                 commits: 1,
                 last: NaiveDate::from_ymd_opt(2026, 9, 11).unwrap(),
                 issue: Some(IssueLink {
-                    number: 1308,
+                    key: floresta(1308),
                     url: format!("{F}/issues/1308"),
                     how: LinkHow::Guess,
                 }),
@@ -923,7 +923,11 @@ mod tests {
             vec![],
         );
         let obs = obligations::collect(&snapshot, &viewer, now(), &HashMap::new());
-        let of = |number| obs.iter().find(|ob| ob.item.number == number).unwrap();
+        let of = |number| {
+            obs.iter()
+                .find(|ob| ob.item.key == floresta(number))
+                .unwrap()
+        };
         let line = render::ob_card(of(71), None);
         assert_eq!(line.as_str().lines().count(), 1);
 
@@ -1005,7 +1009,7 @@ mod tests {
     #[test]
     fn muting_an_item_twice_counts_both_cards_in_either_order() {
         let viewer = me();
-        let merge = HashMap::from([(61, crate::snapshot::MergeState::conflicting())]);
+        let merge = HashMap::from([(floresta(61), crate::snapshot::MergeState::conflicting())]);
         let snapshot = snap(vec![pr(61).author(ME).pushed_at(day(2))], vec![]);
         let obs = obligations::collect(&snapshot, &viewer, now(), &merge);
         let dragged = render::ob_card(&obs[0], None).as_str().to_owned();
@@ -1041,7 +1045,7 @@ mod tests {
     #[test]
     fn an_old_card_with_no_head_does_not_hold_a_state_on_any_head() {
         let viewer = me();
-        let merge = HashMap::from([(61, crate::snapshot::MergeState::red())]);
+        let merge = HashMap::from([(floresta(61), crate::snapshot::MergeState::red())]);
         let snapshot = snap(vec![pr(61).author(ME)], vec![]);
         let obs = obligations::collect(&snapshot, &viewer, now(), &merge);
         let passed = [format!("- [ ] c [#61]({F}/pull/61) <!--t:|ci_failed-->")];

@@ -23,7 +23,7 @@ impl fmt::Display for Repo {
 }
 
 /// A repo you actually work in. Issue numbers repeat between these, so a bare number
-/// means nothing outside the code reading one of them.
+/// means nothing, and an item is its `CardKey`.
 pub struct Project {
     pub repo: Repo,
     pub fork: Repo,

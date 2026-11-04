@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, SecondsFormat, TimeDelta, TimeZone, Utc};
 
 use crate::board::CardKey;
+use crate::config;
 use crate::obligations::Viewer;
 use crate::opportunities::{Opportunity, Source};
 use crate::snapshot::{
@@ -90,22 +91,7 @@ impl Thread {
 }
 
 fn item(number: u64, title: String, url: String, detail: Detail) -> Item {
-    Item {
-        key: item_key(&url).unwrap(),
-        number,
-        title,
-        url,
-        author: "alice".to_owned(),
-        author_bot: false,
-        created: day(30),
-        updated: day(1),
-        body: String::new(),
-        milestone: None,
-        labels: vec![],
-        assignees: vec![],
-        comments: vec![],
-        detail,
-    }
+    Item::fixture(number, title, url, day(30), day(1), detail)
 }
 
 impl Item {
@@ -146,15 +132,22 @@ pub fn issue(number: u64) -> Item {
         format!("{REPO_URL}/issues/{number}"),
         Detail::Issue(IssueDetail {
             assigned_at: HashMap::new(),
-            linked_prs: vec![],
+            has_linked_pr: false,
         }),
     )
 }
 
+/// A snapshot of Floresta, which is whose items `pr` and `issue` make.
 pub fn snap(prs: Vec<Item>, issues: Vec<Item>) -> Snapshot {
     Snapshot {
+        project: &config::PROJECTS[0],
         items: prs.into_iter().chain(issues).collect(),
     }
+}
+
+/// The key `pr` and `issue` give this number.
+pub fn floresta(number: u64) -> CardKey {
+    key(&format!("getfloresta/floresta#{number}"))
 }
 
 /// Builders, each returning the item so a fixture reads as one expression.
@@ -241,9 +234,9 @@ impl Item {
         self
     }
 
-    pub fn linked_pr(mut self, number: u64) -> Self {
+    pub fn linked_pr(mut self) -> Self {
         if let Detail::Issue(issue) = &mut self.detail {
-            issue.linked_prs.push(number);
+            issue.has_linked_pr = true;
         }
         self
     }

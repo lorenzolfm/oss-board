@@ -98,7 +98,7 @@ fn opportunity<'a>(
     }
 }
 
-/// `skip` holds the obligation and claimed keys; `column` the numbers on Needs Review.
+/// `skip` holds the obligation and claimed keys; `column` the items on Needs Review.
 pub fn collect<'a>(
     snap: &'a Snapshot,
     me: &Viewer,
@@ -106,7 +106,7 @@ pub fn collect<'a>(
     skip: &HashSet<CardKey>,
     tombstones: &HashSet<CardKey>,
     fp: &Footprint,
-    column: &HashSet<u64>,
+    column: &HashSet<CardKey>,
 ) -> Vec<Opportunity<'a>> {
     let is_out = |item: &Item| {
         skip.contains(&item.key)
@@ -137,7 +137,7 @@ pub fn collect<'a>(
         {
             sources.push(Source::Unreviewed);
         }
-        if column.contains(&item.number) {
+        if column.contains(&item.key) {
             sources.push(Source::NeedsReview);
         }
         if !sources.is_empty() {
@@ -148,11 +148,11 @@ pub fn collect<'a>(
         let mut sources = Vec::new();
         if item.created.days_ago(now) <= config::NEW_ISSUE_DAYS
             && item.assignees.is_empty()
-            && issue.linked_prs.is_empty()
+            && !issue.has_linked_pr
         {
             sources.push(Source::NewIssue);
         }
-        if column.contains(&item.number) {
+        if column.contains(&item.key) {
             sources.push(Source::NeedsReview);
         }
         if !sources.is_empty() {

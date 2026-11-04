@@ -568,7 +568,7 @@ mod tests {
         ranked
             .picks()
             .iter()
-            .map(|(opp, _)| opp.item.number)
+            .map(|(opp, _)| opp.item.number())
             .collect()
     }
 

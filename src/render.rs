@@ -201,7 +201,7 @@ pub fn unshipped_card(u: &Unshipped) -> Card {
             LinkHow::Refs => "fixes",
             LinkHow::Guess => "probably fixes",
         };
-        format!(" · {verb} [#{}]({})", issue.number, issue.url)
+        format!(" · {verb} [{}]({})", issue.key.short(), issue.url)
     });
     Card::with_key(&format!("⚡ {head}{link}"), &u.key())
 }
