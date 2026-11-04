@@ -116,6 +116,7 @@ pub struct Comment {
 #[derive(Clone, Debug)]
 pub struct Review {
     pub author: String,
+    /// Machine traffic, as on `Comment`.
     pub bot: bool,
     pub state: ReviewState,
     pub body: String,
@@ -449,6 +450,12 @@ fn actor(author: Option<Actor>) -> (String, bool) {
     }
 }
 
+/// Whether a whole comment or review body only tells a machine what to do.
+fn is_machine_command(body: &str) -> bool {
+    let words = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    config::MACHINE_COMMANDS.contains(&words.as_str())
+}
+
 fn logins(conn: Conn<Login>) -> Vec<String> {
     conn.into_nodes().filter_map(|a| a.login).collect()
 }
@@ -473,10 +480,9 @@ struct CommentNode {
 impl CommentNode {
     fn into_comment(self, kind: CommentKind) -> Comment {
         let (author, bot) = actor(self.author);
-        let words = self.body.split_whitespace().collect::<Vec<_>>().join(" ");
         Comment {
             author,
-            bot: bot || config::MACHINE_COMMANDS.contains(&words.as_str()),
+            bot: bot || is_machine_command(&self.body),
             at: self.created_at,
             body: self.body,
             kind,
@@ -578,7 +584,7 @@ impl TryFrom<PrNode> for Item {
                 let (author, bot) = actor(r.author);
                 Review {
                     author,
-                    bot,
+                    bot: bot || is_machine_command(&r.body),
                     state: r.state,
                     body: r.body,
                     at: r.submitted_at.unwrap_or(r.created_at),

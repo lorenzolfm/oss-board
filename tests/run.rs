@@ -652,10 +652,12 @@ fn machine_traffic_on_your_pr_is_nobody_waiting_on_you() {
             "body":"{body}","createdAt":"{now}"}}]}}"#
         )
     };
-    let review = format!(
-        r#""reviews":{{"nodes":[{{"author":{{"__typename":"User","login":"cdk-bot"}},
-        "state":"COMMENTED","body":"Verified findings","submittedAt":"{now}","createdAt":"{now}"}}]}}"#
-    );
+    let review = |login: &str, body: &str| {
+        format!(
+            r#""reviews":{{"nodes":[{{"author":{{"__typename":"User","login":"{login}"}},
+            "state":"COMMENTED","body":"{body}","submittedAt":"{now}","createdAt":"{now}"}}]}}"#
+        )
+    };
     let cases = [
         (
             "the machine's comment",
@@ -666,7 +668,7 @@ fn machine_traffic_on_your_pr_is_nobody_waiting_on_you() {
         (
             "the machine's review",
             r#""reviews":{"nodes":[]}"#,
-            review,
+            review("cdk-bot", "Verified findings"),
             false,
         ),
         (
@@ -679,6 +681,18 @@ fn machine_traffic_on_your_pr_is_nobody_waiting_on_you() {
             "a command with more to say",
             r#""comments":{"nodes":[]}"#,
             comment("bob", "@cdk-bot review, then can you rebase?"),
+            true,
+        ),
+        (
+            "a bare command as a review's body",
+            r#""reviews":{"nodes":[]}"#,
+            review("bob", r"\r\n@cdk-bot review\r\n"),
+            false,
+        ),
+        (
+            "a review's command with more to say",
+            r#""reviews":{"nodes":[]}"#,
+            review("bob", "@cdk-bot review, then can you rebase?"),
             true,
         ),
     ];

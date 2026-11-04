@@ -117,8 +117,8 @@ pub const BRANCH_IGNORE: [&str; 2] = ["backup/", "worktree-agent-"];
 /// comments and review bodies on cdk's open PRs, 89 were this account's and 150 told it what to
 /// do.
 pub const MACHINE_ACCOUNTS: [&str; 1] = ["cdk-bot"];
-/// A whole comment that only tells one of them what to do. Anything longer may be talking to a
-/// person too, so it stays a comment.
+/// A whole comment or review body that only tells one of them what to do. Anything longer may
+/// be talking to a person too, so it stays a comment.
 pub const MACHINE_COMMANDS: [&str; 2] = ["@cdk-bot", "@cdk-bot review"];
 
 /// Board lane, across every project.
