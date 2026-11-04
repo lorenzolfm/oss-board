@@ -465,15 +465,46 @@ fn thread_wait<'t>(
     Some((*first, newest))
 }
 
-/// When someone else last said anything in this thread. Your own reply and a bot's are no new
-/// trigger.
-pub fn others_last_word(thread: &Thread, me: &Viewer) -> Option<Timestamp> {
-    thread
-        .comments
-        .iter()
-        .filter(|c| !me.is(&c.author) && !c.bot)
-        .map(|c| c.at)
-        .max()
+/// Where a thread stands for you. Declared lowest first: past the limit the model reads the
+/// highest, so a word still waiting on you outranks any date.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ThreadTurn {
+    /// No person has said anything. A machine is nobody waiting on you.
+    Machines,
+    /// Nobody else has said anything.
+    OnlyYou,
+    /// Someone else spoke, and you had the last word.
+    Answered { said: Timestamp },
+    /// Someone else had the last word, so the next is yours.
+    Waiting { said: Timestamp },
+}
+
+impl ThreadTurn {
+    pub fn of(thread: &Thread, me: &Viewer) -> Self {
+        let Some(last) = thread.comments.iter().rfind(|c| !c.bot) else {
+            return Self::Machines;
+        };
+        let others = thread
+            .comments
+            .iter()
+            .filter(|c| !c.bot && !me.is(&c.author));
+        let Some(said) = others.map(|c| c.at).max() else {
+            return Self::OnlyYou;
+        };
+        if me.is(&last.author) {
+            Self::Answered { said }
+        } else {
+            Self::Waiting { said }
+        }
+    }
+
+    /// When someone else last said anything in it. Your own reply and a bot's are no new trigger.
+    fn said(self) -> Option<Timestamp> {
+        match self {
+            Self::Machines | Self::OnlyYou => None,
+            Self::Answered { said } | Self::Waiting { said } => Some(said),
+        }
+    }
 }
 
 /// What dates an open thread on your own PR, if it still counts.
@@ -486,7 +517,7 @@ fn own_thread_said(
     if thread.resolved {
         return None;
     }
-    let said = others_last_word(thread, me);
+    let said = ThreadTurn::of(thread, me).said();
     if threads_block_merge {
         // It has to be resolved all the same, so with nothing else in it, it is dated from
         // when it opened.

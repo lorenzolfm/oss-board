@@ -32,7 +32,7 @@ use sha2::{Digest, Sha256};
 use crate::board::CardKey;
 use crate::footprint::Footprint;
 use crate::obligations::{
-    Obligation, Viewer, fingerprint, last_per_kind, others_last_word, pings, waiting_comments,
+    Obligation, ThreadTurn, Viewer, fingerprint, last_per_kind, pings, waiting_comments,
 };
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
@@ -188,14 +188,15 @@ struct AckDiff<'a> {
 }
 
 /// The threads the model reads, of those the rules count. A machine is nobody waiting on you, so
-/// a thread with only a machine in it takes no place. Past the limit the newest word someone
-/// else said decides, so the thread that moved the reason is read. Up to it they stay in PR
-/// order, so a verdict isn't read again for this alone.
+/// a thread with only a machine in it takes no place. Past the limit a word still waiting on you
+/// goes first, then the newest word someone else said. Up to it they stay in PR order, so a
+/// verdict isn't read again for this alone.
 fn threads_read<'a>(ob: &Obligation<'a>, me: &Viewer) -> Vec<&'a Thread> {
-    let has_a_person = |t: &&Thread| t.comments.iter().any(|c| !c.bot);
-    let mut read: Vec<&Thread> = ob.threads.iter().copied().filter(has_a_person).collect();
+    let turn = |t: &Thread| ThreadTurn::of(t, me);
+    let spoken = |t: &&Thread| turn(t) != ThreadTurn::Machines;
+    let mut read: Vec<&Thread> = ob.threads.iter().copied().filter(spoken).collect();
     if read.len() > THREADS_READ {
-        read.sort_by_key(|t| Reverse(others_last_word(t, me)));
+        read.sort_by_key(|t| Reverse(turn(t)));
         read.truncate(THREADS_READ);
     }
     read
@@ -1386,6 +1387,74 @@ mod tests {
                 question(),
             ])),
             ["a question", "old 1", "old 2", "old 3"]
+        );
+    }
+
+    /// On your own PR a thread stays open once you have answered it, so the newest word someone
+    /// else said can be one you answered. Reading only those, the model answers `false` with the
+    /// question you owe cut.
+    #[test]
+    fn past_four_threads_a_word_waiting_on_you_outranks_one_you_answered() {
+        let (floresta, cdk) = (&crate::config::PROJECTS[0], &crate::config::PROJECTS[1]);
+        let sent = |project, repo, threads| {
+            let item = pr(2)
+                .author(ME)
+                .in_repo(repo)
+                .pushed_at(day(60))
+                .threads(threads);
+            let mut sent = threads_sent(project, item);
+            sent.sort();
+            sent
+        };
+        let you_answered = |text| thread(vec![c("bob", 2, "why?"), c(ME, 1, text)]);
+        let a_machine_replied = |text| {
+            thread(vec![
+                c("bob", 2, "why?"),
+                c(ME, 1, text),
+                bot("cdk-bot", 1, "a finding"),
+            ])
+        };
+        let four = |answered: &dyn Fn(&'static str) -> Thread| {
+            vec![
+                answered("mine 1"),
+                answered("mine 2"),
+                answered("mine 3"),
+                answered("mine 4"),
+            ]
+        };
+        let question = |days_ago| thread(vec![c("bob", days_ago, "a question")]);
+        let cases = [
+            ("older", question(3), four(&you_answered)),
+            (
+                "as old, and last in PR order",
+                question(2),
+                four(&you_answered),
+            ),
+            (
+                "older, with a machine after your answers",
+                question(3),
+                four(&a_machine_replied),
+            ),
+        ];
+        for (project, repo) in [(floresta, "getfloresta/Floresta"), (cdk, "cashubtc/cdk")] {
+            for (name, open, answered) in &cases {
+                let mut threads = answered.clone();
+                threads.push(open.clone());
+                assert_eq!(
+                    sent(project, repo, threads),
+                    ["a question", "mine 1", "mine 2", "mine 3"],
+                    "{name}, in {repo}"
+                );
+            }
+        }
+
+        // Only where threads block merge does one with nobody else in it count, and nobody is
+        // waiting in it, however new it is.
+        let mut with_a_note = four(&you_answered);
+        with_a_note.push(thread(vec![c(ME, 0, "a note to myself")]));
+        assert_eq!(
+            sent(floresta, "getfloresta/Floresta", with_a_note),
+            ["mine 1", "mine 2", "mine 3", "mine 4"]
         );
     }
 
