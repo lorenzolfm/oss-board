@@ -33,8 +33,8 @@ pub struct Project {
     clone: &'static str,
     /// What that clone calls `repo`.
     remote: &'static str,
-    /// The org board's review column, if it has one worth reading.
-    pub column: Option<ProjectColumn>,
+    /// The review column on its org board.
+    pub column: ReviewColumn,
 }
 
 impl Project {
@@ -64,7 +64,7 @@ pub static PROJECTS: [Project; 2] = [
         remote: "upstream",
         // Checked 2026-10-14 before enabling: 23 open PRs, 13 of them moved in the
         // previous two weeks -- a curated queue, not a column nobody uses.
-        column: Some(ProjectColumn {
+        column: ReviewColumn::Curated(ProjectColumn {
             org: "getfloresta",
             number: 2,
             column: "Needs review",
@@ -82,7 +82,11 @@ pub static PROJECTS: [Project; 2] = [
         base: "main",
         clone: "Projects/misc/cdk",
         remote: "cashubtc",
-        column: None,
+        column: ReviewColumn::Unproven(ProjectColumn {
+            org: "cashubtc",
+            number: 2,
+            column: "Needs Review",
+        }),
     },
 ];
 
@@ -115,6 +119,15 @@ pub struct ProjectColumn {
     pub org: &'static str,
     pub number: u64,
     pub column: &'static str,
+}
+
+/// Whether a column has earned a run's attention. A name nobody uses would only add noise
+/// to the ranking, so that takes checking first, and the check needs the board's address.
+pub enum ReviewColumn {
+    /// Not shown to be curated yet. `survey` reads it, and a run does not.
+    Unproven(ProjectColumn),
+    /// Checked before enabling. A run reads it too.
+    Curated(ProjectColumn),
 }
 
 fn home() -> PathBuf {

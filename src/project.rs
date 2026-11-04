@@ -3,13 +3,13 @@
 //! Needs a token with `read:project`; without it the query fails and the source is
 //! simply absent from that run. `survey` exists for the one-off check that the
 //! column is curated -- items moving in and out recently, not a name nobody uses. It
-//! reads the boards of every project configured with a column.
+//! reads every project's board, including one a run does not read yet.
 
 use std::collections::HashSet;
 
 use serde::Deserialize;
 
-use crate::config::{self, ProjectColumn, Repo};
+use crate::config::{self, ProjectColumn, Repo, ReviewColumn};
 use crate::gh::{self, GhError, ItemState, Page};
 use crate::timestamp::Timestamp;
 
@@ -149,11 +149,14 @@ pub fn needs_review(repo: Repo, cfg: &ProjectColumn) -> Result<HashSet<u64>, GhE
 /// Print every column of each org board, biggest first.
 pub fn survey() -> Result<(), GhError> {
     for project in &config::PROJECTS {
-        let Some(cfg) = &project.column else {
-            println!("{}: no column configured", project.repo);
-            continue;
+        let (cfg, read) = match &project.column {
+            ReviewColumn::Curated(cfg) => (cfg, "a run reads it"),
+            ReviewColumn::Unproven(cfg) => (cfg, "a run does not read it yet"),
         };
-        println!("{}: {}'s board #{}", project.repo, cfg.org, cfg.number);
+        println!(
+            "{}: {}'s board #{}, {read}",
+            project.repo, cfg.org, cfg.number
+        );
         survey_board(cfg)?;
     }
     Ok(())

@@ -48,7 +48,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use board::{AgentLane, Board, Card, CardKey, Changes, Claim, ClaimLane, GitHubItem};
 use brief::{BriefKind, Target};
-use config::Project;
+use config::{Project, ReviewColumn};
 use footprint::Footprint;
 use model::Ranked;
 use obligations::{Obligation, Reason, ReasonKind, Seen, Viewer};
@@ -467,7 +467,7 @@ fn gather<'s>(
     });
 
     let mut column = HashSet::new();
-    if let Some(cfg) = &project.column {
+    if let ReviewColumn::Curated(cfg) = &project.column {
         match project::needs_review(repo, cfg) {
             Ok(numbers) => column = numbers,
             Err(err) => {

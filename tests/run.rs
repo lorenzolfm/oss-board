@@ -193,19 +193,24 @@ impl Fixture {
         fs::read_to_string(self.path("claude.log")).unwrap_or_default()
     }
 
-    /// A command with the fakes first on PATH and nothing of the real user's.
+    /// A refresh with the fakes first on PATH and nothing of the real user's.
     fn command(&self, args: &[&str]) -> Command {
+        let mut cmd = self.binary();
+        cmd.arg("refresh")
+            .args(["--board", self.board().to_str().unwrap()])
+            .args(["--state", self.path("state").to_str().unwrap()])
+            .args(args);
+        cmd
+    }
+
+    fn binary(&self) -> Command {
         let path = format!(
             "{}:{}",
             self.path("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         );
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oss-board"));
-        cmd.arg("refresh")
-            .args(["--board", self.board().to_str().unwrap()])
-            .args(["--state", self.path("state").to_str().unwrap()])
-            .args(args)
-            .env("PATH", path)
+        cmd.env("PATH", path)
             .env("HOME", self.dir.path())
             .env("FIXTURE_DIR", self.dir.path())
             .env_remove("GH_TOKEN")
@@ -1252,6 +1257,32 @@ fn a_stale_ack_on_cdk_is_diffed_against_its_own_base() {
         lane(&board, "Needs me")[0].contains("rebase only"),
         "{board}"
     );
+}
+
+/// cdk's board stays off until `survey` shows it is curated, so `survey` has to be able to
+/// read a board a run does not.
+#[test]
+fn survey_reads_a_board_a_run_does_not() {
+    let cdk_board = r#"organization(login: "cashubtc")"#;
+    let fixture = Fixture::new();
+    run(fixture
+        .command(&["--no-model", "--no-briefings"])
+        .env("GH_FAIL_ON", cdk_board));
+    assert_eq!(fixture.degraded(), serde_json::json!([]));
+
+    let out = run(fixture.binary().arg("survey"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("cashubtc/cdk: cashubtc's board #2"),
+        "{stdout}"
+    );
+    let failed = fixture
+        .binary()
+        .arg("survey")
+        .env("GH_FAIL_ON", cdk_board)
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
 }
 
 #[test]

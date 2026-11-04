@@ -50,7 +50,7 @@ hide, drop or reorder it there. Six rules (`src/obligations.rs`):
 **Opportunities** are ranked by the judge, capped at 8, and only on the board:
 new issues (14 days, unassigned, nothing linked), non-draft PRs with
 zero approvals you haven't touched, PRs you engaged with that moved since, and
-the org board's Needs review column, where a project has one configured. Your
+the org board's Needs review column, where a project's has been shown to be curated. Your
 **footprint** -- the crates your commits touched, computed from your local clones --
 is ranking context for the judge, never a filter. Neither repo has a CODEOWNERS to
 use instead. The cap and the judge are shared, so the lane is the best 8 across both.
@@ -271,9 +271,10 @@ reuse cached gists and rankings unless something they look at moved.
    ```
 3. **The Needs review column** is on for Floresta. It was checked before enabling
    (2026-10-14: 23 open PRs, 13 moved in the previous two weeks). `oss-board survey`
-   re-runs that survey; if a column ever goes stale, set that project's `column` in
-   `config::PROJECTS` to `None`. cdk's org board (`cashubtc` #2) has a Needs Review
-   status too, and is off until `survey` shows it is curated.
+   re-runs that survey, on every project's board. If a column ever goes stale, mark that
+   project's `column` in `config::PROJECTS` as `Unproven`, and a run stops reading it.
+   cdk's org board (`cashubtc` #2) has a Needs Review status too, and stays `Unproven`
+   until `survey` shows it is curated.
 4. **A new clone.** Unshipped and the footprint read `upstream_ref` from the project's
    clone, as fresh as your last fetch. A clone that is missing costs those two sources
    and says so in the heartbeat, and the rest of the run goes on.
