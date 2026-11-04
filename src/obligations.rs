@@ -734,6 +734,21 @@ pub fn fingerprint(ob: &Obligation<'_>) -> Fingerprint {
     }
 }
 
+/// The newest event behind each kind of reason, in the order `kinds_text` lists them.
+/// `Seen` compares times per kind, so anything keyed on what may be new has to as well: one
+/// time across them lets a head dated ahead hide a newer ping.
+pub fn last_per_kind(ob: &Obligation<'_>) -> String {
+    let mut newest: BTreeMap<ReasonKind, Option<Timestamp>> = BTreeMap::new();
+    for reason in &ob.reasons {
+        let held = newest.entry(reason.kind).or_default();
+        *held = (*held).max(reason.last());
+    }
+    let times = newest
+        .values()
+        .map(|at| at.map_or(String::new(), |at| at.to_string()));
+    times.collect::<Vec<_>>().join(",")
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct SeenKind {
     #[serde(default, skip_serializing_if = "Option::is_none")]

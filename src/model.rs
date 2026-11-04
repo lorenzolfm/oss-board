@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 
 use crate::board::CardKey;
 use crate::footprint::Footprint;
-use crate::obligations::{Obligation, Viewer, fingerprint};
+use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind};
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
@@ -111,11 +111,10 @@ pub fn save(path: &Path, value: &impl Serialize) -> Result<()> {
 // ---------------------------------------------------------------- gists
 
 fn gist_fingerprint(ob: &Obligation<'_>) -> String {
-    let fp = fingerprint(ob);
     format!(
         "{}|{}|{}",
-        fp.last_text(),
-        fp.kinds_text(),
+        last_per_kind(ob),
+        fingerprint(ob).kinds_text(),
         ob.item.head().unwrap_or("")
     )
 }
@@ -712,6 +711,37 @@ mod tests {
             after_failure.is_empty(),
             "a failed gist pass leaves no stale gist on a changed item"
         );
+    }
+
+    /// One time across every kind would let this head hide the ping, and a verdict on the
+    /// thank-you would decide a question the model never read.
+    #[test]
+    fn a_newer_ping_on_a_head_dated_ahead_is_read_again() {
+        let dir = TempDir::new().unwrap();
+        let path = cache(&dir, "g.json");
+        let viewer = me();
+        let empty = HashMap::new();
+        let acked = |comments| {
+            pr(98)
+                .with_head(&"a".repeat(40))
+                .pushed_at(day(-30))
+                .comments(comments)
+        };
+        let ack = c(ME, 9, "ACK 1234567");
+        let thanks = c("bob", 5, &format!("@{ME} thanks"));
+        let question = c("bob", 1, &format!("@{ME} can you decide?"));
+        let first = snap(vec![acked(vec![ack.clone(), thanks.clone()])], vec![]);
+        let obs = collect(&first, &viewer, now(), &empty);
+        let item_key = obs[0].item.key.clone();
+        let answer = |asks: bool| {
+            Some(json!({"gists": [{"key": item_key.to_string(), "gist": "g", "asks": asks}]}))
+        };
+        gists(&obs, &viewer, &path, |_| answer(false)).unwrap();
+
+        let next = snap(vec![acked(vec![ack, thanks, question])], vec![]);
+        let obs = collect(&next, &viewer, now(), &empty);
+        let got = gists(&obs, &viewer, &path, |_| answer(true)).unwrap();
+        assert!(got[&item_key].asks, "the cached verdict decided it");
     }
 
     /// Asked to judge a "can you rebase?" with no owner on it, the model could not tell
