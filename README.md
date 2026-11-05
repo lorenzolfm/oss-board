@@ -133,6 +133,11 @@ Opportunities and Unshipped stay on the board.
 If the model gives no verdict on a new item, it goes through and the message says it
 wasn't filtered: a false alarm can be seen, a dropped ask can't.
 
+A comment the rules don't count, such as a follow-up on someone else's PR that pings
+nobody, makes the model read a card again, but it is no new trigger. So if that reading
+turns into an ask on a card with nothing else new since the last DM, the board gets the
+new gist and the DM stays quiet until a new trigger.
+
 A source that can't be read is not a clear board. `Unshipped` and any card held by an
 unread source stay as they were, a claimed card keeps its note, and the heartbeat and
 `state/last_run.json` name the source. The DM names it too when it could change what

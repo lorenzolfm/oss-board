@@ -1001,7 +1001,9 @@ pub fn new_asks<'o, 'a>(
 /// What to remember once a DM is delivered. `obs` is every obligation, muted ones too:
 /// an item leaves this record only by clearing. A mute is not a clearing, and neither is
 /// a kind this run could not read, so what was remembered of those stays. An ask `held`
-/// back by the cap keeps what was remembered of it, so it stays new for the next DM.
+/// back by the cap keeps what was remembered of it, so it stays new for the next DM. A card
+/// the verdict left out is remembered like any other, so a later verdict alone can't bring
+/// it back.
 pub fn seen_after(
     obs: &[Obligation<'_>],
     held: &[&Obligation<'_>],

@@ -56,8 +56,12 @@ case "$prompt" in
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     echo 'Sure, here you go:'
     asks=true
-    [ -f "$FIXTURE_DIR/nobody_asks" ] && asks=false
-    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no","asks":'"$asks"'}]}';;
+    gist="wants a yes/no"
+    if [ -f "$FIXTURE_DIR/nobody_asks" ]; then
+      asks=false
+      gist="nothing asked"
+    fi
+    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"'"$gist"'","asks":'"$asks"'}]}';;
   "You are picking"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     [ -f "$FIXTURE_DIR/no_judge" ] && exit 1
@@ -1081,6 +1085,56 @@ fn what_the_model_says_asks_nothing_stays_on_the_board_and_out_of_the_dm() {
     assert!(
         lane(&board, "Needs me")[0].contains("[floresta#7]("),
         "{board}"
+    );
+}
+
+/// On someone else's PR, a follow-up that pings nobody makes the model read a card again, and
+/// it is no new trigger. So what that reading says reaches the board, and an ask read only now
+/// stays out of the DM. A miss usually means someone pings again.
+#[test]
+fn a_verdict_that_turns_true_is_no_new_trigger_for_the_dm() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("nobody_asks"), "").unwrap();
+    // One node for both mornings, because `pr_node` dates it from the clock and a ping dated
+    // later is a new trigger.
+    let mentioned = pr_node(7, "waiting on you", "cc @me please", "aaaaaaa", "bob");
+    fs::write(
+        fixture.path("prs.json"),
+        prs_page(std::slice::from_ref(&mentioned)),
+    )
+    .unwrap();
+    let (url, messages) = listener();
+    let left_out = deliver(&fixture, &url, &messages, &[]);
+    assert!(left_out.contains("nothing new"), "{left_out}");
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Needs me")[0].contains("*(nothing asked)*"),
+        "{board}"
+    );
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let followed_up = mentioned.replace(
+        r#""comments":{"nodes":[]}"#,
+        &format!(
+            r#""comments":{{"nodes":[{{"author":{{"__typename":"User","login":"bob"}},
+            "body":"actually, could you look at this?","createdAt":"{now}"}}]}}"#
+        ),
+    );
+    fs::write(fixture.path("prs.json"), prs_page(&[followed_up])).unwrap();
+    fs::remove_file(fixture.path("nobody_asks")).unwrap();
+
+    let dm = deliver(&fixture, &url, &messages, &[]);
+    assert!(dm.contains("nothing new"), "{dm}");
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Needs me")[0].contains("*(wants a yes/no)*"),
+        "the board has what the model read again: {board}"
+    );
+    let verdicts: serde_json::Value =
+        serde_json::from_str(&fixture.read_state("gists.json")).unwrap();
+    assert_eq!(
+        verdicts["getfloresta/floresta#7"]["asks"], true,
+        "the model read an ask, and the DM still left it out: {verdicts}"
     );
 }
 
