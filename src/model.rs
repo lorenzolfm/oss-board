@@ -320,6 +320,9 @@ pub fn gists(
                 .get(&key)
                 .filter(|_| asked.contains(&key) && !gist.is_empty())
             {
+                if asks && cache.get(&key).is_some_and(|was| !was.asks) {
+                    log(&format!("{} turned into an ask", key.short()));
+                }
                 let fp = fp.clone();
                 cache.insert(key, CachedGist { fp, gist, asks });
             }

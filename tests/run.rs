@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Duration;
 
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use tempfile::TempDir;
@@ -56,8 +57,12 @@ case "$prompt" in
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     echo 'Sure, here you go:'
     asks=true
-    [ -f "$FIXTURE_DIR/nobody_asks" ] && asks=false
-    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"wants a yes/no","asks":'"$asks"'}]}';;
+    gist="wants a yes/no"
+    if [ -f "$FIXTURE_DIR/nobody_asks" ]; then
+      asks=false
+      gist="nothing asked"
+    fi
+    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"'"$gist"'","asks":'"$asks"'}]}';;
   "You are picking"*)
     echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
     [ -f "$FIXTURE_DIR/no_judge" ] && exit 1
@@ -248,12 +253,22 @@ fn run(cmd: &mut Command) -> Output {
 
 /// Answers every HTTP request 200 and hands back what it was sent.
 fn listener() -> (String, Receiver<String>) {
+    listener_failing(None)
+}
+
+/// The same, with a 500 for the request numbered `failing`, counting from 1.
+fn listener_failing(failing: Option<usize>) -> (String, Receiver<String>) {
     let socket = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", socket.local_addr().unwrap());
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        for stream in socket.incoming().flatten() {
-            if tx.send(read_request(stream)).is_err() {
+        for (index, stream) in socket.incoming().flatten().enumerate() {
+            let status = if failing == Some(index + 1) {
+                "500 Internal Server Error"
+            } else {
+                "200 OK"
+            };
+            if tx.send(read_request(stream, status)).is_err() {
                 return;
             }
         }
@@ -261,7 +276,7 @@ fn listener() -> (String, Receiver<String>) {
     (url, rx)
 }
 
-fn read_request(mut stream: TcpStream) -> String {
+fn read_request(mut stream: TcpStream, status: &str) -> String {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request = String::new();
     let mut length = 0;
@@ -278,9 +293,8 @@ fn read_request(mut stream: TcpStream) -> String {
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     request.push_str(&String::from_utf8_lossy(&body));
-    stream
-        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .unwrap();
+    let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    stream.write_all(response.as_bytes()).unwrap();
     request
 }
 
@@ -1032,12 +1046,23 @@ fn without_a_read_only_token_a_briefing_is_refused_not_run_on_your_own_auth() {
 
 /// One DM through the transport the tests can read, handing back what it sent.
 fn deliver(fixture: &Fixture, url: &str, messages: &Receiver<String>, flags: &[&str]) -> String {
-    run(fixture
+    deliver_logged(fixture, url, messages, flags).0
+}
+
+/// What a delivered run sent first, and what it logged.
+fn deliver_logged(
+    fixture: &Fixture,
+    url: &str,
+    messages: &Receiver<String>,
+    flags: &[&str],
+) -> (String, String) {
+    let out = run(fixture
         .command(&[&["--notify", "--dm-now", "--no-briefings"], flags].concat())
         .env("OPENCLAW_ENABLED", "1")
         .env("OPENCLAW_URL", url)
         .env("OPENCLAW_GATEWAY_TOKEN", "gateway-token"));
-    messages.recv().unwrap()
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    (messages.recv().unwrap(), log)
 }
 
 #[test]
@@ -1082,6 +1107,132 @@ fn what_the_model_says_asks_nothing_stays_on_the_board_and_out_of_the_dm() {
         lane(&board, "Needs me")[0].contains("[floresta#7]("),
         "{board}"
     );
+}
+
+/// What the log says when a reading turns from no ask into one.
+const TURNED: &str = "floresta#7 turned into an ask";
+
+/// On someone else's PR, a follow-up that pings nobody makes the model read a card again, and
+/// it is no new trigger. So what that reading says reaches the board, and an ask read only now
+/// stays out of the DM. A miss usually means someone pings again.
+#[test]
+fn a_verdict_that_turns_true_is_no_new_trigger_for_the_dm() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("nobody_asks"), "").unwrap();
+    // One node for both mornings, because `pr_node` dates it from the clock and a ping dated
+    // later is a new trigger.
+    let mentioned = pr_node(7, "waiting on you", "cc @me please", "aaaaaaa", "bob");
+    fs::write(
+        fixture.path("prs.json"),
+        prs_page(std::slice::from_ref(&mentioned)),
+    )
+    .unwrap();
+    let (url, messages) = listener();
+    let (left_out, log) = deliver_logged(&fixture, &url, &messages, &[]);
+    assert!(left_out.contains("nothing new"), "{left_out}");
+    assert!(
+        !log.contains(TURNED),
+        "a first reading turns nothing: {log}"
+    );
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Needs me")[0].contains("*(nothing asked)*"),
+        "{board}"
+    );
+
+    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let followed_up = |said: &[&str]| {
+        let comments: Vec<String> = said
+            .iter()
+            .map(|body| {
+                format!(
+                    r#"{{"author":{{"__typename":"User","login":"bob"}},
+                    "body":"{body}","createdAt":"{now}"}}"#
+                )
+            })
+            .collect();
+        mentioned.replace(
+            r#""comments":{"nodes":[]}"#,
+            &format!(r#""comments":{{"nodes":[{}]}}"#, comments.join(",")),
+        )
+    };
+    let question = "actually, could you look at this?";
+    fs::write(
+        fixture.path("prs.json"),
+        prs_page(&[followed_up(&[question])]),
+    )
+    .unwrap();
+    fs::remove_file(fixture.path("nobody_asks")).unwrap();
+
+    let (dm, log) = deliver_logged(&fixture, &url, &messages, &[]);
+    assert!(dm.contains("nothing new"), "{dm}");
+    assert!(log.contains(TURNED), "the log can count these: {log}");
+    let board = fixture.read_board();
+    assert!(
+        lane(&board, "Needs me")[0].contains("*(wants a yes/no)*"),
+        "the board has what the model read again: {board}"
+    );
+    let verdicts: serde_json::Value =
+        serde_json::from_str(&fixture.read_state("gists.json")).unwrap();
+    assert_eq!(
+        verdicts["getfloresta/floresta#7"]["asks"], true,
+        "the model read an ask, and the DM still left it out: {verdicts}"
+    );
+
+    fs::write(
+        fixture.path("prs.json"),
+        prs_page(&[followed_up(&[question, "any thoughts?"])]),
+    )
+    .unwrap();
+    let (dm, log) = deliver_logged(&fixture, &url, &messages, &[]);
+    assert!(dm.contains("nothing new"), "another one stays out: {dm}");
+    assert!(!log.contains(TURNED), "it was an ask already: {log}");
+}
+
+/// A first reading has nothing to turn from, even when it asks.
+#[test]
+fn a_first_reading_that_asks_turns_nothing() {
+    let fixture = Fixture::new();
+    let mentioned = pr_node(7, "waiting on you", "cc @me please", "aaaaaaa", "bob");
+    fs::write(fixture.path("prs.json"), prs_page(&[mentioned])).unwrap();
+    let (url, messages) = listener();
+    let (dm, log) = deliver_logged(&fixture, &url, &messages, &[]);
+    assert!(dm.contains("1 new"), "{dm}");
+    assert!(
+        !log.contains(TURNED),
+        "a first reading turns nothing: {log}"
+    );
+}
+
+/// A long DM goes out in parts, with the asks last. A part no transport took is an ask nobody
+/// saw, so the DM isn't remembered until every part has arrived.
+#[test]
+fn a_dm_that_only_partly_arrives_is_not_remembered() {
+    let fixture = Fixture::new();
+    fs::write(fixture.board(), board_text("", CLAIMED_ISSUE)).unwrap();
+    // An alert too long for one message, so the ask goes out in the next.
+    fs::write(
+        fixture.path("claims.json"),
+        claimed_issue("OPEN", &"x".repeat(4000)),
+    )
+    .unwrap();
+    // Empty if there is no second part, so a regression fails here and doesn't wait forever.
+    let second_part = |messages: &Receiver<String>| {
+        let wait = Duration::from_secs(5);
+        messages.recv_timeout(wait).unwrap_or_default()
+    };
+    let (url, messages) = listener_failing(Some(2));
+    deliver(&fixture, &url, &messages, &["--no-model"]);
+    let lost = second_part(&messages);
+    assert!(lost.contains("pull/7"), "the part that failed: {lost}");
+
+    let (url, messages) = listener();
+    deliver(&fixture, &url, &messages, &["--no-model"]);
+    let again = second_part(&messages);
+    assert!(again.contains("pull/7"), "it is still new: {again}");
+
+    let next = deliver(&fixture, &url, &messages, &["--no-model"]);
+    assert!(next.contains("nothing new"), "every part arrived: {next}");
 }
 
 /// GitHub answers UNKNOWN at 08:07 because master just moved. That says nothing about the

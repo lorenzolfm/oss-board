@@ -199,7 +199,7 @@ fn seen_records<'de, D: Deserializer<'de>>(
     }
     let wire = BTreeMap::<CardKey, Wire>::deserialize(deserializer)?;
     let records = wire.into_iter().filter_map(|(key, record)| match record {
-        Wire::Triggers(told) => Some((key, told)),
+        Wire::Triggers(seen) => Some((key, seen)),
         Wire::Legacy(text) => Timestamp::parse(&text).map(|at| (key, Seen::read_up_to(at))),
     });
     Ok(records.collect())
@@ -785,14 +785,18 @@ fn run(args: &Refresh) -> Result<()> {
         println!("{text}");
     } else if args.notify && (slot.is_some() || args.dm_now) {
         let results = notify::dispatch(&text);
-        for delivery in &results {
+        for delivery in results.iter().flatten() {
             let verdict = if delivery.ok { "ok" } else { "FAILED" };
             log(&format!(
                 "notify {}: {verdict} — {}",
                 delivery.transport, delivery.detail
             ));
         }
-        if results.iter().any(|delivery| delivery.ok) {
+        // A chunk no transport took is an ask nobody saw. A duplicate DM is the cheap failure.
+        if results
+            .iter()
+            .all(|part| part.iter().any(|delivery| delivery.ok))
+        {
             let record = LastDm {
                 at: Some(local),
                 seen: obligations::seen_after(&obs, held, &last_dm.seen, &unread_kinds),
