@@ -1,0 +1,6 @@
+#!/bin/sh
+# Writes `TODO` where the note should go, then fails.
+echo call >> "$FIXTURE_DIR/claude.log"
+note=$(printf '%s\n' "$2" | sed -n '/exactly this path/{n;s/^ *//;p;}')
+printf 'TODO' > "$note"
+exit 1

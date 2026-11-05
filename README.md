@@ -178,6 +178,7 @@ src/notify.rs          Telegram (chunked) + uptime-kuma heartbeat
 src/gh.rs, src/proc.rs the `gh` CLI, and subprocesses with a deadline
 src/testkit.rs         snapshot-shaped fixtures for the unit tests
 tests/run.rs           the whole binary against fake gh, git and claude on PATH
+tests/fakes/           those fakes, and the agents a test swaps in for claude
 state/                 gists.json, rank.json, last_dm.json, last_run.json, summary.txt
 ```
 
@@ -196,11 +197,7 @@ cargo nextest run                                        # or: nix flake check
 one run at a time holds `--state`; a run that finds another in progress leaves the
 work to it.
 
-Use nextest for tests, including mutation and repeat runs; `nix develop` has it.
-`cargo test` runs the binary tests as threads of one process, so on a busy machine a
-child forked by one test can still hold another test's fake `gh` open for writing when
-that test runs it, and the test fails with `Text file busy`. nextest gives each test
-its own process.
+`nix develop` has nextest. `cargo test` runs the same tests.
 
 A dry run still refreshes `state/summary.txt` and `state/last_run.json`, and the
 model caches when the model runs, so point `--state` elsewhere to leave them alone.

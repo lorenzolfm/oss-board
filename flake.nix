@@ -31,7 +31,14 @@
           (crane.mkLib pkgs).overrideToolchain (p:
             p.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml);
 
-        src = craneLib.cleanCargoSource ./.;
+        # The fake `gh`, `git` and `claude` the binary tests run have no extension for
+        # crane's filter to keep.
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          name = "source";
+          filter = path: type:
+            pkgs.lib.hasInfix "/tests/fakes" path || craneLib.filterCargoSources path type;
+        };
 
         commonArgs = {
           inherit src;

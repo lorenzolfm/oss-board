@@ -1,0 +1,8 @@
+#!/bin/sh
+# A repository with nothing unshipped on it, or one that fails the reads named.
+if [ -n "$GIT_FAIL_ON" ]; then
+  case "$*" in *"$GIT_FAIL_ON"*) echo boom >&2; exit 128;; esac
+fi
+case "$*" in
+  *"config user.email"*) echo me@example.com;;
+esac

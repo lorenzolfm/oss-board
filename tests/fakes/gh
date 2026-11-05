@@ -1,0 +1,17 @@
+#!/bin/sh
+if [ -n "$GH_FAIL_ON" ]; then
+  case "$*" in *"$GH_FAIL_ON"*) echo boom >&2; exit 1;; esac
+fi
+case "$*" in
+  *"viewer { login }"*) echo '{"data":{"viewer":{"login":"me"}}}';;
+  *"creator=me"*) ;;
+  *"first: 50"*) echo '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
+  *'owner: "cashubtc"'*"pullRequests(states: OPEN"*) cat "$FIXTURE_DIR/cdk_prs.json";;
+  *"pullRequests(states: OPEN"*) cat "$FIXTURE_DIR/prs.json";;
+  *"repos/cashubtc/cdk/compare/main..."*) echo '[{"filename":"src/a.rs","patch":"same"}]';;
+  *"issues(states: OPEN"*) echo '{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
+  *mergeable*) cat "$FIXTURE_DIR/merge.json";;
+  *projectV2*) echo '{"data":{"organization":{"projectV2":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}';;
+  *issueOrPullRequest*) cat "$FIXTURE_DIR/claims.json";;
+  *) echo "unexpected gh call: $*" >&2; exit 1;;
+esac
