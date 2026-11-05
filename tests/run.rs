@@ -1189,6 +1189,21 @@ fn a_verdict_that_turns_true_is_no_new_trigger_for_the_dm() {
     assert!(!log.contains(TURNED), "it was an ask already: {log}");
 }
 
+/// A first reading has nothing to turn from, even when it asks.
+#[test]
+fn a_first_reading_that_asks_turns_nothing() {
+    let fixture = Fixture::new();
+    let mentioned = pr_node(7, "waiting on you", "cc @me please", "aaaaaaa", "bob");
+    fs::write(fixture.path("prs.json"), prs_page(&[mentioned])).unwrap();
+    let (url, messages) = listener();
+    let (dm, log) = deliver_logged(&fixture, &url, &messages, &[]);
+    assert!(dm.contains("1 new"), "{dm}");
+    assert!(
+        !log.contains(TURNED),
+        "a first reading turns nothing: {log}"
+    );
+}
+
 /// A long DM goes out in parts, with the asks last. A part no transport took is an ask nobody
 /// saw, so the DM isn't remembered until every part has arrived.
 #[test]

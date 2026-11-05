@@ -849,8 +849,8 @@ pub fn add_reason<'a>(obs: &mut Vec<Obligation<'a>>, item: &'a Item, reason: Rea
 /// What a mute remembers, kept in the card itself so dragging it to Passed carries it
 /// along: the newest event behind the card, which kinds of reason it had, and the head
 /// any of them belong to. One time stands for every kind, which works because a new event
-/// is newer than the card you dragged. An old comment edited to ping you is not, so it stays
-/// covered.
+/// is newer than that time. A comment edited to ping you keeps its old date, so on a card
+/// that already had a mention, it stays covered if it is older than that time.
 #[derive(Clone, Debug)]
 pub struct Fingerprint {
     pub last: Option<Timestamp>,

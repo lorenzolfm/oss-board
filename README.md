@@ -138,8 +138,9 @@ that pings nobody, a push to a PR you were only pinged on, or an edited descript
 makes it read a card again, and that is no new trigger. So if that reading turns into an
 ask on a card with nothing else new since the last DM, the board gets the new gist and
 the DM stays quiet until a new trigger. The log says `turned into an ask` whenever a
-reading does, even if a new trigger came with it, so counting those lines can only
-overstate how often an ask waits.
+reading does, even if a new trigger came with it, so those lines mostly overstate how
+often an ask waits. They can also miss one: a muted card's verdict is forgotten, so if
+you undo the drag, its next reading has nothing to turn from and logs nothing.
 
 A source that can't be read is not a clear board. `Unshipped` and any card held by an
 unread source stay as they were, a claimed card keeps its note, and the heartbeat and
