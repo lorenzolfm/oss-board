@@ -1054,6 +1054,35 @@ mod tests {
         assert!(!is_muted(&obs[0], mutes.get(&obs[0].item.key)));
     }
 
+    /// A head can be dated ahead of a later ping by the clock of whoever committed it, and
+    /// that date is no event. A card muted on that head still comes back for the ping.
+    #[test]
+    fn a_head_dated_ahead_does_not_mute_a_newer_ping() {
+        let viewer = me();
+        let empty = HashMap::new();
+        let acked = pr(98)
+            .with_head(&"a".repeat(40))
+            .pushed_at(day(-1))
+            .comments(vec![
+                c(ME, 9, "ACK 1234567"),
+                c("bob", 5, &format!("@{ME} first")),
+            ]);
+        let snapshot = snap(vec![acked.clone()], vec![]);
+        let obs = obligations::collect(&snapshot, &viewer, now(), &empty);
+        let dragged = render::ob_card(&obs[0], None).as_str().to_owned();
+        let (_dir, path) = on_disk(&[("Passed", &[dragged])]);
+        let mutes = Board::open(&path).unwrap().mutes();
+        assert!(is_muted(&obs[0], mutes.get(&obs[0].item.key)), "as dragged");
+
+        let pinged = acked.comments(vec![c("bob", 1, &format!("@{ME} a question"))]);
+        let snapshot = snap(vec![pinged], vec![]);
+        let obs = obligations::collect(&snapshot, &viewer, now(), &empty);
+        assert!(
+            !is_muted(&obs[0], mutes.get(&obs[0].item.key)),
+            "the newer ping re-arms it"
+        );
+    }
+
     #[test]
     fn a_mute_on_a_kind_nothing_knows_any_more_holds_nothing() {
         let viewer = me();

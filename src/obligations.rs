@@ -180,6 +180,15 @@ impl Reason {
         }
     }
 
+    /// The newest event behind this, if events date it. A head's date is what its committer's
+    /// clock said, and `covers` never reads it, so it can't speak for another kind.
+    fn newest_event(&self) -> Option<Timestamp> {
+        match &self.when {
+            When::Events { last, .. } => Some(*last),
+            When::Head { .. } | When::Standing { .. } => None,
+        }
+    }
+
     fn head(&self) -> Option<&str> {
         match &self.when {
             When::Events { .. } | When::Standing { .. } => None,
@@ -839,7 +848,9 @@ pub fn add_reason<'a>(obs: &mut Vec<Obligation<'a>>, item: &'a Item, reason: Rea
 
 /// What a mute remembers, kept in the card itself so dragging it to Passed carries it
 /// along: the newest event behind the card, which kinds of reason it had, and the head
-/// any of them belong to.
+/// any of them belong to. One time stands for every kind, which works because a new event
+/// is newer than the card you dragged. An old comment edited to ping you is not, so it stays
+/// covered.
 #[derive(Clone, Debug)]
 pub struct Fingerprint {
     pub last: Option<Timestamp>,
@@ -860,7 +871,7 @@ impl Fingerprint {
 
 pub fn fingerprint(ob: &Obligation<'_>) -> Fingerprint {
     Fingerprint {
-        last: ob.reasons.iter().filter_map(Reason::last).max(),
+        last: ob.reasons.iter().filter_map(Reason::newest_event).max(),
         kinds: ob.reasons.iter().map(|reason| reason.kind).collect(),
         head: ob.reasons.iter().find_map(Reason::head).map(str::to_owned),
     }
@@ -974,8 +985,8 @@ pub fn is_muted(ob: &Obligation<'_>, mute: Option<&Seen>) -> bool {
 // ---------------------------------------------------------------- the DM
 
 /// The reasons that are a new trigger since the last DM, by the test a mute uses.
-fn new_reasons<'o>(ob: &'o Obligation<'_>, told: Option<&Seen>) -> Vec<&'o Reason> {
-    let is_new = |reason: &&Reason| !told.is_some_and(|told| told.covers(reason));
+fn new_reasons<'o>(ob: &'o Obligation<'_>, remembered: Option<&Seen>) -> Vec<&'o Reason> {
+    let is_new = |reason: &&Reason| !remembered.is_some_and(|seen| seen.covers(reason));
     ob.reasons.iter().filter(is_new).collect()
 }
 
@@ -1012,17 +1023,17 @@ pub fn seen_after(
 ) -> BTreeMap<CardKey, Seen> {
     let mut after: BTreeMap<CardKey, Seen> = seen
         .iter()
-        .filter_map(|(key, told)| Some((key.clone(), told.about(unread)?)))
+        .filter_map(|(key, remembered)| Some((key.clone(), remembered.about(unread)?)))
         .collect();
     for ob in obs {
         let key = &ob.item.key;
         if held.iter().any(|held| held.item.key == *key) {
             after.remove(key);
-            after.extend(seen.get(key).map(|told| (key.clone(), told.clone())));
+            after.extend(seen.get(key).map(|kept| (key.clone(), kept.clone())));
             continue;
         }
-        let told = after.entry(key.clone()).or_default();
-        ob.reasons.iter().for_each(|reason| told.saw(reason));
+        let remembered = after.entry(key.clone()).or_default();
+        ob.reasons.iter().for_each(|reason| remembered.saw(reason));
     }
     after
 }

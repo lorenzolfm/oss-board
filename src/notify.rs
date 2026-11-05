@@ -212,11 +212,12 @@ fn dispatch_one(text: &str) -> Vec<Delivery> {
     results
 }
 
-/// Fire whichever transports are configured, one message per chunk.
-pub fn dispatch(text: &str) -> Vec<Delivery> {
+/// Fire whichever transports are configured, one message per chunk: for each chunk, what
+/// each transport did with it.
+pub fn dispatch(text: &str) -> Vec<Vec<Delivery>> {
     chunks(text, CHUNK_LIMIT)
         .iter()
-        .flat_map(|part| dispatch_one(part))
+        .map(|part| dispatch_one(part))
         .collect()
 }
 

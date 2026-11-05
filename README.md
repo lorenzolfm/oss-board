@@ -119,7 +119,7 @@ message across both repos, longest-waiting first; any more stay new for the next
 A quiet morning is the header line alone, so a missing message means something is
 broken.
 
-Only clearing forgets what you were told. Dragging a card to Passed doesn't, so what
+Only clearing forgets what the DM remembers. Dragging a card to Passed doesn't, so what
 re-arms the mute is new and what you already knew is not. A source that can't be read
 doesn't either, so a conflict isn't news twice because GitHub was computing it one
 morning.
@@ -133,10 +133,13 @@ Opportunities and Unshipped stay on the board.
 If the model gives no verdict on a new item, it goes through and the message says it
 wasn't filtered: a false alarm can be seen, a dropped ask can't.
 
-A comment the rules don't count, such as a follow-up on someone else's PR that pings
-nobody, makes the model read a card again, but it is no new trigger. So if that reading
-turns into an ask on a card with nothing else new since the last DM, the board gets the
-new gist and the DM stays quiet until a new trigger.
+What the model reads and the rules don't count, such as a follow-up on someone else's PR
+that pings nobody, a push to a PR you were only pinged on, or an edited description,
+makes it read a card again, and that is no new trigger. So if that reading turns into an
+ask on a card with nothing else new since the last DM, the board gets the new gist and
+the DM stays quiet until a new trigger. The log says `turned into an ask` whenever a
+reading does, even if a new trigger came with it, so counting those lines can only
+overstate how often an ask waits.
 
 A source that can't be read is not a clear board. `Unshipped` and any card held by an
 unread source stay as they were, a claimed card keeps its note, and the heartbeat and
