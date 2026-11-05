@@ -103,6 +103,17 @@ fn prs_page(nodes: &[String]) -> String {
     )
 }
 
+/// One PR with one review thread, whose comments are as given.
+fn prs_with_thread(comments: &str) -> String {
+    prs_page(&[pr_node(1, "t", "", "aaaaaaa", "bob").replace(
+        r#""reviewThreads":{"nodes":[]}"#,
+        &format!(
+            r#""reviewThreads":{{"nodes":[{{"isResolved":false,"path":"src/a.rs",
+            "comments":{comments}}}]}}"#
+        ),
+    )])
+}
+
 /// #7 mentions you, so it is an obligation. #8 is unreviewed, so an opportunity.
 fn prs() -> String {
     prs_page(&[
@@ -457,11 +468,14 @@ fn an_unreadable_pr_list_fails_the_run_and_leaves_the_board() {
         conversation(r#"{"nodes":null}"#),
         conversation("null"),
     );
+    // With no count, a thread that was cut would read as a whole one.
+    let no_count = prs_with_thread(r#"{"nodes":[]}"#);
     for prs in [
         bad_url.as_str(),
         no_nodes.as_str(),
         null_nodes.as_str(),
         null_list.as_str(),
+        no_count.as_str(),
         r#"{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":null}}}}"#,
         r#"{"data":{"repository":{"pullRequests":{"nodes":[]}}}}"#,
         r#"{"data":{"repository":{"pullRequests":{}}}}"#,
@@ -481,6 +495,40 @@ fn an_unreadable_pr_list_fails_the_run_and_leaves_the_board() {
             .unwrap();
         assert!(!out.status.success(), "{prs}");
         assert_eq!(fixture.read_board(), before, "{prs}");
+    }
+}
+
+/// A thread past what the query reads looks whole to every rule, so a run has to say so. A null
+/// node was read, and is only one this token may not see.
+#[test]
+fn a_thread_cut_at_the_wire_says_so_in_the_log() {
+    let word = r#"{"author":{"__typename":"User","login":"bob"},"body":"a word",
+        "createdAt":"2026-01-01T00:00:00Z"}"#;
+    let cases = [
+        (
+            "cut",
+            format!(r#"{{"totalCount":31,"nodes":[{word}]}}"#),
+            true,
+        ),
+        (
+            "whole",
+            format!(r#"{{"totalCount":1,"nodes":[{word}]}}"#),
+            false,
+        ),
+        (
+            "a null node",
+            format!(r#"{{"totalCount":2,"nodes":[null,{word}]}}"#),
+            false,
+        ),
+    ];
+    for (name, comments, logged) in cases {
+        let fixture = Fixture::new();
+        fs::write(fixture.path("prs.json"), prs_with_thread(&comments)).unwrap();
+        let out = run(&mut fixture.command(&["--dry-run", "--no-model"]));
+        let log = String::from_utf8_lossy(&out.stderr);
+        let said = "pull/1: a thread in src/a.rs has 31 comments, and only the newest 1 were read";
+        assert_eq!(log.contains(said), logged, "{name}: {log}");
+        assert_eq!(log.contains("a thread in"), logged, "{name}: {log}");
     }
 }
 

@@ -336,10 +336,30 @@ fn answered_up_to(item: &Item, me: &Viewer) -> Option<Timestamp> {
 /// The comments still waiting on you, oldest first: what the conversation rule reads, before
 /// it decides which of them make a reason. So this keeps a "never mind" that pings nobody,
 /// and a review's body, which is where a reviewer says what they want done.
-pub fn waiting_comments<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
+fn waiting_comments<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
     let answered = answered_up_to(item, me);
     let waiting = |comment: &&Comment| Said::from(*comment).is_waiting(answered, me, now);
     item.comments.iter().filter(waiting).collect()
+}
+
+/// What the verdict reads of those: the comment that started the wait, the first ping, which
+/// dates and names a mention, the newest, which moves it, and the last two. On a busy item they
+/// would fall out of a plain "last three".
+pub fn comments_read<'i>(item: &'i Item, me: &Viewer, now: DateTime<Utc>) -> Vec<&'i Comment> {
+    let waiting = waiting_comments(item, me, now);
+    let mine: Vec<Said<'_>> = stream(item).filter(|s| me.is(s.author)).collect();
+    let pinged = |comment: &&Comment| is_ping(&comment.body, me, &mine);
+    let first_ping = waiting.iter().position(pinged);
+    let newest_ping = waiting.iter().rposition(pinged);
+    let is_read = |at: usize| {
+        at == 0 || Some(at) == first_ping || Some(at) == newest_ping || at + 2 >= waiting.len()
+    };
+    let read = waiting.iter().enumerate().filter(|(at, _)| is_read(*at));
+    read.map(|(_, comment)| *comment).collect()
+}
+
+fn is_ping(body: &str, me: &Viewer, mine: &[Said<'_>]) -> bool {
+    me.is_mentioned_in(body) || quotes(body, mine)
 }
 
 fn norm(text: &str) -> String {
@@ -384,7 +404,7 @@ fn conversation(item: &Item, me: &Viewer, now: DateTime<Utc>) -> Vec<Reason> {
     let assigned_to_me = item.assignees.iter().any(|login| me.is(login));
     let after = said.iter().filter(|s| s.is_waiting(answered, me, now));
     let (pinged, others): (Vec<&Said<'_>>, Vec<&Said<'_>>) =
-        after.partition(|s| me.is_mentioned_in(s.body) || quotes(s.body, &mine));
+        after.partition(|s| is_ping(s.body, me, &mine));
 
     if let (Some(first), Some(newest)) = (pinged.first(), pinged.last()) {
         let verb = if !me.is_mentioned_in(first.body) {
@@ -452,8 +472,49 @@ fn thread_wait<'t>(
     Some((*first, newest))
 }
 
-/// What dates an open thread on your own PR, if it still counts. Dated by what someone else
-/// said: your own reply and a bot's are no new trigger.
+/// Where a thread stands for you. Declared lowest first: past the limit the model reads the
+/// highest, so a word still waiting on you outranks any date.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ThreadTurn {
+    /// No person has said anything. A machine is nobody waiting on you.
+    Machines,
+    /// Nobody else has said anything.
+    OnlyYou,
+    /// Someone else spoke, and you had the last word.
+    Answered { said: Timestamp },
+    /// Someone else had the last word, so the next is yours.
+    Waiting { said: Timestamp },
+}
+
+impl ThreadTurn {
+    pub fn of(thread: &Thread, me: &Viewer) -> Self {
+        let Some(last) = thread.comments.iter().rfind(|c| !c.bot) else {
+            return Self::Machines;
+        };
+        let others = thread
+            .comments
+            .iter()
+            .filter(|c| !c.bot && !me.is(&c.author));
+        let Some(said) = others.map(|c| c.at).max() else {
+            return Self::OnlyYou;
+        };
+        if me.is(&last.author) {
+            Self::Answered { said }
+        } else {
+            Self::Waiting { said }
+        }
+    }
+
+    /// When someone else last said anything in it. Your own reply and a bot's are no new trigger.
+    fn said(self) -> Option<Timestamp> {
+        match self {
+            Self::Machines | Self::OnlyYou => None,
+            Self::Answered { said } | Self::Waiting { said } => Some(said),
+        }
+    }
+}
+
+/// What dates an open thread on your own PR, if it still counts.
 fn own_thread_said(
     thread: &Thread,
     me: &Viewer,
@@ -463,11 +524,7 @@ fn own_thread_said(
     if thread.resolved {
         return None;
     }
-    let others = thread
-        .comments
-        .iter()
-        .filter(|c| !me.is(&c.author) && !c.bot);
-    let said = others.map(|c| c.at).max();
+    let said = ThreadTurn::of(thread, me).said();
     if threads_block_merge {
         // It has to be resolved all the same, so with nothing else in it, it is dated from
         // when it opened.

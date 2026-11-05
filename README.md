@@ -240,7 +240,9 @@ reuse cached gists and rankings unless something they look at moved.
 - **Responses are parsed once, against GitHub's schema.** A field the schema
   promises is required, so a response of another shape is a failed read rather
   than an empty list. `labels` and `files` are the only lists allowed to be
-  missing, because they only decorate a card.
+  missing, because they only decorate a card. A review thread is read from its
+  newest 30 comments, because the rules turn on its newest word, and a run logs
+  any thread it cuts.
 
 ## Setup
 

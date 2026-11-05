@@ -13,6 +13,7 @@
 //! from anyone who can open an issue. Removing the GitHub token alone would not be
 //! enough, because `gh` falls back to your own login.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -30,14 +31,18 @@ use sha2::{Digest, Sha256};
 
 use crate::board::CardKey;
 use crate::footprint::Footprint;
-use crate::obligations::{Obligation, Viewer, fingerprint, last_per_kind, waiting_comments};
+use crate::obligations::{
+    Obligation, ThreadTurn, Viewer, comments_read, fingerprint, last_per_kind,
+};
 use crate::opportunities::{Opportunity, Source};
 use crate::proc;
 use crate::prompts;
-use crate::snapshot::{Ci, ReviewState};
+use crate::snapshot::{Ci, ReviewState, Thread};
 use crate::text::clip;
 
 const TIMEOUT: Duration = Duration::from_secs(300);
+/// Threads the model reads of one PR.
+const THREADS_READ: usize = 4;
 /// Enough that the repo you have fewer commits in still makes the list.
 const FOOTPRINT_AREAS: usize = 20;
 
@@ -182,29 +187,33 @@ struct AckDiff<'a> {
     changed: &'a [String],
 }
 
+/// The threads the model reads, of those the rules count. A machine is nobody waiting on you, so
+/// a thread with only a machine in it takes no place. Past the limit a word still waiting on you
+/// goes first, then the newest word someone else said. Up to it they stay in PR order, so a
+/// verdict isn't read again for this alone.
+fn threads_read<'a>(ob: &Obligation<'a>, me: &Viewer) -> Vec<&'a Thread> {
+    let turn = |t: &Thread| ThreadTurn::of(t, me);
+    let spoken = |t: &&Thread| turn(t) != ThreadTurn::Machines;
+    let mut read: Vec<&Thread> = ob.threads.iter().copied().filter(spoken).collect();
+    if read.len() > THREADS_READ {
+        read.sort_by_key(|t| Reverse(turn(t)));
+        read.truncate(THREADS_READ);
+    }
+    read
+}
+
 fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excerpt<'a> {
     let item = ob.item;
-    let waiting = waiting_comments(item, me, now);
-    // The comment that started the wait is the one the gist is about; on a busy
-    // thread it would fall out of a plain "last three".
-    let recent: Vec<_> = if waiting.len() <= 3 {
-        waiting
-    } else {
-        let mut kept = vec![waiting[0]];
-        kept.extend_from_slice(&waiting[waiting.len() - 2..]);
-        kept
-    };
+    let recent = comments_read(item, me, now);
     let pr = item.pr().map(|pr| PrExcerpt {
         size: format!(
             "+{}/-{} in {} files",
             pr.additions, pr.deletions, pr.changed_files
         ),
         files: &pr.files[..pr.files.len().min(12)],
-        // A machine is nobody waiting on you, so it can't push out what a person said, and a
-        // thread with only a machine in it takes none of the four places.
-        threads: ob
-            .threads
-            .iter()
+        // A machine can't push out what a person said.
+        threads: threads_read(ob, me)
+            .into_iter()
             .map(|t| {
                 let said: Vec<_> = t.comments.iter().filter(|c| !c.bot).collect();
                 ThreadExcerpt {
@@ -218,8 +227,6 @@ fn excerpt<'a>(ob: &'a Obligation<'_>, me: &Viewer, now: DateTime<Utc>) -> Excer
                         .collect(),
                 }
             })
-            .filter(|t| !t.last.is_empty())
-            .take(4)
             .collect(),
     });
     Excerpt {
@@ -566,7 +573,7 @@ mod tests {
 
     use super::*;
     use crate::obligations::collect;
-    use crate::snapshot::{Interdiff, Item};
+    use crate::snapshot::{Comment, Interdiff, Item};
     use crate::testkit::{ME, bot, c, day, issue, me, now, opportunity, pr, review, snap, thread};
     use chrono::TimeDelta;
     use serde_json::json;
@@ -1152,6 +1159,81 @@ mod tests {
         assert_eq!(waiting_sent(item), ["rename this", "LGTM"]);
     }
 
+    /// A `false` read from what is left would drop an ask nobody can see is missing. A mention
+    /// stands on its first ping and its newest, and the first can be nothing but thanks.
+    #[test]
+    fn the_verdict_reads_the_comments_a_mention_stands_on() {
+        let thanks = format!("@{ME} thanks");
+        let ask = format!("@{ME} can you decide?");
+        let mine = "this should stay a plain u64 for now";
+        let quote = format!("> {mine}\nwhy?");
+        let quote_sent = format!("> {mine} why?");
+        let word = |text: &str| c("ann", 5, text);
+        let cases: Vec<(&str, Vec<Comment>, Vec<&str>)> = vec![
+            (
+                "the one ping, behind the first comment",
+                vec![
+                    word("one"),
+                    word("two"),
+                    word(&ask),
+                    word("three"),
+                    word("four"),
+                ],
+                vec!["one", &ask, "three", "four"],
+            ),
+            (
+                "a newer ping than the first",
+                vec![
+                    word("one"),
+                    word(&thanks),
+                    word("two"),
+                    word(&ask),
+                    word("three"),
+                    word("four"),
+                ],
+                vec!["one", &thanks, &ask, "three", "four"],
+            ),
+            (
+                "a quote reply is a ping",
+                vec![
+                    c(ME, 9, mine),
+                    word("one"),
+                    word("two"),
+                    word(&quote),
+                    word("three"),
+                    word("four"),
+                ],
+                vec!["one", &quote_sent, "three", "four"],
+            ),
+            (
+                "a ping between the first and the newest has no place",
+                vec![
+                    word(&thanks),
+                    word(&format!("@{ME} between")),
+                    word(&ask),
+                    word("one"),
+                    word("two"),
+                ],
+                vec![thanks.as_str(), &ask, "one", "two"],
+            ),
+            (
+                "with no ping it stays the first and the last two",
+                vec![
+                    word("one"),
+                    word("two"),
+                    word("three"),
+                    word("four"),
+                    word("five"),
+                ],
+                vec!["one", "four", "five"],
+            ),
+        ];
+        for (name, comments, want) in cases {
+            let item = pr(1).requested(ME, &day(0).to_string()).comments(comments);
+            assert_eq!(waiting_sent(item), want, "{name}");
+        }
+    }
+
     /// The newest word of each thread the model would read of this PR.
     fn threads_sent(project: &'static crate::config::Project, item: Item) -> Vec<String> {
         let viewer = me();
@@ -1238,6 +1320,128 @@ mod tests {
             find(1),
         ])]);
         assert_eq!(threads_sent(floresta, replied_after_a_person), ["because"]);
+    }
+
+    /// The rules count every thread, and the reason moves on the newest word in any of them. A
+    /// verdict read from the first four in PR order can miss that word however new it is.
+    #[test]
+    fn past_four_threads_the_verdict_reads_the_newest_words() {
+        let floresta = &crate::config::PROJECTS[0];
+        let sent = |item| {
+            let mut sent = threads_sent(floresta, item);
+            sent.sort();
+            sent
+        };
+        let answered = |days_ago, text| thread(vec![c(ME, 20, "why?"), c("bob", days_ago, text)]);
+        let others = pr(1).threads(vec![
+            answered(6, "dropped"),
+            answered(5, "a"),
+            answered(4, "b"),
+            answered(3, "c"),
+            answered(1, "newest"),
+        ]);
+        assert_eq!(sent(others), ["a", "b", "c", "newest"]);
+
+        // Your own PR. Neither your reply nor a machine's is what someone else said last.
+        let own = |threads| {
+            pr(2)
+                .author(ME)
+                .in_repo("getfloresta/Floresta")
+                .pushed_at(day(60))
+                .threads(threads)
+        };
+        let question = || thread(vec![c("bob", 2, "a question")]);
+        let you_replied = |text| thread(vec![c("bob", 9, "why?"), c(ME, 1, text)]);
+        assert_eq!(
+            sent(own(vec![
+                you_replied("mine 1"),
+                you_replied("mine 2"),
+                you_replied("mine 3"),
+                you_replied("mine 4"),
+                question(),
+            ])),
+            ["a question", "mine 1", "mine 2", "mine 3"]
+        );
+        let a_machine_replied =
+            |text| thread(vec![c("bob", 9, text), bot("cdk-bot", 1, "a finding")]);
+        assert_eq!(
+            sent(own(vec![
+                a_machine_replied("old 1"),
+                a_machine_replied("old 2"),
+                a_machine_replied("old 3"),
+                a_machine_replied("old 4"),
+                question(),
+            ])),
+            ["a question", "old 1", "old 2", "old 3"]
+        );
+    }
+
+    /// On your own PR a thread stays open once you have answered it, so the newest word someone
+    /// else said can be one you answered. Reading only those, the model answers `false` with the
+    /// question you owe cut.
+    #[test]
+    fn past_four_threads_a_word_waiting_on_you_outranks_one_you_answered() {
+        let (floresta, cdk) = (&crate::config::PROJECTS[0], &crate::config::PROJECTS[1]);
+        let sent = |project, repo, threads| {
+            let item = pr(2)
+                .author(ME)
+                .in_repo(repo)
+                .pushed_at(day(60))
+                .threads(threads);
+            let mut sent = threads_sent(project, item);
+            sent.sort();
+            sent
+        };
+        let you_answered = |text| thread(vec![c("bob", 2, "why?"), c(ME, 1, text)]);
+        let a_machine_replied = |text| {
+            thread(vec![
+                c("bob", 2, "why?"),
+                c(ME, 1, text),
+                bot("cdk-bot", 1, "a finding"),
+            ])
+        };
+        let four = |answered: &dyn Fn(&'static str) -> Thread| {
+            vec![
+                answered("mine 1"),
+                answered("mine 2"),
+                answered("mine 3"),
+                answered("mine 4"),
+            ]
+        };
+        let question = |days_ago| thread(vec![c("bob", days_ago, "a question")]);
+        let cases = [
+            ("older", question(3), four(&you_answered)),
+            (
+                "as old, and last in PR order",
+                question(2),
+                four(&you_answered),
+            ),
+            (
+                "older, with a machine after your answers",
+                question(3),
+                four(&a_machine_replied),
+            ),
+        ];
+        for (project, repo) in [(floresta, "getfloresta/Floresta"), (cdk, "cashubtc/cdk")] {
+            for (name, open, answered) in &cases {
+                let mut threads = answered.clone();
+                threads.push(open.clone());
+                assert_eq!(
+                    sent(project, repo, threads),
+                    ["a question", "mine 1", "mine 2", "mine 3"],
+                    "{name}, in {repo}"
+                );
+            }
+        }
+
+        // Only where threads block merge does one with nobody else in it count, and nobody is
+        // waiting in it, however new it is.
+        let mut with_a_note = four(&you_answered);
+        with_a_note.push(thread(vec![c(ME, 0, "a note to myself")]));
+        assert_eq!(
+            sent(floresta, "getfloresta/Floresta", with_a_note),
+            ["mine 1", "mine 2", "mine 3", "mine 4"]
+        );
     }
 
     /// Asked to judge a "can you rebase?" with no owner on it, the model could not tell
