@@ -61,9 +61,11 @@ use instead. The cap and the judge are shared, so the lane is the best 8 across 
 **Unshipped** work is your fork PRs and local branches carrying commits you
 wrote that upstream lacks. Anything an upstream PR of yours already carries
 (by title, branch or commit) is hidden, as are review checkouts (`pr-1105`)
-and branches of only others' commits. Each is linked to the issue it likely
-fixes. One linked to an issue you're assigned to or were @-mentioned on is
-promoted to an obligation on that issue.
+and branches of only others' commits. Each is linked to the issue it names.
+Failing that, it's linked to an issue sharing three title words with it, not
+counting the work's own prefix like `fix(chain):`, and the card says "probably".
+One linked to an issue you're assigned to or were @-mentioned on is promoted to
+an obligation on that issue.
 
 ## The lane contract
 

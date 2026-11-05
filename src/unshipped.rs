@@ -54,12 +54,16 @@ const STOP: [&str; 39] = [
     "use",
 ];
 
+/// The fewest words a guess can share with an issue's title.
+const GUESS_MIN_WORDS: usize = 3;
+
 /// Which upstream issue a piece of work fixes, and how sure we are.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkHow {
     /// It names the issue explicitly.
     Refs,
-    /// Title match on at least two shared words, which is why the card says "probably".
+    /// Title match on at least `GUESS_MIN_WORDS` shared words, which is why the card says
+    /// "probably".
     Guess,
 }
 
@@ -160,11 +164,29 @@ fn tokens(text: &str) -> HashSet<String> {
     out
 }
 
+/// What a piece of work says about itself: its branch's name, and its titles without a prefix
+/// like `fix(chain):`, which is whatever comes before the first `: ` if it has no whitespace
+/// in it. That prefix says which part of the project the work is in, not what it does, so a
+/// word from it is no sign of the same problem. A branch's name isn't split that way, so
+/// `fix/chain-tip` still says `chain`. An issue's title keeps its prefix, because there it is
+/// often the subject.
+fn work_words<'a>(branch: &str, titles: impl IntoIterator<Item = &'a String>) -> HashSet<String> {
+    let mut words = tokens(branch);
+    for title in titles {
+        let said = title
+            .split_once(": ")
+            .filter(|(prefix, _)| !prefix.contains(char::is_whitespace))
+            .map_or(title.as_str(), |(_, said)| said);
+        words.extend(tokens(said));
+    }
+    words
+}
+
 /// The open upstream issue this work most likely fixes.
 ///
 /// An explicit reference wins. Bare `#N` in a fork PR means the fork's own numbering
 /// unless N is too big to be one, hence the >= 100 floor. Failing that, a title
-/// match on at least two shared words.
+/// match on at least `GUESS_MIN_WORDS` shared words.
 fn link_issue<'a>(
     refs: &Regex,
     text: &str,
@@ -191,7 +213,7 @@ fn link_issue<'a>(
             score = shared;
         }
     }
-    if score >= 2 {
+    if score >= GUESS_MIN_WORDS {
         best.map(|issue| (issue, LinkHow::Guess))
     } else {
         None
@@ -374,7 +396,7 @@ fn assemble(
         {
             continue;
         }
-        let words = tokens(&format!("{} {}", pr.title, pr.branch));
+        let words = work_words(&pr.branch, [&pr.title]);
         let text = format!("{}\n{}", pr.body, pr.title);
         items.push(Unshipped {
             repo,
@@ -400,7 +422,7 @@ fn assemble(
         {
             continue;
         }
-        let words = tokens(&format!("{} {}", branch.branch, branch.subjects.join(" ")));
+        let words = work_words(&branch.branch, &branch.subjects);
         let text = format!("{}\n{}", branch.subjects.join("\n"), branch.title);
         items.push(Unshipped {
             repo,
@@ -729,6 +751,85 @@ mod tests {
             Some((6, LinkHow::Refs)),
             "naming the repo makes even a small number upstream's"
         );
+    }
+
+    /// The first three linked on the board on 2026-11-05, and none of that work fixes its
+    /// issue. Both kinds of work build their words apart from `link_issue`, so both are read.
+    #[test]
+    fn a_guess_takes_three_words_past_the_prefix_of_a_title() {
+        let cases = [
+            (
+                "a prefix and two words",
+                "fix(chain): stop truncating the accumulator file on reorg",
+                "flat-store-roots-truncation",
+                "getblockchaininfo reports progress=1.0 / ibd=false when the chain store stops accepting blocks early",
+                false,
+            ),
+            (
+                "a prefix both titles share a word of",
+                "fix(cdk-sql-common): guard the mint quote write on the stored totals",
+                "guard-mint-quote-write",
+                "bug(cdk-mint-rpc): force-paid mint quote RPC can over credit quotes",
+                false,
+            ),
+            (
+                "two words and no help from the prefix",
+                "refactor(cdk-common): tie locked rows to their transaction at compile time",
+                "acquired-branded-transaction",
+                "Wallet database update_mint_url leaves transactions, melt_quote, and mint rows on the old URL",
+                false,
+            ),
+            (
+                "three words after a prefix",
+                "fix(node): read and parse config.toml once per boot",
+                "parse-config-once",
+                "config.toml is read and parsed three times per startup",
+                true,
+            ),
+            (
+                "a colon further on is not a prefix",
+                "Read and parse config.toml: once per boot",
+                "read-config-boot",
+                "config.toml is read and parsed three times per startup",
+                true,
+            ),
+            (
+                "the branch's name is words too",
+                "Read it once per boot",
+                "config-toml",
+                "config.toml is read and parsed three times per startup",
+                true,
+            ),
+            (
+                "an issue's prefix is words too",
+                "feat(wallet): find a mint over nostr by discoverability",
+                "wallet-finds-mints",
+                "cdk-nostr: add optional NIP-87 mint discoverability types and query helpers",
+                true,
+            ),
+        ];
+        let repos = repos();
+        let local = clone_at(&repos.clone);
+        for (index, (name, title, branch_name, issue_title, links)) in cases.into_iter().enumerate()
+        {
+            let upstream = issue(1).title(issue_title);
+            let issues = [&upstream];
+            let want = links.then(|| upstream.key.clone());
+            let linked = |prs: Vec<ForkPr>| {
+                assemble(prs, &issues, &[], &local)
+                    .unwrap()
+                    .into_iter()
+                    .find(|u| u.branch == branch_name)
+                    .expect("the work is listed")
+                    .issue
+                    .map(|link| link.key)
+            };
+            let file = format!("case{index}");
+            branch(&repos, branch_name, &[&file], MINE, Some(title));
+            assert_eq!(linked(vec![]), want, "as a local branch: {name}");
+            let pr = fork_pr(6, title, branch_name, "a");
+            assert_eq!(linked(vec![pr]), want, "as a fork PR: {name}");
+        }
     }
 
     #[test]
