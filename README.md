@@ -189,12 +189,18 @@ cargo run -- refresh --state state --dry-run             # ...with gists and the
 cargo run -- refresh --state state                       # update the board
 cargo run -- refresh --state state --notify --dm-now     # ...and DM now regardless of the slot
 cargo run -- survey                                      # survey the org boards' columns
-cargo test                                               # or: nix flake check
+cargo nextest run                                        # or: nix flake check
 ```
 
 `--dry-run` and `--notify` exclude each other, and `--dm-now` needs `--notify`. Only
 one run at a time holds `--state`; a run that finds another in progress leaves the
 work to it.
+
+Use nextest for tests, including mutation and repeat runs; `nix develop` has it.
+`cargo test` runs the binary tests as threads of one process, so on a busy machine a
+child forked by one test can still hold another test's fake `gh` open for writing when
+that test runs it, and the test fails with `Text file busy`. nextest gives each test
+its own process.
 
 A dry run still refreshes `state/summary.txt` and `state/last_run.json`, and the
 model caches when the model runs, so point `--state` elsewhere to leave them alone.
