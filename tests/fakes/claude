@@ -1,0 +1,29 @@
+#!/bin/sh
+# Records which tokens it was handed, wraps its answers in prose as a real model
+# does, and writes the note a briefing asks for. Keeps the board it saw at that
+# moment, for what a slow briefing can cost.
+prompt=$2
+shift 2
+args=$(printf '[%s]' "$@")
+case "$prompt" in
+  "Each item below"*)
+    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
+    echo 'Sure, here you go:'
+    asks=true
+    gist="wants a yes/no"
+    if [ -f "$FIXTURE_DIR/nobody_asks" ]; then
+      asks=false
+      gist="nothing asked"
+    fi
+    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"'"$gist"'","asks":'"$asks"'}]}';;
+  "You are picking"*)
+    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
+    [ -f "$FIXTURE_DIR/no_judge" ] && exit 1
+    echo '{"picks":[{"key":"getfloresta/Floresta#8","why":"small and yours"}]}';;
+  "Write an Obsidian"*)
+    echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
+    cp "$FIXTURE_DIR/vault/Tasks.md" "$FIXTURE_DIR/board_at_brief.md"
+    note=$(printf '%s\n' "$prompt" | sed -n '/exactly this path/{n;s/^ *//;p;}')
+    printf '%0400d' 0 > "$note"
+    echo DONE;;
+esac

@@ -6,7 +6,6 @@
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver};
@@ -15,74 +14,6 @@ use std::time::Duration;
 
 use chrono::{SecondsFormat, TimeDelta, Utc};
 use tempfile::TempDir;
-
-const FAKE_GH: &str = r#"#!/bin/sh
-if [ -n "$GH_FAIL_ON" ]; then
-  case "$*" in *"$GH_FAIL_ON"*) echo boom >&2; exit 1;; esac
-fi
-case "$*" in
-  *"viewer { login }"*) echo '{"data":{"viewer":{"login":"me"}}}';;
-  *"creator=me"*) ;;
-  *"first: 50"*) echo '{"data":{"repository":{"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
-  *'owner: "cashubtc"'*"pullRequests(states: OPEN"*) cat "$FIXTURE_DIR/cdk_prs.json";;
-  *"pullRequests(states: OPEN"*) cat "$FIXTURE_DIR/prs.json";;
-  *"repos/cashubtc/cdk/compare/main..."*) echo '[{"filename":"src/a.rs","patch":"same"}]';;
-  *"issues(states: OPEN"*) echo '{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}';;
-  *mergeable*) cat "$FIXTURE_DIR/merge.json";;
-  *projectV2*) echo '{"data":{"organization":{"projectV2":{"items":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}';;
-  *issueOrPullRequest*) cat "$FIXTURE_DIR/claims.json";;
-  *) echo "unexpected gh call: $*" >&2; exit 1;;
-esac
-"#;
-
-/// A repository with nothing unshipped on it, or one that fails the reads named.
-const FAKE_GIT: &str = r#"#!/bin/sh
-if [ -n "$GIT_FAIL_ON" ]; then
-  case "$*" in *"$GIT_FAIL_ON"*) echo boom >&2; exit 128;; esac
-fi
-case "$*" in
-  *"config user.email"*) echo me@example.com;;
-esac
-"#;
-
-/// Records which tokens it was handed, wraps its answers in prose as a real model
-/// does, and writes the note a briefing asks for. Keeps the board it saw at that
-/// moment, for what a slow briefing can cost.
-const FAKE_CLAUDE: &str = r#"#!/bin/sh
-prompt=$2
-shift 2
-args=$(printf '[%s]' "$@")
-case "$prompt" in
-  "Each item below"*)
-    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
-    echo 'Sure, here you go:'
-    asks=true
-    gist="wants a yes/no"
-    if [ -f "$FIXTURE_DIR/nobody_asks" ]; then
-      asks=false
-      gist="nothing asked"
-    fi
-    echo '{"gists":[{"key":"getfloresta/Floresta#7","gist":"'"$gist"'","asks":'"$asks"'}]}';;
-  "You are picking"*)
-    echo "model GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
-    [ -f "$FIXTURE_DIR/no_judge" ] && exit 1
-    echo '{"picks":[{"key":"getfloresta/Floresta#8","why":"small and yours"}]}';;
-  "Write an Obsidian"*)
-    echo "brief GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset} args=$args" >> "$FIXTURE_DIR/claude.log"
-    cp "$FIXTURE_DIR/vault/Tasks.md" "$FIXTURE_DIR/board_at_brief.md"
-    note=$(printf '%s\n' "$prompt" | sed -n '/exactly this path/{n;s/^ *//;p;}')
-    printf '%0400d' 0 > "$note"
-    echo DONE;;
-esac
-"#;
-
-/// Writes `TODO` where the note should go, then fails.
-const FAILING_AGENT: &str = r#"#!/bin/sh
-echo call >> "$FIXTURE_DIR/claude.log"
-note=$(printf '%s\n' "$2" | sed -n '/exactly this path/{n;s/^ *//;p;}')
-printf 'TODO' > "$note"
-exit 1
-"#;
 
 /// An open PR, as the bulk query returns one, opened recently enough that a mention in
 /// its description is still asking.
@@ -155,21 +86,44 @@ fn my_broken_pr() -> (String, String) {
 const CLAIMS: &str = r#"{"data":{"n0":{"issueOrPullRequest":{
   "__typename":"PullRequest","state":"OPEN","mergedAt":null,"author":{"login":"carol"}}}}}"#;
 
+/// The fake `gh`, `git` and `claude`. They are files in the tree because a script a test
+/// writes can be refused when it runs: under `cargo test`, a child forked by another test
+/// holds a copy of the write handle until it execs, and the kernel says `Text file busy`.
+const FAKES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fakes");
+
+/// A `claude` from `tests/fakes/agents`, which goes ahead of the default one on PATH.
+#[derive(Clone, Copy)]
+enum Agent {
+    /// Writes `TODO` where the note should go, then exits 1.
+    Failing,
+    /// Writes `TODO` where the note should go, then exits 0.
+    Thin,
+    /// Exits 0 having written nothing.
+    Silent,
+    /// Exits 1 having done nothing.
+    Broken,
+}
+
+impl Agent {
+    fn dir(self) -> &'static str {
+        match self {
+            Self::Failing => "failing",
+            Self::Thin => "thin",
+            Self::Silent => "silent",
+            Self::Broken => "broken",
+        }
+    }
+}
+
 struct Fixture {
     dir: TempDir,
+    agent: Option<Agent>,
 }
 
 impl Fixture {
     fn new() -> Self {
         let dir = TempDir::new().unwrap();
-        let fixture = Self { dir };
-        let bin = fixture.path("bin");
-        fs::create_dir(&bin).unwrap();
-        for (name, script) in [("gh", FAKE_GH), ("claude", FAKE_CLAUDE), ("git", FAKE_GIT)] {
-            let path = bin.join(name);
-            fs::write(&path, script).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let fixture = Self { dir, agent: None };
         fs::write(fixture.path("prs.json"), prs()).unwrap();
         fs::write(fixture.path("cdk_prs.json"), prs_page(&[])).unwrap();
         let clean = merge_node("MERGEABLE", "null");
@@ -181,6 +135,13 @@ impl Fixture {
         fs::write(fixture.path("claims.json"), CLAIMS).unwrap();
         fs::create_dir(fixture.path("vault")).unwrap();
         fixture
+    }
+
+    fn with_agent(agent: Agent) -> Self {
+        Self {
+            agent: Some(agent),
+            ..Self::new()
+        }
     }
 
     fn path(&self, name: &str) -> PathBuf {
@@ -220,11 +181,11 @@ impl Fixture {
     }
 
     fn binary(&self) -> Command {
-        let path = format!(
-            "{}:{}",
-            self.path("bin").display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
+        let inherited = std::env::var("PATH").unwrap_or_default();
+        let path = match self.agent {
+            Some(agent) => format!("{FAKES}/agents/{}:{FAKES}:{inherited}", agent.dir()),
+            None => format!("{FAKES}:{inherited}"),
+        };
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_oss-board"));
         cmd.env("PATH", path)
             .env("HOME", self.dir.path())
@@ -980,9 +941,8 @@ fn a_linked_card_whose_note_is_gone_is_not_briefed_again() {
 /// What a failed agent left must not pass for a note, or the card is stuck with it.
 #[test]
 fn a_failed_briefing_leaves_nothing_and_is_tried_again() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_agent(Agent::Failing);
     fs::write(fixture.board(), claimed_pr_board()).unwrap();
-    fs::write(fixture.path("bin/claude"), FAILING_AGENT).unwrap();
     let briefing_run = || {
         run(fixture
             .command(&["--no-model"])
@@ -1004,10 +964,9 @@ fn a_failed_briefing_leaves_nothing_and_is_tried_again() {
 /// written nothing. What it finds is not that agent's work.
 #[test]
 fn a_draft_left_by_a_killed_run_does_not_become_the_note() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_agent(Agent::Silent);
     fs::write(fixture.board(), claimed_pr_board()).unwrap();
     fs::write(fixture.path("vault/.Floresta-8.md.tmp"), "x".repeat(400)).unwrap();
-    fs::write(fixture.path("bin/claude"), "#!/bin/sh\nexit 0\n").unwrap();
     run(fixture
         .command(&["--no-model"])
         .env("GH_TOKEN", "read-only-token"));
@@ -1020,13 +979,8 @@ fn a_draft_left_by_a_killed_run_does_not_become_the_note() {
 /// An agent that succeeds with next to nothing is failing in a way that looks answered.
 #[test]
 fn a_thin_note_is_discarded() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_agent(Agent::Thin);
     fs::write(fixture.board(), claimed_pr_board()).unwrap();
-    fs::write(
-        fixture.path("bin/claude"),
-        FAILING_AGENT.replace("exit 1", "exit 0"),
-    )
-    .unwrap();
     run(fixture
         .command(&["--no-model"])
         .env("GH_TOKEN", "read-only-token"));
@@ -1380,8 +1334,7 @@ fn a_card_in_done_raises_no_alert() {
 /// no ask for the "not filtered" line to go on.
 #[test]
 fn a_model_that_does_not_answer_is_said_on_a_quiet_morning_too() {
-    let fixture = Fixture::new();
-    fs::write(fixture.path("bin/claude"), "#!/bin/sh\nexit 1\n").unwrap();
+    let fixture = Fixture::with_agent(Agent::Broken);
     let (url, messages) = listener();
     let first = deliver(&fixture, &url, &messages, &[]);
     assert!(first.contains("did not answer"), "{first}");

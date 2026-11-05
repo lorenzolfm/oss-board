@@ -178,6 +178,7 @@ src/notify.rs          Telegram (chunked) + uptime-kuma heartbeat
 src/gh.rs, src/proc.rs the `gh` CLI, and subprocesses with a deadline
 src/testkit.rs         snapshot-shaped fixtures for the unit tests
 tests/run.rs           the whole binary against fake gh, git and claude on PATH
+tests/fakes/           those fakes, and the agents a test swaps in for claude
 state/                 gists.json, rank.json, last_dm.json, last_run.json, summary.txt
 ```
 
@@ -189,12 +190,14 @@ cargo run -- refresh --state state --dry-run             # ...with gists and the
 cargo run -- refresh --state state                       # update the board
 cargo run -- refresh --state state --notify --dm-now     # ...and DM now regardless of the slot
 cargo run -- survey                                      # survey the org boards' columns
-cargo test                                               # or: nix flake check
+cargo nextest run                                        # or: nix flake check
 ```
 
 `--dry-run` and `--notify` exclude each other, and `--dm-now` needs `--notify`. Only
 one run at a time holds `--state`; a run that finds another in progress leaves the
 work to it.
+
+`nix develop` has nextest. `cargo test` runs the same tests.
 
 A dry run still refreshes `state/summary.txt` and `state/last_run.json`, and the
 model caches when the model runs, so point `--state` elsewhere to leave them alone.
